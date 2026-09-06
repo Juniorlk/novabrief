@@ -1,0 +1,7 @@
+# Pinned so every developer machine and every CI runner build the audio engine
+# with the same compiler. Bump deliberately, never silently.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]
+profile = "minimal"

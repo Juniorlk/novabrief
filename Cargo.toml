@@ -1,0 +1,31 @@
+# Rust workspace. Only the crates required by POC #1 are members; vault,
+# uploader and api-client join when their lot starts (CLAUDE.md section 2).
+[workspace]
+resolver = "2"
+members = [
+    "apps/desktop/src-tauri/crates/audio-engine",
+    "tools/nb-capture",
+    "tools/nb-testsignal",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "UNLICENSED"
+publish = false
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+todo = "deny"
+dbg_macro = "deny"
+print_stdout = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
