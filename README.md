@@ -51,6 +51,7 @@ Windows.
 | pnpm | via corepack | `corepack enable` |
 | GNU Make | 4.x | `winget install ezwinports.make` |
 | Docker Desktop | — | pour `infra/` (lot backend) |
+| GitHub CLI | 2.x | `winget install GitHub.cli`, puis `gh auth login` une fois — sert à lire les résultats de CI |
 
 ```powershell
 winget install --id Microsoft.VisualStudio.2022.BuildTools `
