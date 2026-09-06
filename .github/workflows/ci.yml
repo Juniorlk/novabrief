@@ -1,0 +1,128 @@
+name: CI
+
+# Lint + tests for all three languages on every PR. The Rust job runs on Windows:
+# the audio engine depends on WASAPI and only builds usefully there
+# (CLAUDE.md section 10). Jobs call the tools directly rather than through
+# `make`, which is not present by default on Windows runners.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  rust:
+    name: Rust (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        # rust-toolchain.toml pins the channel and components.
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dev tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Ruff (lint)
+        run: python -m ruff check --output-format=github .
+
+      - name: Ruff (format)
+        run: python -m ruff format --check .
+
+      - name: mypy --strict
+        run: python -m mypy
+
+      - name: pytest
+        # Exit code 5 = nothing collected: tolerated while the backend does not exist.
+        run: |
+          set +e
+          python -m pytest
+          status=$?
+          set -e
+          if [ "$status" -eq 5 ]; then
+            echo "::notice::pytest collected no test (expected at this stage)."
+            exit 0
+          fi
+          exit "$status"
+
+  node:
+    name: Node / TypeScript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: ESLint
+        run: pnpm run lint
+
+      - name: TypeScript
+        run: pnpm run typecheck
+
+      - name: Vitest
+        run: pnpm run test
+
+  hygiene:
+    name: Repository hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: No .env committed
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::A .env file is tracked by Git. Revoke the exposed secrets."
+            exit 1
+          fi
+          echo "OK: no .env tracked by Git."
+
+      - name: Report the .env.example surface
+        run: |
+          missing=$(grep -nE '^[A-Z0-9_]+=$' .env.example | wc -l)
+          total=$(grep -cE '^[A-Z0-9_]+=' .env.example)
+          echo "$total variables declared in .env.example ($missing without an example comment)."
