@@ -1,0 +1,17 @@
+[package]
+name = "audio-engine"
+description = "WASAPI capture (microphone + system loopback), resampling, drift compensation and Opus encoding."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+
+[dev-dependencies]
