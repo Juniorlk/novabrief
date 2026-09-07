@@ -1,8 +1,10 @@
 //! `nb-capture` — command-line recorder used to validate POC #1.
 //!
 //! Captures the microphone and the system audio simultaneously, resamples both
-//! to 16 kHz mono, and writes them as a stereo WAV where the left channel is
-//! the microphone and the right channel is what the machine was playing.
+//! to 16 kHz mono, and writes them as a stereo stream where the left channel is
+//! the microphone and the right channel is what the machine was playing. The
+//! output is either an uncompressed WAV, for analysis, or Opus in segmented Ogg
+//! with a manifest, which is what the product ships and is about 32x smaller.
 //!
 //! Each endpoint runs on its own thread: WASAPI clients are apartment-bound and
 //! the two devices have independent clocks, so they cannot share a pump. The
@@ -22,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use audio_engine::{
-    downmix_to_mono, peak, CaptureStats, Endpoint, EndpointCapture, MonoResampler, StereoMixer,
-    TARGET_SAMPLE_RATE,
+    downmix_to_mono, peak, CaptureStats, Endpoint, EndpointCapture, MonoResampler,
+    SegmentedOpusWriter, StereoMixer, TARGET_SAMPLE_RATE,
 };
 use clap::Parser;
 
@@ -38,8 +40,8 @@ struct Cli {
     #[arg(short, long, value_name = "SECONDS")]
     duration: Option<u64>,
 
-    /// Output file. The current milestone writes WAV; Opus/Ogg comes with the
-    /// encoding step.
+    /// Output file for WAV, or the directory that will hold the segments and
+    /// the manifest for Opus.
     #[arg(short, long, value_name = "FILE", default_value = "capture.wav")]
     out: PathBuf,
 
@@ -61,6 +63,20 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     output: Option<String>,
 
+    /// Output format. `wav` is raw 16 kHz stereo float, useful for analysis
+    /// but 128 kB/s. `opus` writes 5-10 s Ogg segments plus a manifest, which
+    /// is what the product ships and is roughly 32x smaller.
+    #[arg(long, value_enum, default_value_t = Format::Wav)]
+    format: Format,
+
+    /// Opus bitrate in bits per second. Ignored for WAV.
+    #[arg(long, default_value_t = 32_000, value_name = "BPS")]
+    bitrate: u32,
+
+    /// Seconds of audio per Opus segment, clamped to 5-10 s.
+    #[arg(long, default_value_t = 5.0, value_name = "SECONDS")]
+    segment_seconds: f64,
+
     /// List the active audio devices and exit.
     #[arg(long)]
     list_devices: bool,
@@ -69,6 +85,38 @@ struct Cli {
     /// output stays readable when piped to a file.
     #[arg(long)]
     no_tty: bool,
+}
+
+/// What nb-capture writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Format {
+    /// Uncompressed 16 kHz stereo float: 128 kB/s, for analysis.
+    Wav,
+    /// Opus in segmented Ogg with a manifest: what the product ships.
+    Opus,
+}
+
+/// Where mixed stereo audio goes.
+///
+/// Both variants take the same interleaved stereo samples, so the mixing loop
+/// does not need to know which one it is feeding.
+enum Sink {
+    Wav(Box<hound::WavWriter<std::io::BufWriter<std::fs::File>>>),
+    Opus(Box<SegmentedOpusWriter>),
+}
+
+impl Sink {
+    fn write(&mut self, interleaved: &[f32]) -> Result<()> {
+        match self {
+            Self::Wav(writer) => {
+                for &sample in interleaved {
+                    writer.write_sample(sample)?;
+                }
+                Ok(())
+            }
+            Self::Opus(writer) => writer.write(interleaved).map_err(Into::into),
+        }
+    }
 }
 
 /// A chunk of 16 kHz mono audio on its way to the writer.
@@ -135,15 +183,67 @@ fn main() -> Result<()> {
     }
     println!("\nRecording. Press Ctrl+C to stop.\n");
 
-    let written = write_stereo(&cli, &mic_rx, &sys_rx)?;
+    let (written, sink, skew_frames) = write_stereo(&cli, &mic_rx, &sys_rx)?;
 
     // The channels are closed once both capture threads have finished, so the
     // writer above has already drained everything by the time we join.
     let mic_outcome = join_capture(mic_thread)?;
     let sys_outcome = join_capture(sys_thread)?;
 
-    report(&cli.out, written, &[mic_outcome, sys_outcome]);
+    // The manifest records which devices produced the recording, so finalising
+    // waits until the capture threads have reported their device names.
+    let device_of = |outcome: &Option<ThreadOutcome>| {
+        outcome
+            .as_ref()
+            .map_or_else(|| "not recorded".to_owned(), |o| o.device_name.clone())
+    };
+    let skew_ms = skew_frames * 1000 / i64::from(TARGET_SAMPLE_RATE);
+    let output_path = match cli.format {
+        Format::Wav => cli.out.clone(),
+        Format::Opus => opus_directory(&cli.out),
+    };
+    finalize(
+        sink,
+        &device_of(&mic_outcome),
+        &device_of(&sys_outcome),
+        skew_ms,
+    )?;
+
+    report(&output_path, written, &[mic_outcome, sys_outcome]);
     Ok(())
+}
+
+/// Close the sink, writing the manifest when the output is Opus.
+fn finalize(sink: Sink, input_device: &str, output_device: &str, skew_ms: i64) -> Result<()> {
+    match sink {
+        Sink::Wav(writer) => {
+            writer
+                .finalize()
+                .context("could not finalize the WAV file")?;
+            Ok(())
+        }
+        Sink::Opus(writer) => {
+            let manifest = writer
+                .finish(input_device, output_device, skew_ms)
+                .context("could not finalize the Opus segments")?;
+            let bytes: u64 = manifest.segments.iter().map(|s| s.bytes).sum();
+            let seconds = manifest.duration_ms as f64 / 1000.0;
+            println!(
+                "
+Opus segments     : {}",
+                manifest.segments.len()
+            );
+            println!("Encoded size      : {bytes} bytes");
+            if seconds > 0.0 {
+                println!(
+                    "Rate              : {:.1} kB/min ({:.1} MB/hour)",
+                    bytes as f64 / 1024.0 / (seconds / 60.0),
+                    bytes as f64 / 1_048_576.0 / (seconds / 3600.0)
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Print every active endpoint, flagging Bluetooth hands-free profiles.
@@ -247,15 +347,36 @@ fn join_capture(
 /// Interleave both streams into a stereo WAV until the capture threads stop.
 ///
 /// Returns the number of stereo frames written.
-fn write_stereo(cli: &Cli, mic_rx: &Receiver<Chunk>, sys_rx: &Receiver<Chunk>) -> Result<u64> {
-    let spec = hound::WavSpec {
-        channels: 2,
-        sample_rate: TARGET_SAMPLE_RATE,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
+fn write_stereo(
+    cli: &Cli,
+    mic_rx: &Receiver<Chunk>,
+    sys_rx: &Receiver<Chunk>,
+) -> Result<(u64, Sink, i64)> {
+    let mut sink = match cli.format {
+        Format::Wav => {
+            let spec = hound::WavSpec {
+                channels: 2,
+                sample_rate: TARGET_SAMPLE_RATE,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            Sink::Wav(Box::new(
+                hound::WavWriter::create(&cli.out, spec)
+                    .with_context(|| format!("could not create {}", cli.out.display()))?,
+            ))
+        }
+        Format::Opus => {
+            let directory = opus_directory(&cli.out);
+            let prefix = cli.out.file_stem().map_or_else(
+                || "capture".to_owned(),
+                |s| s.to_string_lossy().into_owned(),
+            );
+            Sink::Opus(Box::new(
+                SegmentedOpusWriter::new(&directory, prefix, cli.bitrate, cli.segment_seconds)
+                    .with_context(|| format!("could not open {}", directory.display()))?,
+            ))
+        }
     };
-    let mut writer = hound::WavWriter::create(&cli.out, spec)
-        .with_context(|| format!("could not create {}", cli.out.display()))?;
 
     let mut mixer = StereoMixer::new();
     let mut interleaved = Vec::new();
@@ -366,11 +487,8 @@ fn write_stereo(cli: &Cli, mic_rx: &Receiver<Chunk>, sys_rx: &Receiver<Chunk>) -
 
         interleaved.clear();
         mixer.drain_into(&mut interleaved);
-        for &sample in &interleaved {
-            writer
-                .write_sample(sample)
-                .context("writing the WAV file failed mid-capture")?;
-        }
+        sink.write(&interleaved)
+            .context("writing the capture failed mid-recording")?;
         frames += (interleaved.len() / 2) as u64;
 
         if last_meter.elapsed() >= METER_REFRESH {
@@ -388,16 +506,9 @@ fn write_stereo(cli: &Cli, mic_rx: &Receiver<Chunk>, sys_rx: &Receiver<Chunk>) -
     // Nothing more will arrive: emit the tail, padding the shorter side.
     interleaved.clear();
     mixer.flush_into(&mut interleaved);
-    for &sample in &interleaved {
-        writer
-            .write_sample(sample)
-            .context("writing the WAV tail failed")?;
-    }
+    sink.write(&interleaved)
+        .context("writing the capture tail failed")?;
     frames += (interleaved.len() / 2) as u64;
-
-    writer
-        .finalize()
-        .context("could not finalize the WAV file")?;
 
     let to_ms = |f: i64| f as f64 * 1000.0 / f64::from(TARGET_SAMPLE_RATE);
     println!();
@@ -412,11 +523,19 @@ fn write_stereo(cli: &Cli, mic_rx: &Receiver<Chunk>, sys_rx: &Receiver<Chunk>) -
         "Worst divergence while both streams ran   : {worst_imbalance} frames ({:.1} ms)",
         to_ms(worst_imbalance)
     );
-    Ok(frames)
+    Ok((frames, sink, applied_skew.unwrap_or(0)))
+}
+
+/// Directory that holds the Opus segments and their manifest.
+///
+/// `--out meeting.opus` and `--out meeting` both write into `meeting/`, so the
+/// segments never collide with an unrelated file.
+fn opus_directory(out: &Path) -> PathBuf {
+    out.with_extension("")
 }
 
 fn report(out: &Path, frames: u64, outcomes: &[Option<ThreadOutcome>]) {
-    let size = std::fs::metadata(out).map(|meta| meta.len()).unwrap_or(0);
+    let size = directory_or_file_size(out);
     let duration = frames as f64 / f64::from(TARGET_SAMPLE_RATE);
 
     println!("\n--- Capture report ---");
@@ -457,6 +576,27 @@ fn report(out: &Path, frames: u64, outcomes: &[Option<ThreadOutcome>]) {
             if outcome.mmcss { "granted" } else { "DENIED" }
         );
     }
+}
+
+/// Total bytes at `path`, whether it is a single file or a directory of
+/// segments.
+fn directory_or_file_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() {
+        return meta.len();
+    }
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .filter_map(std::result::Result::ok)
+                .filter_map(|entry| entry.metadata().ok())
+                .filter(std::fs::Metadata::is_file)
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// Draw a VU meter for each channel.
