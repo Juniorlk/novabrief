@@ -84,3 +84,38 @@ Ces décisions modifient le brief initial et priment sur lui :
 - **Go** : C1 à C4 et C9 atteints sur au moins 4 configurations de périphériques, C2 mesuré et < 40 ms.
 - **Go conditionnel** : C5 ou C6 partiels, avec un plan de correction de moins de 3 jours.
 - **No-Go** : C1, C2 ou C3 non atteints après deux itérations. On revoit l'approche avant tout autre développement.
+
+---
+
+## Résultats mesurés (2026-09-07)
+
+Machine : Windows 11, 8 cœurs. Micro « Réseau de microphones (Intel Smart Sound) ».
+Sorties testées : « Speaker (Realtek(R) Audio) » et casque Bluetooth « Solix Nexus ANC ».
+
+| # | Critère | Cible | Mesuré | État |
+|---|---|---|---|---|
+| C1 | Deux flux captés en même temps | signal sur les deux voies | Voix (L) et vidéo YouTube (R) transcrites séparément, 3 min réelles | **Atteint** |
+| C2 | Décalage micro / système | < 40 ms après 60 min | **Non mesuré** — l'estimateur rapporte −83 293 ppm, valeur physiquement impossible, faussée par 10,25 % de trames manquantes | **Non mesuré** |
+| C3 | Aucune perte de trames | 0 discontinuité sur 60 min | 0 sur 10 min ; **10,25 % de l'audio perdu sur 60 min** sur les deux endpoints | **Échec** |
+| C4 | Loopback silencieux | fichier continu | 20 s à 100 % de silence synthétisé, durée exacte, aucun trou | **Atteint** |
+| C5 | Changement de périphérique | coupure ≤ 500 ms | Non implémenté (`IMMNotificationClient` absent) | **Non traité** |
+| C6 | Casque Bluetooth HFP | détecté et signalé | A2DP (48 kHz stéréo) et HFP (16 kHz mono) distingués et signalés, capture non bloquée | **Atteint** |
+| C7 | Consommation | < 10 % CPU, < 50 Mo RAM | CPU ~1 % ; **RAM 668 Mo à 32 min** (10,4 Mo sur capture courte) | **Échec** |
+| C8 | Poids du fichier | ≈ 14-15 Mo/h | 14,2 Mo/h (tonalité), 11,7 Mo/h sur 60 min | **Atteint** |
+| C9 | Qualité transcriptible | lisible sur les deux voies | Whisper `small` : les deux voies lisibles, séparation parfaite, aucune invention sur signal pur | **Atteint** |
+
+**Matrice de périphériques** : intégré (Realtek + Intel) et Bluetooth (A2DP + HFP) couverts.
+Casque USB, casque jack et sortie HDMI **non testés**.
+
+**Matrice d'applications** : YouTube (Chrome) couvert. Teams, Meet, Zoom et
+WhatsApp Desktop **non testés**.
+
+**Écart au brief** : la dérive est mesurée par les horodatages QPC des paquets
+WASAPI (régression linéaire trames / temps) et non par `tools/nb-testsignal` et
+`measure_drift.py`. La méthode QPC est plus précise, mais ces deux outils
+restent des squelettes.
+
+**Verdict au regard des règles du brief** : C2 non mesuré et C3 non atteint
+⇒ **No-Go en l'état**. Les correctifs sont spécifiés dans
+`docs/tasks/02_correctifs_capture_longue_duree.md` ; Novafrik a décidé le
+2026-09-07 de les différer et de poursuivre.
