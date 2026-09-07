@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use audio_engine::{
-    downmix_to_mono, peak, CaptureStats, Endpoint, EndpointCapture, MonoResampler,
-    SegmentedOpusWriter, StereoMixer, TARGET_SAMPLE_RATE,
+    downmix_to_mono, peak, projected_offset_ms, relative_ppm, CaptureStats, DriftEstimate,
+    DriftEstimator, Endpoint, EndpointCapture, MonoResampler, SegmentedOpusWriter, StereoMixer,
+    TARGET_SAMPLE_RATE,
 };
 use clap::Parser;
 
@@ -136,6 +137,8 @@ struct ThreadOutcome {
     input_channels: u16,
     mmcss: bool,
     stats: CaptureStats,
+    /// How fast this device's clock actually ran, measured during the capture.
+    drift: Option<DriftEstimate>,
 }
 
 fn main() -> Result<()> {
@@ -209,7 +212,9 @@ fn main() -> Result<()> {
         skew_ms,
     )?;
 
-    report(&output_path, written, &[mic_outcome, sys_outcome]);
+    let outcomes = [mic_outcome, sys_outcome];
+    report(&output_path, written, &outcomes);
+    report_relative_drift(&outcomes);
     Ok(())
 }
 
@@ -299,6 +304,8 @@ fn spawn_capture(
         let mut mono = Vec::new();
         let mut converted = Vec::new();
         let mut first_qpc: Option<u64> = None;
+        let mut estimator = DriftEstimator::new(format.sample_rate);
+        let mut device_frames: u64 = 0;
 
         let stats = capture.record(&stop, max_duration, |packet| {
             // Use the engine's reconstructed stream start, not the raw packet
@@ -306,6 +313,17 @@ fn spawn_capture(
             // once something plays, which can be far into the recording.
             if first_qpc.is_none() {
                 first_qpc = packet.stream_start_qpc_100ns;
+            }
+
+            // Only real packets time the device's own clock. Synthesised
+            // silence is generated against the system clock, so feeding it to
+            // the estimator would compare that clock with itself and report no
+            // drift however far the hardware actually strays.
+            if !packet.synthesised {
+                if let Some(qpc) = packet.qpc_100ns {
+                    estimator.observe(qpc, device_frames);
+                }
+                device_frames += (packet.samples.len() / format.channels.max(1) as usize) as u64;
             }
             downmix_to_mono(packet.samples, format.channels, &mut mono);
             converted.clear();
@@ -328,6 +346,7 @@ fn spawn_capture(
             input_channels: format.channels,
             mmcss: capture.mmcss_active(),
             stats,
+            drift: estimator.estimate(),
         })
     })
 }
@@ -534,6 +553,53 @@ fn opus_directory(out: &Path) -> PathBuf {
     out.with_extension("")
 }
 
+/// Print the C2 verdict: how far apart the two clocks run, and what that means
+/// for a meeting of realistic length.
+fn report_relative_drift(outcomes: &[Option<ThreadOutcome>]) {
+    let drifts: Vec<DriftEstimate> = outcomes
+        .iter()
+        .flatten()
+        .filter_map(|outcome| outcome.drift)
+        .collect();
+
+    let [mic, system] = drifts.as_slice() else {
+        println!(
+            "
+Relative drift (C2): not measurable — both endpoints must be              recorded for long enough."
+        );
+        return;
+    };
+
+    let ppm = relative_ppm(mic, system);
+    let shortest = mic.observed_seconds.min(system.observed_seconds);
+    println!(
+        "
+--- Clock drift (C2) ---"
+    );
+    println!("Relative drift    : {ppm:+.2} ppm (microphone against system)");
+    println!("Measured over     : {shortest:.0} s of real packets on both endpoints");
+    for minutes in [15.0_f64, 60.0, 90.0] {
+        println!(
+            "  projected at {:>2.0} min : {:+7.1} ms",
+            minutes,
+            projected_offset_ms(ppm, minutes * 60.0)
+        );
+    }
+    // C2 allows 40 ms after 60 minutes, which is 11.1 ppm of relative drift.
+    let budget_ppm = 40.0 / 3600.0 * 1000.0;
+    if ppm.abs() <= budget_ppm {
+        println!(
+            "VERDICT           : within C2 ({:.1} ppm budget) without compensation",
+            budget_ppm
+        );
+    } else {
+        println!(
+            "VERDICT           : exceeds C2 ({:.1} ppm budget) — compensation required",
+            budget_ppm
+        );
+    }
+}
+
 fn report(out: &Path, frames: u64, outcomes: &[Option<ThreadOutcome>]) {
     let size = directory_or_file_size(out);
     let duration = frames as f64 / f64::from(TARGET_SAMPLE_RATE);
@@ -575,6 +641,17 @@ fn report(out: &Path, frames: u64, outcomes: &[Option<ThreadOutcome>]) {
             "  MMCSS Pro Audio : {}",
             if outcome.mmcss { "granted" } else { "DENIED" }
         );
+        match outcome.drift {
+            Some(drift) => println!(
+                "  clock           : {:.3} Hz measured vs {:.0} nominal = {:+.2} ppm                  (over {:.0} s, {} points)",
+                drift.measured_rate,
+                drift.nominal_rate,
+                drift.ppm,
+                drift.observed_seconds,
+                drift.samples
+            ),
+            None => println!("  clock           : not enough data to measure drift"),
+        }
     }
 }
 

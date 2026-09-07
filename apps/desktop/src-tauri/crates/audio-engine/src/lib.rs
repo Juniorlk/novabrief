@@ -14,6 +14,7 @@
 //!    imbalance between the two streams; the compensator that corrects it, then
 //!    Opus encoding, segments and the manifest, come next.
 
+pub mod drift;
 pub mod encode;
 pub mod error;
 pub mod format;
@@ -22,6 +23,7 @@ pub mod resample;
 #[cfg(windows)]
 pub mod capture;
 
+pub use drift::{projected_offset_ms, relative_ppm, DriftEstimate, DriftEstimator};
 pub use encode::{EncodeError, Manifest, SegmentRecord, SegmentedOpusWriter};
 pub use error::{CaptureError, Endpoint, Result};
 pub use format::{downmix_to_mono, peak, SampleFormat, StreamFormat};
