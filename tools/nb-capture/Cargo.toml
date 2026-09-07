@@ -12,3 +12,7 @@ workspace = true
 
 [dependencies]
 audio-engine = { path = "../../apps/desktop/src-tauri/crates/audio-engine" }
+hound = "3.5.1"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }

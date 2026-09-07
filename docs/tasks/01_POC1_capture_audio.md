@@ -18,7 +18,7 @@ Si ce POC échoue, NovaBrief tel que conçu n'existe pas. Il vaut donc mieux un 
    - conversion de chaque flux en mono, rééchantillonnage à 16 kHz (`rubato` ou équivalent) ;
    - compensateur de dérive d'horloge entre les deux flux (mesure du décalage cumulé, correction sub-milliseconde) ;
    - encodage Opus 32 kbps **stéréo** (canal gauche = micro, canal droit = système) par trames de 20 ms dans un conteneur Ogg ;
-   - écriture par segments de 5 s avec un manifeste JSON (durée, périphériques, horodatages, SHA-256 par segment).
+   - écriture par segments de 5 à 10 s avec un manifeste JSON (durée, périphériques, horodatages, SHA-256 par segment).
 2. Un binaire CLI `tools/nb-capture` : `nb-capture --duration 60 --out capture.ogg [--input <device>] [--output <device>]`, qui affiche en continu les niveaux des deux voies (vu-mètres texte) et écrit le fichier.
 3. Un générateur de signal de test `tools/nb-testsignal` qui joue dans les haut-parleurs des clics à intervalles connus (toutes les 10 s) et un script Python `tools/measure_drift.py` qui mesure, sur le fichier capturé, le décalage entre les clics captés par le loopback et les mêmes clics captés par le micro (haut-parleurs → micro), et trace la dérive dans le temps.
 4. Le compte rendu (format §9 des instructions) avec la **matrice de résultats** ci-dessous remplie.
@@ -32,8 +32,8 @@ Si ce POC échoue, NovaBrief tel que conçu n'existe pas. Il vaut donc mieux un 
 | C3 | Aucune perte de trames | 0 discontinuité sur 60 min | Compteur de `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` + continuité des horodatages |
 | C4 | Loopback silencieux | Quand rien n'est joué, le fichier reste continu (silence encodé, pas de trou) | Capture de 5 min sans son système, durée du fichier = 5 min |
 | C5 | Changement de périphérique en cours de capture | Coupure ≤ 500 ms, capture reprise sans redémarrage | Brancher un casque USB / Bluetooth pendant la capture |
-| C6 | Casque Bluetooth en profil mains-libres (HFP) | Détecté et signalé (le format passe à 8 kHz / 16 kHz mono) | Test avec un casque BT en appel Teams |
-| C7 | Consommation | < 3 % CPU et < 60 Mo RAM sur un portable modeste pendant la capture | Gestionnaire des tâches, 10 min |
+| C6 | Casque Bluetooth en profil mains-libres (HFP) | Détecté et **signalé sans bloquer** la capture (le format passe à 8 kHz / 16 kHz mono) | Test avec un casque BT en appel Teams |
+| C7 | Consommation | < 10 % CPU et < 50 Mo RAM pendant la capture | Gestionnaire des tâches, 10 min |
 | C8 | Poids du fichier | ≈ 14-15 Mo par heure | Taille du fichier / durée |
 | C9 | Qualité transcriptible | Une transcription AssemblyAI (ou Whisper local) du fichier est lisible sur les deux voies | Transcription rapide d'un extrait de 3 min |
 
@@ -56,6 +56,19 @@ Applications à tester : Microsoft Teams (client), Google Meet (Chrome et Edge),
 - Pas de chiffrement local, pas d'upload, pas d'API : ils viennent au lot Desktop.
 - Pas de pilote virtuel (VB-Cable ou autre), pas de capture par hook d'application.
 - Pas de transcription complète : seulement l'extrait de 3 min du critère C9.
+
+## Arbitrages Novafrik du 2026-09-07
+
+Ces décisions modifient le brief initial et priment sur lui :
+
+- **C7 assoupli sur le CPU, resserré sur la mémoire** : cible < 10 % CPU et
+  < 50 Mo RAM (au lieu de < 3 % et < 60 Mo).
+- **Segments de 5 à 10 s** au lieu de 5 s strictes.
+- **C6 ne bloque jamais** : un casque Bluetooth en profil mains-libres est
+  détecté et signalé à l'utilisateur, la capture continue en format dégradé.
+- **Trois portes prioritaires**, dans l'ordre : (1) loopback seul → WAV valide,
+  (2) micro + loopback synchronisés, (3) capture continue de 60 min. Les autres
+  critères sont mesurés mais ne conditionnent pas la poursuite.
 
 ## Déroulé attendu
 

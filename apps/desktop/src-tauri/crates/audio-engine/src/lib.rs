@@ -4,10 +4,21 @@
 //! input device and the default render device (WASAPI loopback) simultaneously,
 //! resample both to 16 kHz mono, compensate the drift between the two clocks,
 //! and encode them as a stereo Opus stream (left = microphone, right = system)
-//! written in 5-second Ogg segments alongside a JSON manifest.
+//! written in 5 to 10 second Ogg segments alongside a JSON manifest.
 //!
-//! The bootstrap commit only registers the crate in the workspace so that
-//! `cargo fmt`, `cargo clippy` and `cargo test` have a target. The engine itself
-//! is written during POC #1.
+//! Milestone reached so far: loopback capture of the default render device to a
+//! valid WAV file, with the format read from `GetMixFormat` rather than assumed,
+//! silence synthesised while nothing plays, and dropped packets counted.
+//! Microphone capture, drift compensation and Opus encoding follow.
 
-#![cfg_attr(not(windows), allow(dead_code))]
+pub mod error;
+pub mod format;
+
+#[cfg(windows)]
+pub mod loopback;
+
+pub use error::{CaptureError, Endpoint, Result};
+pub use format::{downmix_to_mono, peak, SampleFormat, StreamFormat};
+
+#[cfg(windows)]
+pub use loopback::{CaptureStats, LoopbackCapture};
