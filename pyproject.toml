@@ -7,7 +7,17 @@ name = "novabrief"
 version = "0.1.0"
 description = "NovaBrief — monorepo tooling root (Novafrik)."
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "fastapi==0.121.2",
+    "uvicorn[standard]==0.41.0",
+    "pydantic==2.12.4",
+    "pydantic-settings==2.13.0",
+    "sqlalchemy[asyncio]==2.0.45",
+    "asyncpg==0.31.0",
+    "alembic==1.17.1",
+    "structlog==25.5.0",
+    "sentry-sdk[fastapi]==2.44.0",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -79,7 +89,9 @@ warn_unused_configs = true
 show_error_codes = true
 pretty = true
 files = ["packages", "apps/api/app"]
-mypy_path = ["packages"]
+# apps/api is the import root: the package is apps/api/app, so `app.config`
+# only resolves when its parent directory is on the path.
+mypy_path = ["packages", "apps/api"]
 explicit_package_bases = true
 namespace_packages = true
 
@@ -89,6 +101,8 @@ namespace_packages = true
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["apps/api", "packages", "tools"]
+# Same import root as mypy, so tests and type checking agree.
+pythonpath = ["apps/api", "packages"]
 asyncio_mode = "auto"
 addopts = "-ra --strict-markers --strict-config"
 filterwarnings = ["error"]

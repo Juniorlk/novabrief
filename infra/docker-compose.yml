@@ -1,0 +1,103 @@
+# Local development stack for NovaBrief.
+#
+# MinIO stands in for Cloudflare R2: both speak the S3 API, so the same client
+# code and presigned-URL flow run locally and in production without a branch.
+#
+# Exit criterion of lot L0: `docker compose up` answers on /health.
+
+name: novabrief
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-novabrief}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-novabrief}
+      POSTGRES_DB: ${POSTGRES_DB:-novabrief}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-novabrief}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # Persistence off: Redis holds the Celery queue and caches, both
+    # reconstructible. Durable state belongs in PostgreSQL.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${R2_ACCESS_KEY_ID:-novabrief}
+      MINIO_ROOT_PASSWORD: ${R2_SECRET_ACCESS_KEY:-novabrief-dev-secret}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Creates the buckets once and exits; the API expects them to exist.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${R2_ACCESS_KEY_ID:-novabrief}
+      MINIO_ROOT_PASSWORD: ${R2_SECRET_ACCESS_KEY:-novabrief-dev-secret}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+      mc mb --ignore-existing local/novabrief-audio &&
+      mc mb --ignore-existing local/novabrief-invoices &&
+      echo 'buckets ready'
+      "
+    restart: "no"
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/api.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: dev
+      LOG_FORMAT: console
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-novabrief}:${POSTGRES_PASSWORD:-novabrief}@postgres:5432/${POSTGRES_DB:-novabrief}
+      REDIS_URL: redis://redis:6379/0
+      R2_ENDPOINT: http://minio:9000
+      CORS_ALLOWED_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  postgres_data:
+  minio_data:
