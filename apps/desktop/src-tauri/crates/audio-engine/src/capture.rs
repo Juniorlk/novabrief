@@ -1,10 +1,13 @@
-//! WASAPI loopback capture of the default render device.
+//! WASAPI capture of an audio endpoint.
 //!
-//! Shared mode, no driver, no elevation: we open the endpoint the user is
-//! already listening to and ask Windows for a copy of the mix. That is what
-//! makes NovaBrief independent of Teams, Meet or Zoom.
+//! One type serves both streams NovaBrief needs:
 //!
-//! Two behaviours here are deliberate rather than incidental:
+//! * the **default render device in loopback**, which is what the user hears —
+//!   Teams, Meet, Zoom, a browser, anything — captured in shared mode with no
+//!   driver, no bot and no elevation;
+//! * the **default capture device**, i.e. the microphone.
+//!
+//! Three behaviours here are deliberate rather than incidental:
 //!
 //! * **Silence is synthesised.** A loopback client delivers no packet at all
 //!   while nothing is playing, so a naive recorder produces a file shorter than
@@ -14,19 +17,23 @@
 //! * **Discontinuities are counted, not hidden.** Windows flags dropped data
 //!   with `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`; the count is reported so
 //!   criterion C3 is measured instead of assumed.
+//! * **Formats are read, never assumed.** `GetMixFormat` decides; assuming
+//!   48 kHz stereo float is how a recorder ends up silent on somebody else's
+//!   laptop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{HANDLE, S_FALSE};
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_LOOPBACK,
+    eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
+    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
 };
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
@@ -34,8 +41,6 @@ use windows::Win32::System::Threading::{
 
 use crate::error::{CaptureError, Endpoint, Result};
 use crate::format::{stream_format_from_waveformatex, StreamFormat};
-
-const ENDPOINT: Endpoint = Endpoint::SystemLoopback;
 
 /// WASAPI buffer duration requested at initialisation, in 100 ns units (200 ms).
 const REQUESTED_BUFFER_HNS: i64 = 2_000_000;
@@ -110,75 +115,96 @@ impl Drop for ProAudioPriority {
     }
 }
 
-/// An opened loopback stream, ready to record.
-pub struct LoopbackCapture {
+/// Initialise COM for the calling thread.
+///
+/// Every capture runs on its own thread with its own WASAPI client, so each one
+/// initialises COM for itself.
+fn init_com_for_this_thread() -> Result<()> {
+    // SAFETY: initialising COM on this thread. S_FALSE means it was already
+    // initialised compatibly, which is fine.
+    let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if hr.is_err() && hr != S_FALSE {
+        return Err(CaptureError::ComInit(windows::core::Error::from(hr)));
+    }
+    Ok(())
+}
+
+/// An opened WASAPI stream, ready to record.
+pub struct EndpointCapture {
     client: IAudioClient,
     capture: IAudioCaptureClient,
     format: StreamFormat,
+    endpoint: Endpoint,
+    device_name: String,
     mmcss_active: bool,
 }
 
-impl std::fmt::Debug for LoopbackCapture {
+impl std::fmt::Debug for EndpointCapture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LoopbackCapture")
+        f.debug_struct("EndpointCapture")
+            .field("endpoint", &self.endpoint)
+            .field("device_name", &self.device_name)
             .field("format", &self.format)
             .field("mmcss_active", &self.mmcss_active)
             .finish_non_exhaustive()
     }
 }
 
-impl LoopbackCapture {
-    /// Open the default render endpoint in loopback mode.
+impl EndpointCapture {
+    /// Open the default render endpoint in loopback mode: what the user hears.
+    pub fn open_system_loopback() -> Result<Self> {
+        Self::open(Endpoint::SystemLoopback)
+    }
+
+    /// Open the default capture endpoint: the microphone.
+    pub fn open_microphone() -> Result<Self> {
+        Self::open(Endpoint::Microphone)
+    }
+
+    /// Open one of the two endpoints.
     ///
     /// COM is initialised for the calling thread; the returned value must be
     /// used from that same thread.
-    pub fn open() -> Result<Self> {
-        // SAFETY: initialising COM on this thread. S_FALSE means it was already
-        // initialised compatibly, which is fine.
-        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        if hr.is_err() && hr != S_FALSE {
-            return Err(CaptureError::ComInit(windows::core::Error::from(hr)));
-        }
+    pub fn open(endpoint: Endpoint) -> Result<Self> {
+        init_com_for_this_thread()?;
+
+        let loopback = endpoint == Endpoint::SystemLoopback;
+        let data_flow = if loopback { eRender } else { eCapture };
+        // Loopback is the one case where we capture from a *render* endpoint,
+        // which is exactly what the stream flag asks Windows to do.
+        let stream_flags = if loopback {
+            AUDCLNT_STREAMFLAGS_LOOPBACK
+        } else {
+            0
+        };
 
         // SAFETY: standard WASAPI enumeration; every pointer below is owned by
         // the COM runtime and released by the wrapper types on drop.
-        let (client, capture, format) = unsafe {
+        let (client, capture, format, device_name) = unsafe {
             let enumerator: IMMDeviceEnumerator =
-                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|source| {
-                    CaptureError::DeviceOpen {
-                        endpoint: ENDPOINT,
-                        source,
-                    }
-                })?;
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .map_err(|source| CaptureError::DeviceOpen { endpoint, source })?;
 
             let device = enumerator
-                .GetDefaultAudioEndpoint(eRender, eConsole)
-                .map_err(|source| CaptureError::NoDefaultDevice {
-                    endpoint: ENDPOINT,
-                    source,
-                })?;
+                .GetDefaultAudioEndpoint(data_flow, eConsole)
+                .map_err(|source| CaptureError::NoDefaultDevice { endpoint, source })?;
 
-            let client: IAudioClient =
-                device
-                    .Activate(CLSCTX_ALL, None)
-                    .map_err(|source| CaptureError::DeviceOpen {
-                        endpoint: ENDPOINT,
-                        source,
-                    })?;
+            let device_name = friendly_name(&device);
+
+            let client: IAudioClient = device
+                .Activate(CLSCTX_ALL, None)
+                .map_err(|source| CaptureError::DeviceOpen { endpoint, source })?;
 
             let mix_format = client
                 .GetMixFormat()
-                .map_err(|source| CaptureError::DeviceOpen {
-                    endpoint: ENDPOINT,
-                    source,
-                })?;
+                .map_err(|source| CaptureError::DeviceOpen { endpoint, source })?;
 
             // Read the negotiated format before anything can fail, then hand the
             // allocation straight back to the COM allocator.
-            let parsed = stream_format_from_waveformatex(mix_format, ENDPOINT);
+            let parsed = stream_format_from_waveformatex(mix_format, endpoint);
             let init = client.Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
+                stream_flags,
                 REQUESTED_BUFFER_HNS,
                 0,
                 mix_format,
@@ -187,26 +213,21 @@ impl LoopbackCapture {
             CoTaskMemFree(Some(mix_format.cast()));
 
             let format = parsed?;
-            init.map_err(|source| CaptureError::DeviceOpen {
-                endpoint: ENDPOINT,
-                source,
-            })?;
+            init.map_err(|source| CaptureError::DeviceOpen { endpoint, source })?;
 
-            let capture: IAudioCaptureClient =
-                client
-                    .GetService()
-                    .map_err(|source| CaptureError::DeviceOpen {
-                        endpoint: ENDPOINT,
-                        source,
-                    })?;
+            let capture: IAudioCaptureClient = client
+                .GetService()
+                .map_err(|source| CaptureError::DeviceOpen { endpoint, source })?;
 
-            (client, capture, format)
+            (client, capture, format, device_name)
         };
 
         Ok(Self {
             client,
             capture,
             format,
+            endpoint,
+            device_name,
             mmcss_active: false,
         })
     }
@@ -215,6 +236,18 @@ impl LoopbackCapture {
     #[must_use]
     pub const fn format(&self) -> StreamFormat {
         self.format
+    }
+
+    /// Which endpoint this capture reads from.
+    #[must_use]
+    pub const fn endpoint(&self) -> Endpoint {
+        self.endpoint
+    }
+
+    /// Friendly name of the device, as shown in Windows sound settings.
+    #[must_use]
+    pub fn device_name(&self) -> &str {
+        &self.device_name
     }
 
     /// Whether the capture thread was granted MMCSS "Pro Audio" priority.
@@ -242,7 +275,7 @@ impl LoopbackCapture {
 
         // SAFETY: the client is initialised and owned by self.
         unsafe { self.client.Start() }.map_err(|source| CaptureError::StreamFailure {
-            endpoint: ENDPOINT,
+            endpoint: self.endpoint,
             source,
         })?;
 
@@ -264,6 +297,7 @@ impl LoopbackCapture {
     where
         F: FnMut(&[f32]),
     {
+        let endpoint = self.endpoint;
         let mut stats = CaptureStats::default();
         let mut decoded: Vec<f32> = Vec::new();
         let mut silence: Vec<f32> = Vec::new();
@@ -285,12 +319,8 @@ impl LoopbackCapture {
 
             loop {
                 // SAFETY: capture client is live for as long as self.
-                let available = unsafe { self.capture.GetNextPacketSize() }.map_err(|source| {
-                    CaptureError::StreamFailure {
-                        endpoint: ENDPOINT,
-                        source,
-                    }
-                })?;
+                let available = unsafe { self.capture.GetNextPacketSize() }
+                    .map_err(|source| CaptureError::StreamFailure { endpoint, source })?;
                 if available == 0 {
                     break;
                 }
@@ -305,10 +335,7 @@ impl LoopbackCapture {
                     self.capture
                         .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
                 }
-                .map_err(|source| CaptureError::StreamFailure {
-                    endpoint: ENDPOINT,
-                    source,
-                })?;
+                .map_err(|source| CaptureError::StreamFailure { endpoint, source })?;
 
                 if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 && first_packet_seen
                 {
@@ -334,12 +361,8 @@ impl LoopbackCapture {
                 }
 
                 // SAFETY: releases exactly the buffer acquired above.
-                unsafe { self.capture.ReleaseBuffer(frames) }.map_err(|source| {
-                    CaptureError::StreamFailure {
-                        endpoint: ENDPOINT,
-                        source,
-                    }
-                })?;
+                unsafe { self.capture.ReleaseBuffer(frames) }
+                    .map_err(|source| CaptureError::StreamFailure { endpoint, source })?;
 
                 if !decoded.is_empty() {
                     stats.frames += frame_count as u64;
@@ -369,6 +392,32 @@ impl LoopbackCapture {
         }
 
         Ok(stats)
+    }
+}
+
+/// Read the device's friendly name, falling back to a placeholder.
+///
+/// The name is reporting metadata only, so a failure here must never stop a
+/// recording that would otherwise work.
+///
+/// # Safety
+/// `device` must be a live `IMMDevice`.
+unsafe fn friendly_name(device: &windows::Win32::Media::Audio::IMMDevice) -> String {
+    const UNKNOWN: &str = "unknown device";
+    // SAFETY: the property store and the variant are released by their wrappers.
+    unsafe {
+        let Ok(store) = device.OpenPropertyStore(STGM_READ) else {
+            return UNKNOWN.to_owned();
+        };
+        let Ok(value) = store.GetValue(&PKEY_Device_FriendlyName) else {
+            return UNKNOWN.to_owned();
+        };
+        let name = value.to_string();
+        if name.is_empty() {
+            UNKNOWN.to_owned()
+        } else {
+            name
+        }
     }
 }
 

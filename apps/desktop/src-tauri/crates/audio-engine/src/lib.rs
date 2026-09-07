@@ -6,19 +6,24 @@
 //! and encode them as a stereo Opus stream (left = microphone, right = system)
 //! written in 5 to 10 second Ogg segments alongside a JSON manifest.
 //!
-//! Milestone reached so far: loopback capture of the default render device to a
-//! valid WAV file, with the format read from `GetMixFormat` rather than assumed,
-//! silence synthesised while nothing plays, and dropped packets counted.
-//! Microphone capture, drift compensation and Opus encoding follow.
+//! Progress against the three gates Novafrik set:
+//!
+//! 1. **Loopback alone to a valid WAV** — done.
+//! 2. **Microphone + loopback, resampled to 16 kHz and mixed to stereo** — done.
+//! 3. **60 minutes continuous with drift under 40 ms** — the mixer measures the
+//!    imbalance between the two streams; the compensator that corrects it, then
+//!    Opus encoding, segments and the manifest, come next.
 
 pub mod error;
 pub mod format;
+pub mod resample;
 
 #[cfg(windows)]
-pub mod loopback;
+pub mod capture;
 
 pub use error::{CaptureError, Endpoint, Result};
 pub use format::{downmix_to_mono, peak, SampleFormat, StreamFormat};
+pub use resample::{MonoResampler, StereoMixer, TARGET_SAMPLE_RATE};
 
 #[cfg(windows)]
-pub use loopback::{CaptureStats, LoopbackCapture};
+pub use capture::{CaptureStats, EndpointCapture};

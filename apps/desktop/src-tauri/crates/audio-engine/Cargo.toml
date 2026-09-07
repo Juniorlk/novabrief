@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+rubato = "0.16"
 thiserror = "2.0.20"
 
 [target.'cfg(windows)'.dependencies]

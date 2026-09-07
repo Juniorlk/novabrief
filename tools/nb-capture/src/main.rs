@@ -1,247 +1,376 @@
 //! `nb-capture` — command-line recorder used to validate POC #1.
 //!
-//! Milestone reached: loopback only, written to a WAV file, which is the first
-//! of the three gates Novafrik set (loopback alone -> valid WAV, then
-//! microphone + loopback, then 60 minutes continuous).
+//! Captures the microphone and the system audio simultaneously, resamples both
+//! to 16 kHz mono, and writes them as a stereo WAV where the left channel is
+//! the microphone and the right channel is what the machine was playing.
 //!
-//! Dependencies are deliberately minimal — no `clap`, no `anyhow`. Smart App
-//! Control is enforcing on the development machine and blocks Cargo build
-//! scripts and proc-macro DLLs, so this binary sticks to crates that need
-//! neither. See the task report for the decision that has to be made about it.
+//! Each endpoint runs on its own thread: WASAPI clients are apartment-bound and
+//! the two devices have independent clocks, so they cannot share a pump. The
+//! threads resample their own stream and hand 16 kHz mono chunks to the writer
+//! thread, which interleaves them.
 //!
-//! Printing to stdout is the point of this binary: it shows a live text VU
-//! meter while recording, so a human can see signal arriving.
+//! Printing to stdout is the point of this binary: it shows live text VU meters
+//! for both channels, so a human can see signal arriving on each.
 #![allow(clippy::print_stdout)]
 
-use std::error::Error;
 use std::io::Write;
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use audio_engine::{peak, LoopbackCapture};
+use anyhow::{anyhow, Context, Result};
+use audio_engine::{
+    downmix_to_mono, peak, CaptureStats, Endpoint, EndpointCapture, MonoResampler, StereoMixer,
+    TARGET_SAMPLE_RATE,
+};
+use clap::Parser;
 
-type Failure = Box<dyn Error>;
-
-/// How often the VU meter is redrawn.
+/// How often the VU meters are redrawn.
 const METER_REFRESH: Duration = Duration::from_millis(100);
 
-const USAGE: &str = "\
-nb-capture — capture Windows system audio (WASAPI loopback) to a WAV file
+/// Capture a meeting's audio: microphone on the left, system on the right.
+#[derive(Debug, Parser)]
+#[command(name = "nb-capture", version, about)]
+struct Cli {
+    /// Recording length in seconds. Omit to record until Ctrl+C.
+    #[arg(short, long, value_name = "SECONDS")]
+    duration: Option<u64>,
 
-USAGE:
-    nb-capture [OPTIONS]
-
-OPTIONS:
-    -d, --duration <SECONDS>   Recording length. Omit to record until Ctrl+C.
-    -o, --out <FILE>           Output file (default: capture.wav)
-        --no-tty               Print one meter line per refresh instead of
-                               redrawing in place, for piping to a file.
-    -h, --help                 Show this help.
-";
-
-#[derive(Debug)]
-struct Options {
-    duration: Option<Duration>,
+    /// Output file. The current milestone writes WAV; Opus/Ogg comes with the
+    /// encoding step.
+    #[arg(short, long, value_name = "FILE", default_value = "capture.wav")]
     out: PathBuf,
+
+    /// Record only the microphone, leaving the system channel silent.
+    #[arg(long, conflicts_with = "system_only")]
+    mic_only: bool,
+
+    /// Record only the system audio, leaving the microphone channel silent.
+    #[arg(long)]
+    system_only: bool,
+
+    /// Print one meter line per refresh instead of redrawing in place, so the
+    /// output stays readable when piped to a file.
+    #[arg(long)]
     no_tty: bool,
 }
 
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            duration: None,
-            out: PathBuf::from("capture.wav"),
-            no_tty: false,
-        }
-    }
+/// A chunk of 16 kHz mono audio on its way to the writer.
+struct Chunk {
+    samples: Vec<f32>,
 }
 
-/// Parse the command line. Returns `Ok(None)` when help was requested.
-fn parse_args() -> Result<Option<Options>, Failure> {
-    let mut options = Options::default();
-    let mut args = std::env::args().skip(1);
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(None),
-            "-d" | "--duration" => {
-                let value = args
-                    .next()
-                    .ok_or("--duration expects a number of seconds")?;
-                let seconds: u64 = value.parse().map_err(|_| {
-                    format!("--duration expects a number of seconds, got {value:?}")
-                })?;
-                options.duration = Some(Duration::from_secs(seconds));
-            }
-            "-o" | "--out" => {
-                let value = args.next().ok_or("--out expects a file path")?;
-                options.out = PathBuf::from(value);
-            }
-            "--no-tty" => options.no_tty = true,
-            other => return Err(format!("unknown argument {other:?}\n\n{USAGE}").into()),
-        }
-    }
-
-    Ok(Some(options))
+/// What one capture thread reports back when it finishes.
+struct ThreadOutcome {
+    endpoint: Endpoint,
+    device_name: String,
+    input_rate: u32,
+    input_channels: u16,
+    mmcss: bool,
+    stats: CaptureStats,
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("nb-capture: {error}");
-            let mut source = error.source();
-            while let Some(cause) = source {
-                eprintln!("  caused by: {cause}");
-                source = cause.source();
-            }
-            ExitCode::FAILURE
-        }
-    }
-}
+fn main() -> Result<()> {
+    let cli = Cli::parse();
 
-fn run() -> Result<(), Failure> {
-    let Some(options) = parse_args()? else {
-        print!("{USAGE}");
-        return Ok(());
-    };
-
-    let mut capture = LoopbackCapture::open().map_err(|error| {
-        format!(
-            "{error}\nCheck that an output device is present and enabled in \
-             Windows sound settings."
-        )
-    })?;
-
-    let format = capture.format();
-    println!(
-        "Device format : {} Hz, {} ch, {:?}",
-        format.sample_rate, format.channels, format.sample_format
-    );
-    println!("Output        : {}", options.out.display());
-    match options.duration {
-        Some(duration) => println!("Duration      : {} s", duration.as_secs()),
-        None => println!("Duration      : until Ctrl+C"),
-    }
-
-    // The WAV mirrors the endpoint format exactly: this milestone proves the
-    // capture, so it must not hide anything behind a conversion.
-    let spec = hound::WavSpec {
-        channels: format.channels,
-        sample_rate: format.sample_rate,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-    let mut writer = hound::WavWriter::create(&options.out, spec)
-        .map_err(|error| format!("could not create {}: {error}", options.out.display()))?;
+    let want_mic = !cli.system_only;
+    let want_system = !cli.mic_only;
 
     let stop = Arc::new(AtomicBool::new(false));
     let ctrlc_flag = Arc::clone(&stop);
     install_ctrlc_handler(move || ctrlc_flag.store(true, Ordering::Relaxed))?;
 
+    let max_duration = cli.duration.map(Duration::from_secs);
+    let (mic_tx, mic_rx) = channel::<Chunk>();
+    let (sys_tx, sys_rx) = channel::<Chunk>();
+
+    let mic_thread = want_mic.then(|| {
+        spawn_capture(
+            Endpoint::Microphone,
+            Arc::clone(&stop),
+            max_duration,
+            mic_tx,
+        )
+    });
+    let sys_thread = want_system.then(|| {
+        spawn_capture(
+            Endpoint::SystemLoopback,
+            Arc::clone(&stop),
+            max_duration,
+            sys_tx,
+        )
+    });
+
+    println!("Working rate  : {TARGET_SAMPLE_RATE} Hz, stereo (L = microphone, R = system)");
+    println!("Output        : {}", cli.out.display());
+    match max_duration {
+        Some(duration) => println!("Duration      : {} s", duration.as_secs()),
+        None => println!("Duration      : until Ctrl+C"),
+    }
     println!("\nRecording. Press Ctrl+C to stop.\n");
 
-    let mut last_meter = Instant::now();
-    let mut window_peak = 0.0_f32;
-    let mut write_error: Option<hound::Error> = None;
+    let written = write_stereo(&cli, &mic_rx, &sys_rx)?;
 
-    let stats = capture.record(&stop, options.duration, |samples| {
-        if write_error.is_some() {
-            return;
-        }
-        for &sample in samples {
-            if let Err(error) = writer.write_sample(sample) {
-                write_error = Some(error);
-                return;
-            }
-        }
+    // The channels are closed once both capture threads have finished, so the
+    // writer above has already drained everything by the time we join.
+    let mic_outcome = join_capture(mic_thread)?;
+    let sys_outcome = join_capture(sys_thread)?;
 
-        window_peak = window_peak.max(peak(samples));
-        if last_meter.elapsed() >= METER_REFRESH {
-            render_meter(window_peak, options.no_tty);
-            window_peak = 0.0;
-            last_meter = Instant::now();
-        }
-    })?;
-
-    if let Some(error) = write_error {
-        return Err(format!("writing the WAV file failed mid-capture: {error}").into());
-    }
-    writer
-        .finalize()
-        .map_err(|error| format!("could not finalize the WAV file: {error}"))?;
-
-    report(
-        &options.out,
-        &stats,
-        format.sample_rate,
-        capture.mmcss_active(),
-    );
+    report(&cli.out, written, &[mic_outcome, sys_outcome]);
     Ok(())
 }
 
-fn report(
-    out: &std::path::Path,
-    stats: &audio_engine::CaptureStats,
-    sample_rate: u32,
-    mmcss: bool,
-) {
-    let size = std::fs::metadata(out).map(|meta| meta.len()).unwrap_or(0);
-    let padded_share = if stats.frames == 0 {
-        0.0
-    } else {
-        stats.padded_frames as f64 * 100.0 / stats.frames as f64
-    };
+/// Start one endpoint capture on its own thread, resampling to the working rate.
+fn spawn_capture(
+    endpoint: Endpoint,
+    stop: Arc<AtomicBool>,
+    max_duration: Option<Duration>,
+    tx: Sender<Chunk>,
+) -> std::thread::JoinHandle<Result<ThreadOutcome>> {
+    std::thread::spawn(move || -> Result<ThreadOutcome> {
+        let mut capture = EndpointCapture::open(endpoint)
+            .with_context(|| format!("could not open the {endpoint} endpoint"))?;
 
-    println!("\n\n--- Capture report ---");
-    println!(
-        "Duration          : {:.2} s",
-        stats.duration(sample_rate).as_secs_f64()
-    );
-    println!("Frames            : {}", stats.frames);
-    println!(
-        "Discontinuities   : {}  (C3 target: 0)",
-        stats.discontinuities
-    );
-    println!("Silent packets    : {}", stats.silent_packets);
-    println!(
-        "Synthesised frames: {} ({padded_share:.1} % of the file)",
-        stats.padded_frames
-    );
-    println!(
-        "MMCSS Pro Audio   : {}",
-        if mmcss { "granted" } else { "DENIED" }
-    );
-    println!("File size         : {size} bytes");
-    println!("Output            : {}", out.display());
+        let format = capture.format();
+        let mut resampler = MonoResampler::new(format.sample_rate);
+        let mut mono = Vec::new();
+        let mut converted = Vec::new();
+
+        let stats = capture.record(&stop, max_duration, |interleaved| {
+            downmix_to_mono(interleaved, format.channels, &mut mono);
+            converted.clear();
+            resampler.process(&mono, &mut converted);
+            if !converted.is_empty() {
+                // A closed receiver means the writer stopped; the capture then
+                // has nowhere to send audio, so there is nothing to do but
+                // let the loop wind down on the stop flag.
+                let _ = tx.send(Chunk {
+                    samples: std::mem::take(&mut converted),
+                });
+            }
+        })?;
+
+        Ok(ThreadOutcome {
+            endpoint,
+            device_name: capture.device_name().to_owned(),
+            input_rate: format.sample_rate,
+            input_channels: format.channels,
+            mmcss: capture.mmcss_active(),
+            stats,
+        })
+    })
 }
 
-/// Draw a 40-character VU meter for the captured signal.
-fn render_meter(level: f32, no_tty: bool) {
-    const WIDTH: usize = 40;
-    let filled = ((level.clamp(0.0, 1.0) * WIDTH as f32) as usize).min(WIDTH);
-    let bar: String = "#".repeat(filled) + &"-".repeat(WIDTH - filled);
-    let db = if level > 0.0 {
-        format!("{:6.1} dBFS", 20.0 * level.log10())
-    } else {
-        "  -inf dBFS".to_owned()
-    };
+fn join_capture(
+    handle: Option<std::thread::JoinHandle<Result<ThreadOutcome>>>,
+) -> Result<Option<ThreadOutcome>> {
+    match handle {
+        None => Ok(None),
+        Some(handle) => match handle.join() {
+            Ok(result) => result.map(Some),
+            Err(_) => Err(anyhow!("a capture thread panicked")),
+        },
+    }
+}
 
+/// Interleave both streams into a stereo WAV until the capture threads stop.
+///
+/// Returns the number of stereo frames written.
+fn write_stereo(cli: &Cli, mic_rx: &Receiver<Chunk>, sys_rx: &Receiver<Chunk>) -> Result<u64> {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: TARGET_SAMPLE_RATE,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = hound::WavWriter::create(&cli.out, spec)
+        .with_context(|| format!("could not create {}", cli.out.display()))?;
+
+    let mut mixer = StereoMixer::new();
+    let mut interleaved = Vec::new();
+    let mut frames: u64 = 0;
+
+    let mic_recorded = !cli.system_only;
+    let sys_recorded = !cli.mic_only;
+    let mut mic_open = mic_recorded;
+    let mut sys_open = sys_recorded;
+    let mut mic_peak = 0.0_f32;
+    let mut sys_peak = 0.0_f32;
+    let mut last_meter = Instant::now();
+    let mut worst_imbalance: i64 = 0;
+
+    while mic_open || sys_open {
+        let mut received = false;
+
+        // Drain whatever is ready on both sides before writing, so neither
+        // channel accumulates a backlog while the other is served. Disconnection
+        // is detected here rather than by a second try_recv, which would consume
+        // and discard a chunk that arrived in between.
+        loop {
+            match mic_rx.try_recv() {
+                Ok(chunk) => {
+                    mic_peak = mic_peak.max(peak(&chunk.samples));
+                    mixer.push_left(&chunk.samples);
+                    received = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    mic_open = false;
+                    break;
+                }
+            }
+        }
+        loop {
+            match sys_rx.try_recv() {
+                Ok(chunk) => {
+                    sys_peak = sys_peak.max(peak(&chunk.samples));
+                    mixer.push_right(&chunk.samples);
+                    received = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    sys_open = false;
+                    break;
+                }
+            }
+        }
+
+        // A side that is not being recorded never produces samples, so it is fed
+        // silence to match the side that is: without it no stereo frame would
+        // ever be complete and the file would stay empty.
+        if !mic_recorded {
+            let deficit = usize::try_from(-mixer.imbalance()).unwrap_or(0);
+            if deficit > 0 {
+                mixer.push_left(&vec![0.0; deficit]);
+            }
+        }
+        if !sys_recorded {
+            let deficit = usize::try_from(mixer.imbalance()).unwrap_or(0);
+            if deficit > 0 {
+                mixer.push_right(&vec![0.0; deficit]);
+            }
+        }
+
+        if mixer.imbalance().abs() > worst_imbalance.abs() {
+            worst_imbalance = mixer.imbalance();
+        }
+
+        interleaved.clear();
+        mixer.drain_into(&mut interleaved);
+        for &sample in &interleaved {
+            writer
+                .write_sample(sample)
+                .context("writing the WAV file failed mid-capture")?;
+        }
+        frames += (interleaved.len() / 2) as u64;
+
+        if last_meter.elapsed() >= METER_REFRESH {
+            render_meters(mic_peak, sys_peak, cli.no_tty);
+            mic_peak = 0.0;
+            sys_peak = 0.0;
+            last_meter = Instant::now();
+        }
+
+        if !received && (mic_open || sys_open) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // Nothing more will arrive: emit the tail, padding the shorter side.
+    interleaved.clear();
+    mixer.flush_into(&mut interleaved);
+    for &sample in &interleaved {
+        writer
+            .write_sample(sample)
+            .context("writing the WAV tail failed")?;
+    }
+    frames += (interleaved.len() / 2) as u64;
+
+    writer
+        .finalize()
+        .context("could not finalize the WAV file")?;
+
+    println!(
+        "\n\nWorst channel imbalance during capture: {worst_imbalance} frames \
+         ({:.1} ms)",
+        worst_imbalance as f64 * 1000.0 / f64::from(TARGET_SAMPLE_RATE)
+    );
+    Ok(frames)
+}
+
+fn report(out: &Path, frames: u64, outcomes: &[Option<ThreadOutcome>]) {
+    let size = std::fs::metadata(out).map(|meta| meta.len()).unwrap_or(0);
+    let duration = frames as f64 / f64::from(TARGET_SAMPLE_RATE);
+
+    println!("\n--- Capture report ---");
+    println!("Stereo frames     : {frames}");
+    println!("Duration          : {duration:.2} s");
+    println!("File size         : {size} bytes");
+    println!("Output            : {}", out.display());
+
+    for outcome in outcomes.iter().flatten() {
+        let stats = &outcome.stats;
+        let padded_share = if stats.frames == 0 {
+            0.0
+        } else {
+            stats.padded_frames as f64 * 100.0 / stats.frames as f64
+        };
+        println!("\n[{}]", outcome.endpoint);
+        println!("  device          : {}", outcome.device_name);
+        println!(
+            "  native format   : {} Hz, {} ch -> {} Hz mono",
+            outcome.input_rate, outcome.input_channels, TARGET_SAMPLE_RATE
+        );
+        println!(
+            "  captured        : {} frames ({:.2} s at native rate)",
+            stats.frames,
+            stats.duration(outcome.input_rate).as_secs_f64()
+        );
+        println!(
+            "  discontinuities : {}  (C3 target: 0)",
+            stats.discontinuities
+        );
+        println!("  silent packets  : {}", stats.silent_packets);
+        println!(
+            "  synthesised     : {} frames ({padded_share:.1} %)",
+            stats.padded_frames
+        );
+        println!(
+            "  MMCSS Pro Audio : {}",
+            if outcome.mmcss { "granted" } else { "DENIED" }
+        );
+    }
+}
+
+/// Draw a VU meter for each channel.
+fn render_meters(mic: f32, system: f32, no_tty: bool) {
+    let line = format!("mic [{}]  sys [{}]", meter(mic), meter(system));
     if no_tty {
-        println!("system [{bar}] {db}");
+        println!("{line}");
     } else {
-        print!("\rsystem [{bar}] {db}");
+        print!("\r{line}");
         let _ = std::io::stdout().flush();
     }
+}
+
+fn meter(level: f32) -> String {
+    const WIDTH: usize = 24;
+    let filled = ((level.clamp(0.0, 1.0) * WIDTH as f32) as usize).min(WIDTH);
+    let bar = "#".repeat(filled) + &"-".repeat(WIDTH - filled);
+    let db = if level > 0.0 {
+        format!("{:6.1}", 20.0 * level.log10())
+    } else {
+        "  -inf".to_owned()
+    };
+    format!("{bar} {db} dBFS")
 }
 
 /// Install a Ctrl+C handler so a recording stopped by hand still finalises its
 /// WAV header instead of leaving a truncated file behind.
 #[cfg(windows)]
-fn install_ctrlc_handler<F>(on_signal: F) -> Result<(), Failure>
+fn install_ctrlc_handler<F>(on_signal: F) -> Result<()>
 where
     F: Fn() + Send + Sync + 'static,
 {
@@ -260,20 +389,18 @@ where
 
     HANDLER
         .set(Box::new(on_signal))
-        .map_err(|_| "the Ctrl+C handler was installed twice")?;
+        .map_err(|_| anyhow!("the Ctrl+C handler was installed twice"))?;
 
     // SAFETY: registering a plain function pointer with the console subsystem.
     let ok = unsafe { SetConsoleCtrlHandler(Some(trampoline), 1) };
-    if ok == 0 {
-        return Err("could not install the Ctrl+C handler".into());
-    }
+    anyhow::ensure!(ok != 0, "could not install the Ctrl+C handler");
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn install_ctrlc_handler<F>(_on_signal: F) -> Result<(), Failure>
+fn install_ctrlc_handler<F>(_on_signal: F) -> Result<()>
 where
     F: Fn() + Send + Sync + 'static,
 {
-    Err("nb-capture only runs on Windows: it captures audio through WASAPI".into())
+    anyhow::bail!("nb-capture only runs on Windows: it captures audio through WASAPI")
 }
