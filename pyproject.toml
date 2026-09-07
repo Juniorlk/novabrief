@@ -17,6 +17,12 @@ dev = [
     "pytest-asyncio==1.2.0",
     "pytest-cov==7.0.0",
 ]
+# Measurement tooling for phase 0 only. Local Whisper stands in for AssemblyAI
+# while no key is available; production transcription goes through
+# TranscriptionProvider (ADR-01), never through this.
+poc = [
+    "faster-whisper==1.2.1",
+]
 
 [build-system]
 requires = ["setuptools>=80"]
