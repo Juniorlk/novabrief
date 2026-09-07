@@ -201,8 +201,11 @@ fn spawn_capture(
         let mut first_qpc: Option<u64> = None;
 
         let stats = capture.record(&stop, max_duration, |packet| {
+            // Use the engine's reconstructed stream start, not the raw packet
+            // timestamp: for a loopback endpoint the first packet only arrives
+            // once something plays, which can be far into the recording.
             if first_qpc.is_none() {
-                first_qpc = packet.qpc_100ns;
+                first_qpc = packet.stream_start_qpc_100ns;
             }
             downmix_to_mono(packet.samples, format.channels, &mut mono);
             converted.clear();

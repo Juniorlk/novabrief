@@ -67,6 +67,14 @@ pub struct Packet<'a> {
     /// than when our thread happened to read it. `None` for synthesised silence
     /// and for drivers that do not supply a timestamp.
     pub qpc_100ns: Option<u64>,
+    /// When this *stream* started, on the same clock.
+    ///
+    /// This is what a caller aligning two endpoints needs, and it is not the
+    /// timestamp of the first packet: a loopback endpoint stays silent until
+    /// something plays, so its first packet can arrive long after the capture
+    /// began. The engine reconstructs the real start once and reports it here,
+    /// so callers never have to redo — or get wrong — that reasoning.
+    pub stream_start_qpc_100ns: Option<u64>,
     /// True when this batch is silence we generated to cover a gap, rather than
     /// audio the device delivered.
     pub synthesised: bool,
@@ -346,6 +354,7 @@ impl EndpointCapture {
         let mut first_packet_seen = false;
         let channels = self.format.channels as usize;
         let rate = f64::from(self.format.sample_rate);
+        let rate_hz = self.format.sample_rate.max(1);
         let started = Instant::now();
 
         while !stop.load(Ordering::Relaxed) {
@@ -381,7 +390,20 @@ impl EndpointCapture {
 
                 let packet_qpc = (qpc != 0).then_some(qpc);
                 if stats.first_qpc_100ns.is_none() {
-                    stats.first_qpc_100ns = packet_qpc;
+                    // When the stream begins, this is the timestamp of the first
+                    // frame. But a loopback endpoint delivers nothing at all
+                    // while nothing is playing, so the first *real* packet can
+                    // arrive many seconds in, after that much synthesised
+                    // silence. Taking its timestamp as the start of the stream
+                    // would claim the capture began when the audio began, which
+                    // is a different thing entirely: the two would then be
+                    // aligned against each other by that error.
+                    //
+                    // Every frame already emitted is silence covering the gap,
+                    // so subtracting its duration recovers the instant the
+                    // capture actually started.
+                    stats.first_qpc_100ns = packet_qpc
+                        .map(|timestamp| stream_start_from(timestamp, stats.frames, rate_hz));
                 }
 
                 if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 && first_packet_seen
@@ -417,6 +439,7 @@ impl EndpointCapture {
                     on_frames(Packet {
                         samples: &decoded,
                         qpc_100ns: packet_qpc,
+                        stream_start_qpc_100ns: stats.first_qpc_100ns,
                         synthesised: false,
                     });
                 }
@@ -438,6 +461,7 @@ impl EndpointCapture {
                     on_frames(Packet {
                         samples: &silence,
                         qpc_100ns: None,
+                        stream_start_qpc_100ns: stats.first_qpc_100ns,
                         synthesised: true,
                     });
                 } else {
@@ -448,6 +472,22 @@ impl EndpointCapture {
 
         Ok(stats)
     }
+}
+
+/// Reconstruct when a stream started, from the timestamp of its first real
+/// packet and the number of frames already emitted before that packet.
+///
+/// A loopback endpoint delivers nothing while nothing is playing, so its first
+/// real packet can arrive many seconds into a recording, after that much
+/// synthesised silence. Taking that packet's timestamp as the start of the
+/// stream confuses "when audio began" with "when capture began" — and two
+/// endpoints aligned on that mistake end up shifted by the whole delay.
+fn stream_start_from(packet_qpc_100ns: u64, frames_before: u64, sample_rate: u32) -> u64 {
+    if sample_rate == 0 {
+        return packet_qpc_100ns;
+    }
+    let elapsed_100ns = (u128::from(frames_before) * 10_000_000) / u128::from(sample_rate);
+    packet_qpc_100ns.saturating_sub(u64::try_from(elapsed_100ns).unwrap_or(u64::MAX))
 }
 
 /// A selectable audio endpoint, as reported to the user by `--list-devices`.
@@ -605,8 +645,52 @@ unsafe fn friendly_name(device: &windows::Win32::Media::Audio::IMMDevice) -> Str
 
 #[cfg(test)]
 mod tests {
-    use super::CaptureStats;
+    use super::{stream_start_from, CaptureStats};
     use std::time::Duration;
+
+    /// One second expressed in the 100 ns units WASAPI reports.
+    const ONE_SECOND: u64 = 10_000_000;
+
+    #[test]
+    fn stream_start_equals_the_packet_time_when_nothing_preceded_it() {
+        assert_eq!(
+            stream_start_from(50 * ONE_SECOND, 0, 48_000),
+            50 * ONE_SECOND
+        );
+    }
+
+    #[test]
+    fn stream_start_backs_out_the_silence_synthesised_before_the_first_packet() {
+        // A loopback endpoint that stayed silent for nine seconds: 9 s of
+        // synthesised frames at 48 kHz, then a real packet at t = 50 s. The
+        // stream itself started at t = 41 s, not at t = 50 s.
+        let frames_before = 9 * 48_000;
+        assert_eq!(
+            stream_start_from(50 * ONE_SECOND, frames_before, 48_000),
+            41 * ONE_SECOND
+        );
+    }
+
+    #[test]
+    fn stream_start_is_independent_of_the_sample_rate() {
+        // The same nine seconds of silence, at a different rate, must back out
+        // the same nine seconds.
+        let at_16k = stream_start_from(50 * ONE_SECOND, 9 * 16_000, 16_000);
+        let at_44k = stream_start_from(50 * ONE_SECOND, 9 * 44_100, 44_100);
+        assert_eq!(at_16k, 41 * ONE_SECOND);
+        assert_eq!(at_44k, 41 * ONE_SECOND);
+    }
+
+    #[test]
+    fn stream_start_saturates_rather_than_underflowing() {
+        // More silence than the clock has counted cannot wrap around.
+        assert_eq!(stream_start_from(ONE_SECOND, 100 * 48_000, 48_000), 0);
+    }
+
+    #[test]
+    fn stream_start_tolerates_an_unknown_sample_rate() {
+        assert_eq!(stream_start_from(7 * ONE_SECOND, 1_000, 0), 7 * ONE_SECOND);
+    }
 
     #[test]
     fn duration_is_derived_from_the_frame_count() {
