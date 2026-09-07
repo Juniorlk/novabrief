@@ -51,6 +51,20 @@ struct Cli {
     #[arg(long)]
     system_only: bool,
 
+    /// Capture device (microphone). Matched as a case-insensitive substring of
+    /// the device name; defaults to the Windows default device.
+    #[arg(long, value_name = "NAME")]
+    input: Option<String>,
+
+    /// Render device to capture in loopback. Matched as a case-insensitive
+    /// substring of the device name; defaults to the Windows default device.
+    #[arg(long, value_name = "NAME")]
+    output: Option<String>,
+
+    /// List the active audio devices and exit.
+    #[arg(long)]
+    list_devices: bool,
+
     /// Print one meter line per refresh instead of redrawing in place, so the
     /// output stays readable when piped to a file.
     #[arg(long)]
@@ -60,6 +74,10 @@ struct Cli {
 /// A chunk of 16 kHz mono audio on its way to the writer.
 struct Chunk {
     samples: Vec<f32>,
+    /// Timestamp of the first frame this endpoint ever delivered, repeated on
+    /// every chunk so the writer can align the two streams as soon as both have
+    /// spoken once.
+    first_qpc_100ns: Option<u64>,
 }
 
 /// What one capture thread reports back when it finishes.
@@ -75,6 +93,10 @@ struct ThreadOutcome {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.list_devices {
+        return list_all_devices();
+    }
+
     let want_mic = !cli.system_only;
     let want_system = !cli.mic_only;
 
@@ -89,6 +111,7 @@ fn main() -> Result<()> {
     let mic_thread = want_mic.then(|| {
         spawn_capture(
             Endpoint::Microphone,
+            cli.input.clone(),
             Arc::clone(&stop),
             max_duration,
             mic_tx,
@@ -97,6 +120,7 @@ fn main() -> Result<()> {
     let sys_thread = want_system.then(|| {
         spawn_capture(
             Endpoint::SystemLoopback,
+            cli.output.clone(),
             Arc::clone(&stop),
             max_duration,
             sys_tx,
@@ -122,24 +146,65 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Print every active endpoint, flagging Bluetooth hands-free profiles.
+fn list_all_devices() -> Result<()> {
+    for (endpoint, title) in [
+        (Endpoint::Microphone, "Capture devices (microphone)"),
+        (Endpoint::SystemLoopback, "Render devices (system loopback)"),
+    ] {
+        println!("\n{title}");
+        let devices = audio_engine::list_devices(endpoint)
+            .with_context(|| format!("could not enumerate {endpoint} devices"))?;
+        if devices.is_empty() {
+            println!("  (none active)");
+            continue;
+        }
+        for device in devices {
+            let marker = if device.is_default { "*" } else { " " };
+            let format = device.format.map_or_else(
+                || "format unavailable".to_owned(),
+                |f| {
+                    format!(
+                        "{} Hz, {} ch, {:?}",
+                        f.sample_rate, f.channels, f.sample_format
+                    )
+                },
+            );
+            let warning = if device.is_hands_free() {
+                "  <- Bluetooth hands-free: degraded audio"
+            } else {
+                ""
+            };
+            println!("  {marker} {}\n      {format}{warning}", device.name);
+        }
+    }
+    println!("\n* = Windows default. Select with --input / --output (substring match).");
+    Ok(())
+}
+
 /// Start one endpoint capture on its own thread, resampling to the working rate.
 fn spawn_capture(
     endpoint: Endpoint,
+    device: Option<String>,
     stop: Arc<AtomicBool>,
     max_duration: Option<Duration>,
     tx: Sender<Chunk>,
 ) -> std::thread::JoinHandle<Result<ThreadOutcome>> {
     std::thread::spawn(move || -> Result<ThreadOutcome> {
-        let mut capture = EndpointCapture::open(endpoint)
+        let mut capture = EndpointCapture::open_named(endpoint, device.as_deref())
             .with_context(|| format!("could not open the {endpoint} endpoint"))?;
 
         let format = capture.format();
         let mut resampler = MonoResampler::new(format.sample_rate);
         let mut mono = Vec::new();
         let mut converted = Vec::new();
+        let mut first_qpc: Option<u64> = None;
 
-        let stats = capture.record(&stop, max_duration, |interleaved| {
-            downmix_to_mono(interleaved, format.channels, &mut mono);
+        let stats = capture.record(&stop, max_duration, |packet| {
+            if first_qpc.is_none() {
+                first_qpc = packet.qpc_100ns;
+            }
+            downmix_to_mono(packet.samples, format.channels, &mut mono);
             converted.clear();
             resampler.process(&mono, &mut converted);
             if !converted.is_empty() {
@@ -148,6 +213,7 @@ fn spawn_capture(
                 // let the loop wind down on the stop flag.
                 let _ = tx.send(Chunk {
                     samples: std::mem::take(&mut converted),
+                    first_qpc_100ns: first_qpc,
                 });
             }
         })?;
@@ -200,6 +266,9 @@ fn write_stereo(cli: &Cli, mic_rx: &Receiver<Chunk>, sys_rx: &Receiver<Chunk>) -
     let mut sys_peak = 0.0_f32;
     let mut last_meter = Instant::now();
     let mut worst_imbalance: i64 = 0;
+    let mut mic_start: Option<u64> = None;
+    let mut sys_start: Option<u64> = None;
+    let mut applied_skew: Option<i64> = None;
 
     while mic_open || sys_open {
         let mut received = false;
@@ -211,6 +280,7 @@ fn write_stereo(cli: &Cli, mic_rx: &Receiver<Chunk>, sys_rx: &Receiver<Chunk>) -
         loop {
             match mic_rx.try_recv() {
                 Ok(chunk) => {
+                    mic_start = mic_start.or(chunk.first_qpc_100ns);
                     mic_peak = mic_peak.max(peak(&chunk.samples));
                     mixer.push_left(&chunk.samples);
                     received = true;
@@ -225,6 +295,7 @@ fn write_stereo(cli: &Cli, mic_rx: &Receiver<Chunk>, sys_rx: &Receiver<Chunk>) -
         loop {
             match sys_rx.try_recv() {
                 Ok(chunk) => {
+                    sys_start = sys_start.or(chunk.first_qpc_100ns);
                     sys_peak = sys_peak.max(peak(&chunk.samples));
                     mixer.push_right(&chunk.samples);
                     received = true;
@@ -234,6 +305,31 @@ fn write_stereo(cli: &Cli, mic_rx: &Receiver<Chunk>, sys_rx: &Receiver<Chunk>) -
                     sys_open = false;
                     break;
                 }
+            }
+        }
+
+        // Correct the start skew exactly once, as soon as both endpoints have
+        // reported when their first frame was captured. The two devices never
+        // open at the same instant, and how far apart they open is a property
+        // of the machine — so it is measured here from the shared performance
+        // counter rather than assumed or hard-coded. The stream that started
+        // later is missing audio at the front, so it gets that much silence.
+        if applied_skew.is_none() && mic_recorded && sys_recorded {
+            if let (Some(mic_qpc), Some(sys_qpc)) = (mic_start, sys_start) {
+                let delta_100ns = i128::from(mic_qpc) - i128::from(sys_qpc);
+                let frames = (delta_100ns * i128::from(TARGET_SAMPLE_RATE)) / 10_000_000;
+                let frames = i64::try_from(frames).unwrap_or(0);
+                match frames.cmp(&0) {
+                    std::cmp::Ordering::Greater => {
+                        // The microphone started later: pad its front.
+                        mixer.push_front_left(&vec![0.0; frames as usize]);
+                    }
+                    std::cmp::Ordering::Less => {
+                        mixer.push_front_right(&vec![0.0; frames.unsigned_abs() as usize]);
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+                applied_skew = Some(frames);
             }
         }
 
@@ -253,7 +349,15 @@ fn write_stereo(cli: &Cli, mic_rx: &Receiver<Chunk>, sys_rx: &Receiver<Chunk>) -
             }
         }
 
-        if mixer.imbalance().abs() > worst_imbalance.abs() {
+        // Measure the imbalance only while both endpoints are still running and
+        // the start skew has been corrected. Outside that window the number is
+        // an artefact, not a measurement: before the correction it is dominated
+        // by the startup difference, and after one stream ends it simply grows
+        // by however long the other keeps recording. What is left in between is
+        // the genuine divergence between the two device clocks.
+        let skew_settled = applied_skew.is_some() || !(mic_recorded && sys_recorded);
+        let both_running = mic_open && sys_open;
+        if skew_settled && both_running && mixer.imbalance().abs() > worst_imbalance.abs() {
             worst_imbalance = mixer.imbalance();
         }
 
@@ -292,10 +396,18 @@ fn write_stereo(cli: &Cli, mic_rx: &Receiver<Chunk>, sys_rx: &Receiver<Chunk>) -
         .finalize()
         .context("could not finalize the WAV file")?;
 
+    let to_ms = |f: i64| f as f64 * 1000.0 / f64::from(TARGET_SAMPLE_RATE);
+    println!();
+    match applied_skew {
+        Some(skew) => println!(
+            "\nStart skew (measured from the device clock): {skew} frames ({:.1} ms), corrected",
+            to_ms(skew)
+        ),
+        None => println!("\nStart skew: not measured (only one endpoint recorded)"),
+    }
     println!(
-        "\n\nWorst channel imbalance during capture: {worst_imbalance} frames \
-         ({:.1} ms)",
-        worst_imbalance as f64 * 1000.0 / f64::from(TARGET_SAMPLE_RATE)
+        "Worst divergence while both streams ran   : {worst_imbalance} frames ({:.1} ms)",
+        to_ms(worst_imbalance)
     );
     Ok(frames)
 }

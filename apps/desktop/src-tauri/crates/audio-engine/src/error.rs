@@ -56,6 +56,9 @@ pub enum CaptureError {
         tag: u16,
     },
 
+    #[error("no active {endpoint} device matches {wanted:?}")]
+    DeviceNotFound { endpoint: Endpoint, wanted: String },
+
     #[error("the audio stream from the {endpoint} failed while recording: {source}")]
     StreamFailure {
         endpoint: Endpoint,

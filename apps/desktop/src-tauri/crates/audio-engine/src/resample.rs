@@ -162,6 +162,27 @@ impl StereoMixer {
         self.right.extend(samples);
     }
 
+    /// Insert samples at the *front* of the microphone channel.
+    ///
+    /// Used once, to correct the measured start skew between the two endpoints:
+    /// the stream that opened later is missing audio at the beginning, and
+    /// prepending that much silence puts both channels back on a common
+    /// timeline. Prepending only makes sense before playback has been drained,
+    /// which is why it happens as soon as both start timestamps are known.
+    pub fn push_front_left(&mut self, samples: &[f32]) {
+        for &sample in samples.iter().rev() {
+            self.left.push_front(sample);
+        }
+    }
+
+    /// Insert samples at the front of the system channel. See
+    /// [`StereoMixer::push_front_left`].
+    pub fn push_front_right(&mut self, samples: &[f32]) {
+        for &sample in samples.iter().rev() {
+            self.right.push_front(sample);
+        }
+    }
+
     /// How many frames one side is ahead of the other.
     ///
     /// Positive means the microphone is ahead, negative means the system is.
@@ -287,6 +308,35 @@ mod tests {
         mixer.flush_into(&mut out);
         assert_eq!(out, vec![1.0, -1.0, 2.0, 0.0]);
         assert_eq!(mixer.imbalance(), 0);
+    }
+
+    #[test]
+    fn prepended_silence_delays_the_channel_it_is_added_to() {
+        let mut mixer = StereoMixer::new();
+        mixer.push_left(&[1.0, 2.0]);
+        mixer.push_right(&[-1.0, -2.0]);
+        // The microphone started two frames late: give it two frames of silence.
+        mixer.push_front_left(&[0.0, 0.0]);
+
+        let mut out = Vec::new();
+        mixer.drain_into(&mut out);
+        // The system audio that predates any microphone audio is preserved,
+        // paired with silence rather than with the wrong microphone samples.
+        assert_eq!(out, vec![0.0, -1.0, 0.0, -2.0]);
+        assert_eq!(mixer.imbalance(), 2, "the two real samples still wait");
+    }
+
+    #[test]
+    fn prepending_keeps_sample_order() {
+        let mut mixer = StereoMixer::new();
+        mixer.push_left(&[9.0]);
+        mixer.push_front_left(&[1.0, 2.0, 3.0]);
+        mixer.push_right(&[0.0; 4]);
+
+        let mut out = Vec::new();
+        mixer.drain_into(&mut out);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        assert_eq!(left, vec![1.0, 2.0, 3.0, 9.0], "prepend must not reverse");
     }
 
     #[test]

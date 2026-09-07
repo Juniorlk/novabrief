@@ -26,4 +26,4 @@ pub use format::{downmix_to_mono, peak, SampleFormat, StreamFormat};
 pub use resample::{MonoResampler, StereoMixer, TARGET_SAMPLE_RATE};
 
 #[cfg(windows)]
-pub use capture::{CaptureStats, EndpointCapture};
+pub use capture::{list_devices, CaptureStats, DeviceInfo, EndpointCapture, Packet};

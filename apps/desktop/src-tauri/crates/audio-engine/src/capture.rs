@@ -30,7 +30,7 @@ use windows::Win32::Foundation::{HANDLE, S_FALSE};
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
     MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
@@ -54,6 +54,24 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// real data that is about to arrive.
 const SILENCE_THRESHOLD: Duration = Duration::from_millis(40);
 
+/// One batch of samples as WASAPI delivered it.
+#[derive(Debug)]
+pub struct Packet<'a> {
+    /// Interleaved samples at the endpoint's native rate and channel count.
+    pub samples: &'a [f32],
+    /// System-wide performance counter, in 100 ns units, at the instant the
+    /// device captured the first frame of this packet.
+    ///
+    /// This is the only value that makes two endpoints comparable: both devices
+    /// report against the same clock, so it says *when* audio happened rather
+    /// than when our thread happened to read it. `None` for synthesised silence
+    /// and for drivers that do not supply a timestamp.
+    pub qpc_100ns: Option<u64>,
+    /// True when this batch is silence we generated to cover a gap, rather than
+    /// audio the device delivered.
+    pub synthesised: bool,
+}
+
 /// What the capture observed, so the POC criteria can be measured rather than
 /// declared.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -66,6 +84,13 @@ pub struct CaptureStats {
     pub silent_packets: u64,
     /// Frames of silence we synthesised because no packet arrived (C4).
     pub padded_frames: u64,
+    /// Timestamp of the very first frame this endpoint delivered.
+    ///
+    /// Two endpoints never start at the same instant — opening a device takes a
+    /// different amount of time for each — and how different is a property of
+    /// the machine, not a constant. Recording both start timestamps lets the
+    /// skew be measured per run and corrected, instead of assumed.
+    pub first_qpc_100ns: Option<u64>,
 }
 
 impl CaptureStats {
@@ -161,11 +186,20 @@ impl EndpointCapture {
         Self::open(Endpoint::Microphone)
     }
 
-    /// Open one of the two endpoints.
+    /// Open one of the two endpoints, using the Windows default device.
     ///
     /// COM is initialised for the calling thread; the returned value must be
     /// used from that same thread.
     pub fn open(endpoint: Endpoint) -> Result<Self> {
+        Self::open_named(endpoint, None)
+    }
+
+    /// Open an endpoint, optionally selecting a device by name.
+    ///
+    /// `wanted` is matched case-insensitively against the device's friendly
+    /// name, as a substring, so `--output "Solix"` is enough to pick
+    /// "Casque (Solix Nexus ANC)". Passing `None` uses the Windows default.
+    pub fn open_named(endpoint: Endpoint, wanted: Option<&str>) -> Result<Self> {
         init_com_for_this_thread()?;
 
         let loopback = endpoint == Endpoint::SystemLoopback;
@@ -185,9 +219,12 @@ impl EndpointCapture {
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                     .map_err(|source| CaptureError::DeviceOpen { endpoint, source })?;
 
-            let device = enumerator
-                .GetDefaultAudioEndpoint(data_flow, eConsole)
-                .map_err(|source| CaptureError::NoDefaultDevice { endpoint, source })?;
+            let device = match wanted {
+                None => enumerator
+                    .GetDefaultAudioEndpoint(data_flow, eConsole)
+                    .map_err(|source| CaptureError::NoDefaultDevice { endpoint, source })?,
+                Some(name) => find_device_by_name(&enumerator, data_flow, name, endpoint)?,
+            };
 
             let device_name = friendly_name(&device);
 
@@ -258,9 +295,10 @@ impl EndpointCapture {
 
     /// Record until `stop` is set or `max_duration` elapses.
     ///
-    /// `on_frames` receives interleaved `f32` samples in the endpoint's native
-    /// sample rate and channel count. It is called from this thread, so it must
-    /// not block for long: anything slow belongs on the far side of a queue.
+    /// `on_frames` receives a [`Packet`] of interleaved `f32` samples in the
+    /// endpoint's native sample rate and channel count. It is called from this
+    /// thread, so it must not block for long: anything slow belongs on the far
+    /// side of a queue.
     pub fn record<F>(
         &mut self,
         stop: &AtomicBool,
@@ -268,7 +306,7 @@ impl EndpointCapture {
         mut on_frames: F,
     ) -> Result<CaptureStats>
     where
-        F: FnMut(&[f32]),
+        F: FnMut(Packet<'_>),
     {
         let priority = ProAudioPriority::acquire();
         self.mmcss_active = priority.is_active();
@@ -295,7 +333,7 @@ impl EndpointCapture {
         on_frames: &mut F,
     ) -> Result<CaptureStats>
     where
-        F: FnMut(&[f32]),
+        F: FnMut(Packet<'_>),
     {
         let endpoint = self.endpoint;
         let mut stats = CaptureStats::default();
@@ -328,14 +366,23 @@ impl EndpointCapture {
                 let mut data: *mut u8 = std::ptr::null_mut();
                 let mut frames: u32 = 0;
                 let mut flags: u32 = 0;
+                let mut qpc: u64 = 0;
 
                 // SAFETY: out-params are live locals; the buffer stays valid
-                // until the matching ReleaseBuffer below.
+                // until the matching ReleaseBuffer below. The QPC out-param is
+                // what makes the two endpoints comparable: it is the system-wide
+                // performance counter, in 100 ns units, at the instant the
+                // device captured the packet's first frame.
                 unsafe {
                     self.capture
-                        .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
+                        .GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))
                 }
                 .map_err(|source| CaptureError::StreamFailure { endpoint, source })?;
+
+                let packet_qpc = (qpc != 0).then_some(qpc);
+                if stats.first_qpc_100ns.is_none() {
+                    stats.first_qpc_100ns = packet_qpc;
+                }
 
                 if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 && first_packet_seen
                 {
@@ -367,7 +414,11 @@ impl EndpointCapture {
                 if !decoded.is_empty() {
                     stats.frames += frame_count as u64;
                     produced_this_cycle = true;
-                    on_frames(&decoded);
+                    on_frames(Packet {
+                        samples: &decoded,
+                        qpc_100ns: packet_qpc,
+                        synthesised: false,
+                    });
                 }
             }
 
@@ -384,7 +435,11 @@ impl EndpointCapture {
                     silence.resize(to_pad * channels, 0.0);
                     stats.frames += behind;
                     stats.padded_frames += behind;
-                    on_frames(&silence);
+                    on_frames(Packet {
+                        samples: &silence,
+                        qpc_100ns: None,
+                        synthesised: true,
+                    });
                 } else {
                     std::thread::sleep(POLL_INTERVAL);
                 }
@@ -393,6 +448,133 @@ impl EndpointCapture {
 
         Ok(stats)
     }
+}
+
+/// A selectable audio endpoint, as reported to the user by `--list-devices`.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    /// Friendly name, as shown in Windows sound settings.
+    pub name: String,
+    /// Whether Windows currently treats this device as the default.
+    pub is_default: bool,
+    /// The mix format Windows negotiated, when it could be read.
+    pub format: Option<StreamFormat>,
+}
+
+impl DeviceInfo {
+    /// Whether this endpoint looks like a Bluetooth hands-free (HFP) profile.
+    ///
+    /// HFP is the profile a headset switches to when its microphone is opened:
+    /// the link becomes bidirectional but the audio collapses to mono at 8 or
+    /// 16 kHz, which is audibly worse and costs transcription accuracy. Per the
+    /// Novafrik arbitration of 2026-09-07 this is **reported, never blocking**.
+    ///
+    /// Both signals are needed: the name catches the device before its format is
+    /// readable, the format catches vendors who do not label the profile.
+    #[must_use]
+    pub fn is_hands_free(&self) -> bool {
+        let name = self.name.to_lowercase();
+        let named = name.contains("hands-free")
+            || name.contains("hands free")
+            || name.contains("mains-libres")
+            || name.contains("mains libres");
+        let degraded = self
+            .format
+            .is_some_and(|f| f.channels == 1 && f.sample_rate <= 16_000);
+        named || degraded
+    }
+}
+
+/// List the active endpoints for one direction.
+///
+/// Enumeration is best-effort reporting: a device that cannot be inspected is
+/// listed without its format rather than failing the whole call.
+pub fn list_devices(endpoint: Endpoint) -> Result<Vec<DeviceInfo>> {
+    init_com_for_this_thread()?;
+    let data_flow = if endpoint == Endpoint::SystemLoopback {
+        eRender
+    } else {
+        eCapture
+    };
+
+    // SAFETY: standard WASAPI enumeration; the COM wrappers release everything.
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                .map_err(|source| CaptureError::DeviceOpen { endpoint, source })?;
+
+        let default_name = enumerator
+            .GetDefaultAudioEndpoint(data_flow, eConsole)
+            .ok()
+            .map(|device| friendly_name(&device));
+
+        let collection = enumerator
+            .EnumAudioEndpoints(data_flow, DEVICE_STATE_ACTIVE)
+            .map_err(|source| CaptureError::DeviceOpen { endpoint, source })?;
+        let count = collection
+            .GetCount()
+            .map_err(|source| CaptureError::DeviceOpen { endpoint, source })?;
+
+        let mut devices = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let Ok(device) = collection.Item(index) else {
+                continue;
+            };
+            let name = friendly_name(&device);
+            let format = device
+                .Activate::<IAudioClient>(CLSCTX_ALL, None)
+                .ok()
+                .and_then(|client| client.GetMixFormat().ok())
+                .and_then(|mix| {
+                    let parsed = stream_format_from_waveformatex(mix, endpoint).ok();
+                    CoTaskMemFree(Some(mix.cast()));
+                    parsed
+                });
+
+            devices.push(DeviceInfo {
+                is_default: default_name.as_deref() == Some(name.as_str()),
+                name,
+                format,
+            });
+        }
+        Ok(devices)
+    }
+}
+
+/// Find an active endpoint whose friendly name contains `wanted`.
+///
+/// # Safety
+/// `enumerator` must be a live `IMMDeviceEnumerator`.
+unsafe fn find_device_by_name(
+    enumerator: &IMMDeviceEnumerator,
+    data_flow: windows::Win32::Media::Audio::EDataFlow,
+    wanted: &str,
+    endpoint: Endpoint,
+) -> Result<windows::Win32::Media::Audio::IMMDevice> {
+    let needle = wanted.to_lowercase();
+    // SAFETY: enumeration over a live collection; items are COM-owned.
+    unsafe {
+        let collection = enumerator
+            .EnumAudioEndpoints(data_flow, DEVICE_STATE_ACTIVE)
+            .map_err(|source| CaptureError::DeviceOpen { endpoint, source })?;
+        let count = collection
+            .GetCount()
+            .map_err(|source| CaptureError::DeviceOpen { endpoint, source })?;
+
+        for index in 0..count {
+            let Ok(device) = collection.Item(index) else {
+                continue;
+            };
+            if friendly_name(&device).to_lowercase().contains(&needle) {
+                return Ok(device);
+            }
+        }
+    }
+
+    Err(CaptureError::DeviceNotFound {
+        endpoint,
+        wanted: wanted.to_owned(),
+    })
 }
 
 /// Read the device's friendly name, falling back to a placeholder.
