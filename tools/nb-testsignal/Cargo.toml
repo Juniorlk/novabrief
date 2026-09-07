@@ -1,0 +1,13 @@
+[package]
+name = "nb-testsignal"
+description = "Plays reference clicks at known intervals so that capture drift can be measured."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

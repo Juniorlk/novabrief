@@ -1,0 +1,29 @@
+{
+  "name": "novabrief",
+  "version": "0.1.0",
+  "private": true,
+  "description": "NovaBrief monorepo — tooling root (Novafrik).",
+  "type": "module",
+  "packageManager": "pnpm@10.18.0",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "scripts": {
+    "lint": "eslint . --max-warnings 0 --no-error-on-unmatched-pattern",
+    "lint:fix": "eslint . --fix --no-error-on-unmatched-pattern",
+    "typecheck": "tsc --build --force",
+    "format": "prettier --write \"**/*.{ts,mts,cts,vue,json,yml,yaml,css}\" --ignore-unknown",
+    "format:check": "prettier --check \"**/*.{ts,mts,cts,vue,json,yml,yaml,css}\" --ignore-unknown",
+    "test": "vitest run --passWithNoTests"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.37.0",
+    "eslint": "^9.37.0",
+    "eslint-plugin-vue": "^10.5.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.0",
+    "vitest": "^3.2.4",
+    "vue-eslint-parser": "^10.2.0"
+  }
+}

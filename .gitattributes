@@ -1,0 +1,19 @@
+# Normalise line endings: the repo stores LF and Windows checkouts get LF too,
+# so ruff, eslint and rustfmt behave identically on Windows and on Linux CI.
+* text=auto eol=lf
+
+*.rs      text eol=lf
+*.py      text eol=lf
+*.ts      text eol=lf
+*.vue     text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+Makefile  text eol=lf
+
+*.ps1     text eol=crlf
+*.bat     text eol=crlf
+
+*.ogg     binary
+*.wav     binary
+*.png     binary
+*.pdf     binary

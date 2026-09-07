@@ -1,0 +1,96 @@
+# Tooling configuration for the whole Python side of the monorepo.
+# No application dependency is declared here yet: FastAPI, SQLAlchemy, Celery
+# and the provider SDKs arrive with the backend lot (CLAUDE.md section 2).
+
+[project]
+name = "novabrief"
+version = "0.1.0"
+description = "NovaBrief — monorepo tooling root (Novafrik)."
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "ruff==0.14.0",
+    "mypy==1.18.2",
+    "pytest==8.4.2",
+    "pytest-asyncio==1.2.0",
+    "pytest-cov==7.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = []
+
+# ---------------------------------------------------------------------------
+# ruff - lint + format (CLAUDE.md section 6)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["apps/api", "packages", "tools"]
+extend-exclude = ["tools/datasets", ".venv", "node_modules"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "N",         # pep8-naming
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "A",         # builtins shadowing
+    "C4",        # comprehensions
+    "T20",       # no print() - CLAUDE.md section 8
+    "SIM",       # simplify
+    "PTH",       # pathlib
+    "RUF",
+    "ASYNC",
+    "S",         # bandit
+    "FIX",       # no TODO/FIXME left behind - CLAUDE.md section 8
+]
+ignore = ["E501"]  # line length is enforced by the formatter
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101"]      # assert is expected in tests
+"tools/**" = ["T20"]          # measurement scripts print their results
+
+[tool.ruff.format]
+quote-style = "double"
+line-ending = "lf"
+
+# ---------------------------------------------------------------------------
+# mypy - strict on packages/ and apps/api/app/ (CLAUDE.md section 6)
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+warn_unused_configs = true
+show_error_codes = true
+pretty = true
+files = ["packages", "apps/api/app"]
+mypy_path = ["packages"]
+explicit_package_bases = true
+namespace_packages = true
+
+# ---------------------------------------------------------------------------
+# pytest - the 70% coverage gate applies to apps/api once it exists
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["apps/api", "packages", "tools"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers --strict-config"
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["apps/api/app", "packages"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true

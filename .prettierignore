@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.nuxt/
+.output/
+target/
+coverage/
+tools/datasets/
+pnpm-lock.yaml
+
+# Product documentation is hand-written French prose (specification, ADRs,
+# task briefs). Prettier would reflow it for no benefit, so it stays out of
+# scope: Prettier only formats code.
+**/*.md
+.venv/
+venv/
+__pycache__/
