@@ -144,12 +144,70 @@ class CurrentSession(_Base):
 
 __all__ = [
     "MIN_PASSWORD_LENGTH",
+    "AcceptInvitationRequest",
     "CurrentSession",
+    "InvitationCreated",
+    "InviteMemberRequest",
     "LoginRequest",
+    "MemberSummary",
     "OrganizationProfile",
+    "PasswordResetConfirm",
+    "PasswordResetRequest",
     "RefreshRequest",
     "RegisterRequest",
     "Role",
     "TokenPair",
     "UserProfile",
 ]
+
+
+class InviteMemberRequest(_Base):
+    """EF-03: invite someone into the organization, with a role."""
+
+    email: EmailStr
+    # Ownership is not transferable by invitation: an organization has one
+    # Owner and changing it is a separate, audited act.
+    role: Literal["ADMIN", "MEMBER"] = "MEMBER"
+
+
+class InvitationCreated(_Base):
+    """What the inviter gets back. Never the token: that went to the invitee."""
+
+    id: uuid.UUID
+    email: EmailStr
+    role: Literal["ADMIN", "MEMBER"]
+    expires_at: datetime
+
+
+class AcceptInvitationRequest(_Base):
+    """EF-03: accept in one click, which also creates the account."""
+
+    token: str = Field(min_length=1, max_length=512)
+    full_name: str = Field(min_length=1, max_length=200)
+    password: Password
+    locale: Locale = "fr"
+    timezone: str = Field(default="Africa/Douala", max_length=64)
+
+
+class MemberSummary(_Base):
+    """A member as listed to an administrator."""
+
+    id: uuid.UUID
+    email: EmailStr | None
+    full_name: str
+    role: Role
+    revoked: bool
+    created_at: datetime
+
+
+class PasswordResetRequest(_Base):
+    """EF-02: ask for a reset link."""
+
+    email: EmailStr
+
+
+class PasswordResetConfirm(_Base):
+    """EF-02: consume the link and choose a new password."""
+
+    token: str = Field(min_length=1, max_length=512)
+    password: Password

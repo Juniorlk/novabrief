@@ -18,16 +18,34 @@ from redis.asyncio import Redis
 
 from app.config import Settings, get_settings
 from app.db import create_engine, create_session_factory
+from app.email import ConsoleProvider, EmailProvider, ResendProvider
 from app.errors import install_error_handlers
 from app.logging import configure_logging, get_logger
 from app.middleware import DEBUG_ID_HEADER, RateLimitMiddleware, RequestContextMiddleware
 from app.ratelimit import InMemoryRateLimiter, RateLimiter, RedisRateLimiter
-from app.routers import auth, health
+from app.routers import auth, health, members
 
 API_PREFIX = "/api/v1"
 VERSION = "0.1.0"
 
 logger = get_logger(__name__)
+
+
+def _build_email_provider(settings: Settings) -> EmailProvider:
+    """Resend when a key is configured, otherwise print to the console.
+
+    Printing rather than silently dropping: a developer without a key still
+    sees the invitation link and can follow it. Silently succeeding would make
+    a broken configuration look like a working one.
+    """
+    if not settings.resend_api_key:
+        logger.warning("email_console_provider", reason="no RESEND_API_KEY configured")
+        return ConsoleProvider()
+    return ResendProvider(
+        api_key=settings.resend_api_key,
+        sender=settings.email_from,
+        reply_to=settings.email_reply_to,
+    )
 
 
 def _build_limiter(settings: Settings) -> RateLimiter:
@@ -83,10 +101,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await engine.dispose()
+        # The rate limiter holds a Redis pool; leaving it open means sockets
+        # Redis still believes are live after every restart.
+        limiter = getattr(app.state, "limiter", None)
+        if isinstance(limiter, RedisRateLimiter):
+            await limiter.aclose()
         logger.info("api_stopped")
 
 
-def create_app(*, limiter: RateLimiter | None = None) -> FastAPI:
+def create_app(
+    *,
+    limiter: RateLimiter | None = None,
+    email_provider: EmailProvider | None = None,
+) -> FastAPI:
     """Build the application.
 
     A factory rather than a module-level instance: tests build an app with
@@ -114,11 +141,10 @@ def create_app(*, limiter: RateLimiter | None = None) -> FastAPI:
     # runs first, then the request context. Refusing an over-limit request
     # before it reaches a handler is the whole point — it must not get as far
     # as opening a database session.
-    app.add_middleware(
-        RateLimitMiddleware,
-        limiter=limiter or _build_limiter(settings),
-        settings=settings,
-    )
+    active_limiter = limiter or _build_limiter(settings)
+    # Kept on the app so shutdown can release its connection pool.
+    app.state.limiter = active_limiter
+    app.add_middleware(RateLimitMiddleware, limiter=active_limiter, settings=settings)
     # Outermost, so the debug_id is bound before anything — including a 429 —
     # can be logged or returned.
     app.add_middleware(RequestContextMiddleware)
@@ -132,12 +158,17 @@ def create_app(*, limiter: RateLimiter | None = None) -> FastAPI:
             expose_headers=[DEBUG_ID_HEADER],
         )
 
+    # Attached to the app rather than resolved per request: building a
+    # provider is configuration, not request state.
+    app.state.email_provider = email_provider or _build_email_provider(settings)
+
     install_error_handlers(app)
 
     # Health lives outside the versioned prefix: an orchestrator probes the
     # process, not a version of the contract.
     app.include_router(health.router)
     app.include_router(auth.router, prefix=API_PREFIX)
+    app.include_router(members.router, prefix=API_PREFIX)
 
     return app
 

@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 from app.db import create_session_factory
@@ -62,7 +63,7 @@ async def client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[AsyncClient]:
     monkeypatch.setenv("DATABASE_URL", APP_DATABASE_URL)
     get_settings.cache_clear()
 
-    engine = create_async_engine(APP_DATABASE_URL, poolclass=None)
+    engine = create_async_engine(APP_DATABASE_URL, poolclass=NullPool)
     try:
         async with engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
@@ -353,7 +354,7 @@ async def test_a_revoked_member_is_refused_immediately(client: AsyncClient) -> N
     user_id = me.json()["user"]["id"]
     organization_id = me.json()["organization"]["id"]
 
-    engine = create_async_engine(APP_DATABASE_URL, poolclass=None)
+    engine = create_async_engine(APP_DATABASE_URL, poolclass=NullPool)
     factory = create_session_factory(engine)
     async with factory() as session, session.begin():
         await session.execute(

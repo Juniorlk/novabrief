@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
 
 from app.db import create_session_factory, set_current_organization
 from app.models import TENANT_TABLES
@@ -46,7 +47,7 @@ pytestmark = pytest.mark.asyncio
 
 
 async def _factory_or_skip(url: str) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine(url, poolclass=None)
+    engine = create_async_engine(url, poolclass=NullPool)
     try:
         async with engine.connect() as connection:
             await connection.execute(text("SELECT 1"))

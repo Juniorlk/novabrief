@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.config import Settings
 from app.db import create_session_factory, set_current_organization
@@ -56,7 +57,7 @@ def settings() -> Settings:
 
 @pytest_asyncio.fixture
 async def sessions() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine(APP_DATABASE_URL, poolclass=None)
+    engine = create_async_engine(APP_DATABASE_URL, poolclass=NullPool)
     try:
         async with engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
