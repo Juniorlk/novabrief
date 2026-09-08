@@ -20,6 +20,7 @@ dependencies = [
     "argon2-cffi==25.1.0",
     "pyjwt[crypto]==2.11.0",
     "email-validator==2.3.0",
+    "redis==6.4.0",
 ]
 
 [project.optional-dependencies]

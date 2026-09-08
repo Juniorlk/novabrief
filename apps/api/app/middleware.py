@@ -1,4 +1,4 @@
-"""Request-scoped context: every request carries a `debug_id`.
+"""HTTP middleware: request context and rate limiting.
 
 A client may supply its own identifier so that a meeting keeps one identity
 from the desktop app through the API and the workers (ADR-07). When it does
@@ -8,15 +8,20 @@ caller can quote it even for a request it did not tag itself.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections.abc import Awaitable, Callable
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.types import ASGIApp
 
+from app.config import Settings
 from app.debug_id import new_debug_id
+from app.errors import problem_response
 from app.logging import bind_request_context, clear_request_context, get_logger
+from app.ratelimit import Decision, RateLimiter
 
 DEBUG_ID_HEADER = "X-Debug-Id"
 
@@ -78,3 +83,99 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         )
         clear_request_context()
         return response
+
+
+# Paths that count against the strict allowance. Anything that verifies a
+# credential belongs here, including the refresh endpoint: a refresh token is a
+# credential, and an attacker holding a stolen one should not be free to probe
+# with it.
+_AUTH_PREFIXES = (
+    "/api/v1/auth/token",
+    "/api/v1/auth/register",
+    "/api/v1/auth/refresh",
+    "/api/v1/auth/password",
+)
+
+# Never limited: an orchestrator probes these every few seconds, and throttling
+# a health check turns a busy moment into a restart loop.
+_EXEMPT_PATHS = ("/health", "/health/ready")
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Refuse callers who exceed their allowance, with a 429 and Retry-After."""
+
+    def __init__(self, app: ASGIApp, *, limiter: RateLimiter, settings: Settings) -> None:
+        super().__init__(app)
+        self._limiter = limiter
+        self._settings = settings
+
+    async def dispatch(
+        self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        path = request.url.path
+        if path in _EXEMPT_PATHS:
+            return await call_next(request)
+
+        is_auth = path.startswith(_AUTH_PREFIXES)
+        limit = (
+            self._settings.rate_limit_auth_per_minute
+            if is_auth
+            else self._settings.rate_limit_api_per_minute
+        )
+
+        decision = await self._limiter.hit(self._key_for(request, is_auth=is_auth), limit)
+
+        if not decision.allowed:
+            refusal = problem_response(
+                request=request,
+                status_code=429,
+                code="RATE_LIMITED",
+                title="Too many requests.",
+                detail=f"Retry in {decision.retry_after} seconds.",
+            )
+            refusal.headers["Retry-After"] = str(decision.retry_after)
+            _apply_headers(refusal, decision)
+            return refusal
+
+        response = await call_next(request)
+        _apply_headers(response, decision)
+        return response
+
+    def _key_for(self, request: Request, *, is_auth: bool) -> str:
+        """Identify the caller for counting purposes.
+
+        By account where one is known, by client address otherwise. Counting
+        authenticated traffic by address would make one office share a single
+        allowance, since a whole company sits behind one public IP — exactly
+        the customer NovaBrief sells to.
+        """
+        bucket = "auth" if is_auth else "api"
+
+        token = request.headers.get("Authorization", "")
+        if token.lower().startswith("bearer ") and not is_auth:
+            # Hashed rather than stored: this key reaches Redis, and a bearer
+            # token in a datastore we do not treat as secret is a credential
+            # sitting in the open.
+            digest = hashlib.sha256(token[7:].strip().encode()).hexdigest()[:32]
+            return f"rl:{bucket}:tok:{digest}"
+
+        return f"rl:{bucket}:ip:{_client_ip(request)}"
+
+
+def _client_ip(request: Request) -> str:
+    """The caller's address, honouring the proxy in front of us.
+
+    `X-Forwarded-For` is only trusted because Caddy sets it and nothing else
+    reaches the API directly. Behind a different topology this would let a
+    caller forge their own identity and reset their own counter.
+    """
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _apply_headers(response: Response, decision: Decision) -> None:
+    """Tell the caller where they stand, so a client can back off on its own."""
+    response.headers["X-RateLimit-Limit"] = str(decision.limit)
+    response.headers["X-RateLimit-Remaining"] = str(decision.remaining)
