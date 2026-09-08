@@ -53,6 +53,16 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
 
+    # RS256 key pair, PEM encoded. Asymmetric so workers can verify a token with
+    # the public key alone while only the API can mint one (section 17.3).
+    jwt_private_key: str | None = None
+    jwt_public_key: str | None = None
+    jwt_access_ttl_minutes: int = 15
+    refresh_token_ttl_days: int = 30
+
+    rate_limit_auth_per_minute: int = 10
+    rate_limit_api_per_minute: int = 600
+
     sentry_dsn_api: str | None = None
     sentry_traces_sample_rate: float = 0.0
 
@@ -86,6 +96,29 @@ class Settings(BaseSettings):
     def is_production(self) -> bool:
         """True in production, where defaults must never be assumed."""
         return self.environment == "prod"
+
+    def require_jwt_private_key(self) -> str:
+        """The signing key, or a clear failure.
+
+        Generating a throwaway key when none is configured would look like it
+        works and silently invalidate every session on restart, and across
+        replicas would mean tokens minted by one instance are rejected by the
+        next. Better to refuse than to be subtly broken.
+        """
+        if not self.jwt_private_key:
+            message = (
+                "JWT_PRIVATE_KEY is not set. Generate an RS256 key pair and put "
+                "it in the environment; the API will not mint tokens without one."
+            )
+            raise RuntimeError(message)
+        return self.jwt_private_key
+
+    def require_jwt_public_key(self) -> str:
+        """The verification key, or a clear failure."""
+        if not self.jwt_public_key:
+            message = "JWT_PUBLIC_KEY is not set; access tokens cannot be verified."
+            raise RuntimeError(message)
+        return self.jwt_public_key
 
 
 @lru_cache(maxsize=1)
