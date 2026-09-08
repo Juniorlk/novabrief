@@ -70,6 +70,15 @@ class RedisRateLimiter:
         self._consecutive_failures = 0
         self._skip_until = 0.0
 
+    async def aclose(self) -> None:
+        """Release the connection pool.
+
+        Without this the sockets stay open until the process dies, which on a
+        rolling restart means a pile of connections Redis still believes are
+        live.
+        """
+        await self._redis.aclose()
+
     async def hit(self, key: str, limit: int) -> Decision:
         now = time.monotonic()
         if now < self._skip_until:

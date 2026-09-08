@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     jwt_access_ttl_minutes: int = 15
     refresh_token_ttl_days: int = 30
 
+    resend_api_key: str | None = None
+    email_from: str = "NovaBrief <no-reply@novabrief.com>"
+    email_reply_to: str | None = None
+
     rate_limit_auth_per_minute: int = 10
     rate_limit_api_per_minute: int = 600
 
