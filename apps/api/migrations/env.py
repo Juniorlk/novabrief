@@ -26,7 +26,10 @@ if config.config_file_name is not None:
 # Autogenerate compares the live database against this metadata.
 target_metadata = Base.metadata
 
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+# Migrations run with the admin credentials when they are configured: the
+# application role deliberately cannot create tables or policies.
+_settings = get_settings()
+config.set_main_option("sqlalchemy.url", _settings.database_admin_url or _settings.database_url)
 
 
 def run_migrations_offline() -> None:

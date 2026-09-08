@@ -18,6 +18,8 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Runs once, on an empty volume: creates the restricted role the API uses.
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-novabrief}"]
       interval: 5s
@@ -85,7 +87,11 @@ services:
       ENVIRONMENT: dev
       LOG_FORMAT: console
       LOG_LEVEL: info
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-novabrief}:${POSTGRES_PASSWORD:-novabrief}@postgres:5432/${POSTGRES_DB:-novabrief}
+      # The API connects as the restricted role, never as the owner: a
+      # superuser bypasses RLS and would silently undo ADR-04.
+      DATABASE_URL: postgresql+asyncpg://novabrief_app:${DATABASE_APP_PASSWORD:-novabrief-app-dev}@postgres:5432/${POSTGRES_DB:-novabrief}
+      # Migrations need DDL, which the application role does not have.
+      DATABASE_ADMIN_URL: postgresql+asyncpg://${POSTGRES_USER:-novabrief}:${POSTGRES_PASSWORD:-novabrief}@postgres:5432/${POSTGRES_DB:-novabrief}
       REDIS_URL: redis://redis:6379/0
       R2_ENDPOINT: http://minio:9000
       CORS_ALLOWED_ORIGINS: http://localhost:3000

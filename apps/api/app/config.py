@@ -40,7 +40,14 @@ class Settings(BaseSettings):
     log_level: str = "info"
     log_format: LogFormat = "json"
 
-    database_url: str = "postgresql+asyncpg://novabrief:novabrief@localhost:5432/novabrief"
+    # The API connects with a restricted role. A SUPERUSER bypasses Row-Level
+    # Security unconditionally, so connecting as the database owner would leave
+    # every ADR-04 policy in place and enforcing nothing.
+    database_url: str = (
+        "postgresql+asyncpg://novabrief_app:novabrief-app-dev@localhost:5432/novabrief"
+    )
+    # Separate credentials for migrations, which need DDL the API must not have.
+    database_admin_url: str | None = None
     database_pool_size: int = 5
     database_max_overflow: int = 10
 
