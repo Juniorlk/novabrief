@@ -29,6 +29,9 @@ dev = [
     "pytest==8.4.2",
     "pytest-asyncio==1.2.0",
     "pytest-cov==7.0.0",
+    # Drives the app through its ASGI transport, so the API tests need neither
+    # a network nor a running server.
+    "httpx==0.28.1",
 ]
 # Measurement tooling for phase 0 only. Local Whisper stands in for AssemblyAI
 # while no key is available; production transcription goes through
