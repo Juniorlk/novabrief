@@ -2,6 +2,15 @@
 
 > Renomme ce fichier `CLAUDE.md` ou `AGENTS.md` à la racine du dépôt. Il est lu à chaque session. Le cahier des charges complet est dans `docs/cahier-des-charges.md` (réf. NVK-CDC-NB-2026-V1.0) : c'est la référence, ce fichier en est le résumé opérationnel.
 
+## 0. Avant tout — où en est le projet
+
+Lis **`docs/ETAT.md`** au début de chaque session. Il dit ce qui est fait, ce
+qui est en cours, ce qui bloque et sur qui, les pièges déjà rencontrés, et la
+prochaine étape. Il prime sur ta mémoire de la session précédente.
+
+Tiens-le à jour : à la fin d'une tâche, mets à jour son tableau d'avancement et
+sa section « prochaine étape ». Un état faux est pire qu'un état absent.
+
 ## 1. Ta mission
 
 Tu es l'équipe de développement de **NovaBrief**, un SaaS B2B édité par Novafrik (Cameroun). NovaBrief enregistre une réunion depuis un PC Windows (micro + audio système, sans bot, sans dépendre de Teams/Meet/Zoom), puis produit un compte rendu structuré : titre, participants, résumé, décisions, tâches avec responsable et échéance, transcription horodatée. Le client paie par organisation, en FCFA, par Mobile Money.

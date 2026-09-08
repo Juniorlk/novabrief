@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.config import get_settings
 from app.db import create_session_factory
 from app.main import create_app
+from app.ratelimit import InMemoryRateLimiter
 
 APP_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL",
@@ -69,7 +70,9 @@ async def client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[AsyncClient]:
         await engine.dispose()
         pytest.skip(f"no test database reachable ({type(exc).__name__})")
 
-    app = create_app()
+    # A limiter of its own per test: sharing one Redis would make each test
+    # depend on how many requests the previous ones made.
+    app = create_app(limiter=InMemoryRateLimiter())
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
 
@@ -398,3 +401,45 @@ async def test_a_rejected_password_is_never_echoed_back(client: AsyncClient) -> 
     # The caller still learns which field was wrong and why.
     fields = [error["field"] for error in response.json()["errors"]]
     assert any("password" in field for field in fields)
+
+
+async def test_the_auth_endpoints_are_rate_limited(client: AsyncClient) -> None:
+    """Section 17.3: 10 a minute on sign-in.
+
+    This is where an attacker guesses passwords and probes which addresses are
+    customers. The strict allowance is the point of having two.
+    """
+    email = _email()
+    payload = {"email": email, "password": "le mauvais mot de passe"}
+
+    statuses = [
+        (await client.post(f"{PREFIX}/auth/token", json=payload)).status_code for _ in range(12)
+    ]
+
+    assert 429 in statuses, f"expected a refusal within 12 attempts, saw {set(statuses)}"
+    first_refusal = statuses.index(429)
+    assert first_refusal >= 10, f"refused after {first_refusal}, expected at least 10"
+
+
+async def test_a_refused_request_says_when_to_retry(client: AsyncClient) -> None:
+    payload = {"email": _email(), "password": "le mauvais mot de passe"}
+    response = None
+    for _ in range(12):
+        response = await client.post(f"{PREFIX}/auth/token", json=payload)
+        if response.status_code == 429:
+            break
+
+    assert response is not None
+    assert response.status_code == 429
+    assert response.json()["code"] == "RATE_LIMITED"
+    assert int(response.headers["Retry-After"]) > 0
+    # Still Problem Details, still carrying the identifier for support.
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert response.json()["debug_id"].startswith("DBG-")
+
+
+async def test_health_is_never_rate_limited(client: AsyncClient) -> None:
+    """Throttling a probe turns a busy moment into a restart loop."""
+    statuses = {(await client.get("/health")).status_code for _ in range(30)}
+
+    assert statuses == {200}
