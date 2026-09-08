@@ -5,6 +5,7 @@ réunion depuis un PC Windows (micro + audio système, sans bot, sans dépendre 
 Teams / Meet / Zoom) et produit un compte rendu structuré : titre, participants,
 résumé, décisions, tâches avec responsable et échéance, transcription horodatée.
 
+- **Où en est le projet** : [`docs/ETAT.md`](docs/ETAT.md) — à lire en premier
 - Référence complète : [`docs/cahier-des-charges.md`](docs/cahier-des-charges.md) (NVK-CDC-NB-2026-V1.0)
 - Instructions permanentes de développement : [`CLAUDE.md`](CLAUDE.md)
 - Décisions d'architecture : [`docs/adr/`](docs/adr/)
@@ -12,16 +13,14 @@ résumé, décisions, tâches avec responsable et échéance, transcription horo
 
 ## État du projet
 
-**Phase 0 — POC.** Rien du SaaS n'est développé tant que les trois POC ne sont pas
-validés par des mesures, dans l'ordre : capture audio Windows, benchmark de
-transcription FR/EN, extraction structurée.
+L'avancement, ce qui bloque et la prochaine étape vivent dans un seul endroit :
+**[`docs/ETAT.md`](docs/ETAT.md)**. Il n'est pas repris ici — un état dupliqué
+est un état qui se contredit.
 
-| Étape | État |
-|---|---|
-| Amorçage du dépôt et outillage | fait |
-| POC #1 — capture audio Windows ([brief](docs/tasks/01_POC1_capture_audio.md)) | à démarrer |
-| POC #2 — benchmark transcription FR/EN | en attente du Go POC #1 |
-| POC #3 — extraction structurée | en attente du Go POC #2 |
+En résumé au 2026-09-08 : le POC #1 est livré (avec un No-Go documenté sur la
+tenue en longue durée), les POC #2 et #3 ont été sautés par décision de
+Novafrik, le socle backend est en place et le lot « comptes et organisations »
+est en cours.
 
 ## Structure
 
