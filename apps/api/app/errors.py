@@ -106,15 +106,17 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation(request: Request, exc: RequestValidationError) -> JSONResponse:
-        # The field-level errors are returned so a client can point at the right
-        # input, but they are not logged: a rejected payload can contain
-        # anything a user typed.
+        # Pydantic's raw errors are not passed through. They carry the rejected
+        # `input` — which on a password field is the password itself, echoed
+        # back through every proxy and access log on the way out — and a `ctx`
+        # holding the original exception object, which is not JSON
+        # serialisable. Only the field, the type and the message leave.
         return problem_response(
             request=request,
             status_code=422,
             code="VALIDATION_ERROR",
             title="The request payload is invalid.",
-            extra={"errors": exc.errors()},
+            extra={"errors": _safe_validation_errors(exc)},
         )
 
     @app.exception_handler(Exception)
@@ -129,6 +131,26 @@ def install_error_handlers(app: FastAPI) -> None:
             title="An unexpected error occurred.",
             detail="Quote the debug_id when contacting support.",
         )
+
+
+def _safe_validation_errors(exc: RequestValidationError) -> list[dict[str, str]]:
+    """Reduce Pydantic's errors to what a client needs and nothing more.
+
+    A caller needs to know which field was wrong and why. It does not need its
+    own submitted value handed back, and we must not be the ones putting a
+    password into a response body.
+    """
+    safe: list[dict[str, str]] = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error.get("loc", ()))
+        safe.append(
+            {
+                "field": location,
+                "type": str(error.get("type", "invalid")),
+                "message": str(error.get("msg", "invalid value")),
+            }
+        )
+    return safe
 
 
 def _code_for_status(status_code: int) -> str:

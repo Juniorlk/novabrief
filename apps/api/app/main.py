@@ -20,7 +20,7 @@ from app.db import create_engine, create_session_factory
 from app.errors import install_error_handlers
 from app.logging import configure_logging, get_logger
 from app.middleware import DEBUG_ID_HEADER, RequestContextMiddleware
-from app.routers import health
+from app.routers import auth, health
 
 API_PREFIX = "/api/v1"
 VERSION = "0.1.0"
@@ -99,6 +99,7 @@ def create_app() -> FastAPI:
     # Health lives outside the versioned prefix: an orchestrator probes the
     # process, not a version of the contract.
     app.include_router(health.router)
+    app.include_router(auth.router, prefix=API_PREFIX)
 
     return app
 
