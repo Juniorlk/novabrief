@@ -5,7 +5,7 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-08**.
+> Dernière mise à jour : **2026-09-08** (fin du lot L1).
 
 ---
 
@@ -18,7 +18,7 @@
 | POC #2 — benchmark transcription | **sauté** (décision Novafrik 2026-09-08) | §5 ci-dessous |
 | POC #3 — extraction structurée | **sauté** (décision Novafrik 2026-09-08) | §5 ci-dessous |
 | Lot L0 — socle backend | **fait sauf staging** | PR #2 ; `docker compose up` répond sur `/health` |
-| Lot L1 — comptes & organisations | **partiel** | PR #2, #4, #5/#6 |
+| Lot L1 — comptes & organisations | **fait** | PR #2, #4, #6, #7 |
 | Lots L2 à L7 | non commencés | `docs/tasks/04_APRES_LES_POC_lots_MVP.md` |
 
 ### Lot L1 en détail
@@ -29,23 +29,26 @@
 | **T-07 (isolation multi-tenant)** | **passe**, en CI à chaque PR |
 | Argon2id, JWT RS256, rotation des refresh tokens | fait |
 | Endpoints `register` / `token` / `refresh` / `logout` / `me` | fait |
-| Limitation de débit (10/min auth, 600/min API) | fait, **en attente de merge** (PR #6) |
-| Invitations (EF-03) | **non commencé** — bloqué sur `RESEND_API_KEY` |
-| Réinitialisation de mot de passe (EF-02) | **non commencé** — bloqué sur `RESEND_API_KEY` |
-| Vérification d'email | non commencé |
-| Écriture du journal d'audit | partielle (inscription, connexion, réutilisation de jeton) |
+| Limitation de débit (10/min auth, 600/min API) | fait |
+| `EmailProvider` (Resend / console / enregistreur) | fait |
+| Invitations (EF-03) : inviter, accepter, révoquer, lister | fait |
+| Réinitialisation de mot de passe (EF-02) | fait |
+| Vérification d'email | **partielle** : prouvée en acceptant une invitation ; pas de mail de vérification à l'inscription |
+| Journal d'audit | écrit sur inscription, connexion, réutilisation de jeton, invitation, adhésion, révocation, réinitialisation |
+| Envoi réel d'emails | **en attente de `RESEND_API_KEY`** — sans clé, les liens sont imprimés en console |
 
 ---
 
 ## 2. Prochaine étape
 
-**`EmailProvider` puis les invitations (EF-03).**
+**Lot L2 — réunions et pipeline** (`docs/tasks/04_APRES_LES_POC_lots_MVP.md`).
 
-L'abstraction suit l'ADR-01 : un protocole, une implémentation Resend, une
-implémentation console pour le développement. Tout est testable avec un double ;
-seul l'envoi réel attend `RESEND_API_KEY`.
+Commencer par ce qui ne dépend d'aucune clé fournisseur : le modèle `meetings`,
+la machine à états de la section 11, et `finalize-local` avec les URL
+présignées vers MinIO. `TranscriptionProvider` et le pipeline d'analyse
+viendront quand les clés seront disponibles.
 
-Avant ça : **merger la PR #6**, qui rapatrie la limitation de débit dans `main`.
+Avant ça : **merger la PR #7**, qui ferme le lot L1.
 
 ---
 
@@ -53,7 +56,7 @@ Avant ça : **merger la PR #6**, qui rapatrie la limitation de débit dans `main
 
 | Bloqué | Ce qu'il faut | Pour |
 |---|---|---|
-| Invitations, réinitialisation de mot de passe | `RESEND_API_KEY` | finir L1 |
+| Envoi réel des emails (le code est fait et testé) | `RESEND_API_KEY` | mettre L1 en service |
 | Staging HTTPS | déploiement sur le VPS OVHcloud | finir L0 |
 | Pipeline de traitement | `ASSEMBLYAI_API_KEY`, `DEEPGRAM_API_KEY`, `OPENAI_API_KEY` | L2 |
 | Paiement | clés sandbox Flutterwave | L5 |
@@ -110,6 +113,25 @@ champ, le type et le message sortent (`_safe_validation_errors` dans
 Redis absent, le limiteur laissait passer — mais après **4 secondes** d'attente
 par requête. Une panne Redis aurait entraîné l'API. Timeouts à 250 ms et
 disjoncteur après trois échecs consécutifs.
+
+### `poolclass=None` ne désactive pas le pool
+
+Ça signifie « le pool par défaut ». Des connexions survivaient à leur test et
+remontaient au ramasse-miettes comme exceptions non levables, ce qui faisait
+échouer un test différent à chaque exécution. Utiliser `NullPool`.
+
+### L'application ne fermait pas son pool Redis
+
+Le `lifespan` libérait le moteur de base et laissait les sockets du limiteur
+ouvertes. Sur un redémarrage progressif, autant de connexions que Redis croit
+encore vivantes. Trouvé en traquant l'instabilité de la suite, pas en relecture.
+
+### Une dépendance runtime déclarée en `dev` casse l'image, pas les tests
+
+`httpx` sert à `ResendProvider` en production mais n'était déclaré que dans
+l'extra `dev`. Les tests l'avaient pour leur propre transport ASGI ; l'image
+Docker ne l'installait pas et l'API ne démarrait plus. Seul le job « Docker
+stack » l'a vu.
 
 ### La perte audio est invisible
 
