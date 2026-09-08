@@ -5,7 +5,7 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-08** (fin du lot L1).
+> Dernière mise à jour : **2026-09-08** (L1 en cours de finalisation).
 
 ---
 
@@ -18,7 +18,7 @@
 | POC #2 — benchmark transcription | **sauté** (décision Novafrik 2026-09-08) | §5 ci-dessous |
 | POC #3 — extraction structurée | **sauté** (décision Novafrik 2026-09-08) | §5 ci-dessous |
 | Lot L0 — socle backend | **fait sauf staging** | PR #2 ; `docker compose up` répond sur `/health` |
-| Lot L1 — comptes & organisations | **fait** | PR #2, #4, #6, #7 |
+| Lot L1 — comptes & organisations | **partiel** (EF-01 a EF-03 faits, EF-04 a EF-06 non) | PR #2, #4, #6, #7 |
 | Lots L2 à L7 | non commencés | `docs/tasks/04_APRES_LES_POC_lots_MVP.md` |
 
 ### Lot L1 en détail
@@ -33,7 +33,10 @@
 | `EmailProvider` (Resend / console / enregistreur) | fait |
 | Invitations (EF-03) : inviter, accepter, révoquer, lister | fait |
 | Réinitialisation de mot de passe (EF-02) | fait |
-| Vérification d'email | **partielle** : prouvée en acceptant une invitation ; pas de mail de vérification à l'inscription |
+| EF-02 vérification d'email à l'inscription | **non fait** — prouvée seulement en acceptant une invitation |
+| EF-04 modification du profil (nom, langue, fuseau) | **non fait** — `/me` est en lecture seule, pas de `PATCH` |
+| EF-05 paramètres d'organisation (nom, RCCM, langue, rétention, lexique) | **non fait** — aucun endpoint |
+| EF-06 export complet et suppression de l'organisation | **non fait** |
 | Journal d'audit | écrit sur inscription, connexion, réutilisation de jeton, invitation, adhésion, révocation, réinitialisation |
 | Envoi réel d'emails | **en attente de `RESEND_API_KEY`** — sans clé, les liens sont imprimés en console |
 
@@ -41,7 +44,25 @@
 
 ## 2. Prochaine étape
 
-**Lot L2 — réunions et pipeline** (`docs/tasks/04_APRES_LES_POC_lots_MVP.md`).
+**Reprendre sur la branche `feat/profile-and-organization-settings`.**
+
+Les schémas Pydantic `UpdateProfileRequest` et `UpdateOrganizationRequest` sont
+écrits et commités dans `packages/schemas/auth.py`. Il reste, dans cet ordre :
+
+1. `app/services/organizations.py` : mise à jour du profil et de l'organisation,
+   avec écriture au journal d'audit.
+   **Règle décidée** : la durée de conservation audio ne peut être que
+   *réduite*. L'augmenter relève du plan, donc du lot L5, et coder ici une
+   valeur de plan violerait l'ADR-09.
+2. `PATCH /api/v1/me` (tout appelant) et `PATCH /api/v1/organizations/current`
+   (Admin ou Owner).
+3. Tests, dont : un membre ordinaire ne peut pas modifier l'organisation, et un
+   appelant ne peut pas changer son propre rôle.
+
+Puis EF-06 (export et suppression, avec 7 jours de rétractation), puis la
+vérification d'email à l'inscription, puis le brief du lot L2.
+
+Ensuite **lot L2 — réunions et pipeline** (`docs/tasks/04_APRES_LES_POC_lots_MVP.md`).
 
 Commencer par ce qui ne dépend d'aucune clé fournisseur : le modèle `meetings`,
 la machine à états de la section 11, et `finalize-local` avec les URL
@@ -153,6 +174,8 @@ Elles ne sont pas dans le cahier des charges et priment sur lui.
 | 2026-09-08 | Hébergement **OVHcloud** au lieu de Hetzner → ADR-011 |
 | 2026-09-08 | **POC #2 et #3 sautés**, passage direct au MVP |
 | 2026-09-08 | Déploiement reporté : finir le code d'abord |
+| 2026-09-08 | **Campagne des 200 réunions annulée.** Le pipeline L2 est construit et testé avec des doubles ; aucun appel réel aux fournisseurs d'IA. Le critère de sortie « 200 réunions en COMPLETED » et le test T-11 ne seront donc pas prononcés. |
+| 2026-09-08 | Déploiement sur le VPS OVHcloud **après** la fin du lot L2 |
 
 **Le risque « l'IA invente une décision » (risque n°2 du cahier des charges)
 reste non mesuré.** Il se manifestera en recette plutôt qu'en phase 0.

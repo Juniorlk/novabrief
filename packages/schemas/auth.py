@@ -157,6 +157,8 @@ __all__ = [
     "RegisterRequest",
     "Role",
     "TokenPair",
+    "UpdateOrganizationRequest",
+    "UpdateProfileRequest",
     "UserProfile",
 ]
 
@@ -211,3 +213,34 @@ class PasswordResetConfirm(_Base):
 
     token: str = Field(min_length=1, max_length=512)
     password: Password
+
+
+class UpdateProfileRequest(_Base):
+    """EF-04: what a user may change about themselves.
+
+    Every field is optional: a client sends only what it is changing, and
+    omitting a field leaves it alone. Role is absent on purpose — nobody
+    promotes themselves.
+    """
+
+    full_name: str | None = Field(default=None, min_length=1, max_length=200)
+    locale: Locale | None = None
+    timezone: str | None = Field(default=None, max_length=64)
+
+
+class UpdateOrganizationRequest(_Base):
+    """EF-05: organization settings an administrator may change.
+
+    Plan, quota and status are absent: they are billing state, changed by the
+    payment flow and never by a customer request (ADR-09).
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    # RCCM or NIU in Cameroon; free text because the format differs per market.
+    legal_id: str | None = Field(default=None, max_length=64)
+    default_language: Locale | None = None
+    # Reducing is always allowed; raising it is a plan matter (see the service).
+    audio_retention_days: int | None = Field(default=None, ge=1, le=3650)
+    # Proper nouns and acronyms handed to the transcription provider as
+    # keyterms, which is what makes local names come back spelled correctly.
+    lexicon: list[str] | None = Field(default=None, max_length=500)
