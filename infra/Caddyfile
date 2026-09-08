@@ -1,0 +1,59 @@
+# Reverse proxy for staging and production.
+#
+# Caddy obtains and renews TLS certificates on its own, which is why it is here
+# rather than nginx: one less scheduled job to forget on a server with no
+# operations team (section 15.2).
+
+{
+	email {$ACME_EMAIL}
+}
+
+# API
+{$API_DOMAIN} {
+	encode zstd gzip
+
+	# HSTS, and the headers that stop the browser being helpful in ways we do
+	# not want. The API serves JSON only, so a permissive CSP costs nothing and
+	# a strict one costs nothing either.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+		-Server
+	}
+
+	# The health probes stay out of the access log: they run every few seconds
+	# and would bury everything else.
+	@health path /health /health/ready
+	log_skip @health
+
+	reverse_proxy api:8000 {
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
+
+# Web application
+{$WEB_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	reverse_proxy web:3000
+
+	log {
+		output stdout
+		format json
+	}
+}

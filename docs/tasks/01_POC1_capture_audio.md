@@ -18,7 +18,7 @@ Si ce POC échoue, NovaBrief tel que conçu n'existe pas. Il vaut donc mieux un 
    - conversion de chaque flux en mono, rééchantillonnage à 16 kHz (`rubato` ou équivalent) ;
    - compensateur de dérive d'horloge entre les deux flux (mesure du décalage cumulé, correction sub-milliseconde) ;
    - encodage Opus 32 kbps **stéréo** (canal gauche = micro, canal droit = système) par trames de 20 ms dans un conteneur Ogg ;
-   - écriture par segments de 5 s avec un manifeste JSON (durée, périphériques, horodatages, SHA-256 par segment).
+   - écriture par segments de 5 à 10 s avec un manifeste JSON (durée, périphériques, horodatages, SHA-256 par segment).
 2. Un binaire CLI `tools/nb-capture` : `nb-capture --duration 60 --out capture.ogg [--input <device>] [--output <device>]`, qui affiche en continu les niveaux des deux voies (vu-mètres texte) et écrit le fichier.
 3. Un générateur de signal de test `tools/nb-testsignal` qui joue dans les haut-parleurs des clics à intervalles connus (toutes les 10 s) et un script Python `tools/measure_drift.py` qui mesure, sur le fichier capturé, le décalage entre les clics captés par le loopback et les mêmes clics captés par le micro (haut-parleurs → micro), et trace la dérive dans le temps.
 4. Le compte rendu (format §9 des instructions) avec la **matrice de résultats** ci-dessous remplie.
@@ -32,8 +32,8 @@ Si ce POC échoue, NovaBrief tel que conçu n'existe pas. Il vaut donc mieux un 
 | C3 | Aucune perte de trames | 0 discontinuité sur 60 min | Compteur de `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` + continuité des horodatages |
 | C4 | Loopback silencieux | Quand rien n'est joué, le fichier reste continu (silence encodé, pas de trou) | Capture de 5 min sans son système, durée du fichier = 5 min |
 | C5 | Changement de périphérique en cours de capture | Coupure ≤ 500 ms, capture reprise sans redémarrage | Brancher un casque USB / Bluetooth pendant la capture |
-| C6 | Casque Bluetooth en profil mains-libres (HFP) | Détecté et signalé (le format passe à 8 kHz / 16 kHz mono) | Test avec un casque BT en appel Teams |
-| C7 | Consommation | < 3 % CPU et < 60 Mo RAM sur un portable modeste pendant la capture | Gestionnaire des tâches, 10 min |
+| C6 | Casque Bluetooth en profil mains-libres (HFP) | Détecté et **signalé sans bloquer** la capture (le format passe à 8 kHz / 16 kHz mono) | Test avec un casque BT en appel Teams |
+| C7 | Consommation | < 10 % CPU et < 50 Mo RAM pendant la capture | Gestionnaire des tâches, 10 min |
 | C8 | Poids du fichier | ≈ 14-15 Mo par heure | Taille du fichier / durée |
 | C9 | Qualité transcriptible | Une transcription AssemblyAI (ou Whisper local) du fichier est lisible sur les deux voies | Transcription rapide d'un extrait de 3 min |
 
@@ -57,6 +57,19 @@ Applications à tester : Microsoft Teams (client), Google Meet (Chrome et Edge),
 - Pas de pilote virtuel (VB-Cable ou autre), pas de capture par hook d'application.
 - Pas de transcription complète : seulement l'extrait de 3 min du critère C9.
 
+## Arbitrages Novafrik du 2026-09-07
+
+Ces décisions modifient le brief initial et priment sur lui :
+
+- **C7 assoupli sur le CPU, resserré sur la mémoire** : cible < 10 % CPU et
+  < 50 Mo RAM (au lieu de < 3 % et < 60 Mo).
+- **Segments de 5 à 10 s** au lieu de 5 s strictes.
+- **C6 ne bloque jamais** : un casque Bluetooth en profil mains-libres est
+  détecté et signalé à l'utilisateur, la capture continue en format dégradé.
+- **Trois portes prioritaires**, dans l'ordre : (1) loopback seul → WAV valide,
+  (2) micro + loopback synchronisés, (3) capture continue de 60 min. Les autres
+  critères sont mesurés mais ne conditionnent pas la poursuite.
+
 ## Déroulé attendu
 
 1. Squelette de la crate + CLI, capture d'un seul flux (loopback), fichier WAV brut. Vérifie que ça enregistre YouTube.
@@ -71,3 +84,38 @@ Applications à tester : Microsoft Teams (client), Google Meet (Chrome et Edge),
 - **Go** : C1 à C4 et C9 atteints sur au moins 4 configurations de périphériques, C2 mesuré et < 40 ms.
 - **Go conditionnel** : C5 ou C6 partiels, avec un plan de correction de moins de 3 jours.
 - **No-Go** : C1, C2 ou C3 non atteints après deux itérations. On revoit l'approche avant tout autre développement.
+
+---
+
+## Résultats mesurés (2026-09-07)
+
+Machine : Windows 11, 8 cœurs. Micro « Réseau de microphones (Intel Smart Sound) ».
+Sorties testées : « Speaker (Realtek(R) Audio) » et casque Bluetooth « Solix Nexus ANC ».
+
+| # | Critère | Cible | Mesuré | État |
+|---|---|---|---|---|
+| C1 | Deux flux captés en même temps | signal sur les deux voies | Voix (L) et vidéo YouTube (R) transcrites séparément, 3 min réelles | **Atteint** |
+| C2 | Décalage micro / système | < 40 ms après 60 min | **Non mesuré** — l'estimateur rapporte −83 293 ppm, valeur physiquement impossible, faussée par 10,25 % de trames manquantes | **Non mesuré** |
+| C3 | Aucune perte de trames | 0 discontinuité sur 60 min | 0 sur 10 min ; **10,25 % de l'audio perdu sur 60 min** sur les deux endpoints | **Échec** |
+| C4 | Loopback silencieux | fichier continu | 20 s à 100 % de silence synthétisé, durée exacte, aucun trou | **Atteint** |
+| C5 | Changement de périphérique | coupure ≤ 500 ms | Non implémenté (`IMMNotificationClient` absent) | **Non traité** |
+| C6 | Casque Bluetooth HFP | détecté et signalé | A2DP (48 kHz stéréo) et HFP (16 kHz mono) distingués et signalés, capture non bloquée | **Atteint** |
+| C7 | Consommation | < 10 % CPU, < 50 Mo RAM | CPU ~1 % ; **RAM 668 Mo à 32 min** (10,4 Mo sur capture courte) | **Échec** |
+| C8 | Poids du fichier | ≈ 14-15 Mo/h | 14,2 Mo/h (tonalité), 11,7 Mo/h sur 60 min | **Atteint** |
+| C9 | Qualité transcriptible | lisible sur les deux voies | Whisper `small` : les deux voies lisibles, séparation parfaite, aucune invention sur signal pur | **Atteint** |
+
+**Matrice de périphériques** : intégré (Realtek + Intel) et Bluetooth (A2DP + HFP) couverts.
+Casque USB, casque jack et sortie HDMI **non testés**.
+
+**Matrice d'applications** : YouTube (Chrome) couvert. Teams, Meet, Zoom et
+WhatsApp Desktop **non testés**.
+
+**Écart au brief** : la dérive est mesurée par les horodatages QPC des paquets
+WASAPI (régression linéaire trames / temps) et non par `tools/nb-testsignal` et
+`measure_drift.py`. La méthode QPC est plus précise, mais ces deux outils
+restent des squelettes.
+
+**Verdict au regard des règles du brief** : C2 non mesuré et C3 non atteint
+⇒ **No-Go en l'état**. Les correctifs sont spécifiés dans
+`docs/tasks/02_correctifs_capture_longue_duree.md` ; Novafrik a décidé le
+2026-09-07 de les différer et de poursuivre.

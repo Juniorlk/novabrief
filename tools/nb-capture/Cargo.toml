@@ -11,4 +11,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+anyhow = "1.0.104"
 audio-engine = { path = "../../apps/desktop/src-tauri/crates/audio-engine" }
+clap = { version = "4.5.61", features = ["derive"] }
+hound = "3.5.1"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }
