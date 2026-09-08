@@ -5,7 +5,7 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-08** (L1 en cours de finalisation).
+> Dernière mise à jour : **2026-09-08** (EF-04 et EF-05 faits ; reste EF-06 et la vérification d'email).
 
 ---
 
@@ -18,7 +18,7 @@
 | POC #2 — benchmark transcription | **sauté** (décision Novafrik 2026-09-08) | §5 ci-dessous |
 | POC #3 — extraction structurée | **sauté** (décision Novafrik 2026-09-08) | §5 ci-dessous |
 | Lot L0 — socle backend | **fait sauf staging** | PR #2 ; `docker compose up` répond sur `/health` |
-| Lot L1 — comptes & organisations | **partiel** (EF-01 a EF-03 faits, EF-04 a EF-06 non) | PR #2, #4, #6, #7 |
+| Lot L1 — comptes & organisations | **partiel** (EF-01 a EF-05 faits ; EF-06 et la verification d'email restent) | PR #2, #4, #6, #7 |
 | Lots L2 à L7 | non commencés | `docs/tasks/04_APRES_LES_POC_lots_MVP.md` |
 
 ### Lot L1 en détail
@@ -34,42 +34,33 @@
 | Invitations (EF-03) : inviter, accepter, révoquer, lister | fait |
 | Réinitialisation de mot de passe (EF-02) | fait |
 | EF-02 vérification d'email à l'inscription | **non fait** — prouvée seulement en acceptant une invitation |
-| EF-04 modification du profil (nom, langue, fuseau) | **non fait** — `/me` est en lecture seule, pas de `PATCH` |
-| EF-05 paramètres d'organisation (nom, RCCM, langue, rétention, lexique) | **non fait** — aucun endpoint |
+| EF-04 modification du profil (nom, langue, fuseau) | fait — `PATCH /api/v1/me` |
+| EF-05 paramètres d'organisation (nom, RCCM, langue, rétention, lexique) | fait — `PATCH /api/v1/organizations/current`, Admin ou Owner |
 | EF-06 export complet et suppression de l'organisation | **non fait** |
-| Journal d'audit | écrit sur inscription, connexion, réutilisation de jeton, invitation, adhésion, révocation, réinitialisation |
-| Envoi réel d'emails | **en attente de `RESEND_API_KEY`** — sans clé, les liens sont imprimés en console |
+| Journal d'audit | écrit sur inscription, connexion, réutilisation de jeton, invitation, adhésion, révocation, réinitialisation, `profile.updated`, `organization.updated` |
+| Envoi réel d'emails | clé reçue le 2026-09-08 et posée dans `.env` ; **pas encore branchée dans `infra/docker-compose.yml`** (à faire avec EF-02) |
 
 ---
 
 ## 2. Prochaine étape
 
-**Reprendre sur la branche `feat/profile-and-organization-settings`.**
+**EF-06 : export et suppression de l'organisation**, sur une nouvelle branche
+partant de `main` une fois la PR de `feat/profile-and-organization-settings`
+mergée.
 
-Les schémas Pydantic `UpdateProfileRequest` et `UpdateOrganizationRequest` sont
-écrits et commités dans `packages/schemas/auth.py`. Il reste, dans cet ordre :
+Arbitrage rendu par Novafrik le 2026-09-08 : **export JSON + audio maintenant,
+PDF reporté au lot L4**, suppression définitive avec **7 jours de
+rétractation**. La colonne `organizations.deletion_requested_at` existe déjà et
+attend son endpoint.
 
-1. `app/services/organizations.py` : mise à jour du profil et de l'organisation,
-   avec écriture au journal d'audit.
-   **Règle décidée** : la durée de conservation audio ne peut être que
-   *réduite*. L'augmenter relève du plan, donc du lot L5, et coder ici une
-   valeur de plan violerait l'ADR-09.
-2. `PATCH /api/v1/me` (tout appelant) et `PATCH /api/v1/organizations/current`
-   (Admin ou Owner).
-3. Tests, dont : un membre ordinaire ne peut pas modifier l'organisation, et un
-   appelant ne peut pas changer son propre rôle.
+Ensuite, dans cet ordre :
 
-Puis EF-06 (export et suppression, avec 7 jours de rétractation), puis la
-vérification d'email à l'inscription, puis le brief du lot L2.
-
-Ensuite **lot L2 — réunions et pipeline** (`docs/tasks/04_APRES_LES_POC_lots_MVP.md`).
-
-Commencer par ce qui ne dépend d'aucune clé fournisseur : le modèle `meetings`,
-la machine à états de la section 11, et `finalize-local` avec les URL
-présignées vers MinIO. `TranscriptionProvider` et le pipeline d'analyse
-viendront quand les clés seront disponibles.
-
-Avant ça : **merger la PR #7**, qui ferme le lot L1.
+1. EF-02 — vérification d'email à l'inscription. Aujourd'hui l'adresse n'est
+   prouvée qu'en acceptant une invitation ; une inscription directe laisse
+   `email_verified_at` à NULL sans jamais rien envoyer. C'est aussi le moment
+   de passer `RESEND_API_KEY` et `EMAIL_FROM` au conteneur `api` dans
+   `infra/docker-compose.yml`, ce qui n'est pas fait.
+2. Le brief `docs/tasks/05_L2_reunions_pipeline.md`, puis le lot L2.
 
 ---
 
@@ -77,9 +68,9 @@ Avant ça : **merger la PR #7**, qui ferme le lot L1.
 
 | Bloqué | Ce qu'il faut | Pour |
 |---|---|---|
-| Envoi réel des emails (le code est fait et testé) | `RESEND_API_KEY` | mettre L1 en service |
-| Staging HTTPS | déploiement sur le VPS OVHcloud | finir L0 |
-| Pipeline de traitement | `ASSEMBLYAI_API_KEY`, `DEEPGRAM_API_KEY`, `OPENAI_API_KEY` | L2 |
+| Envoi à de vrais destinataires | un **domaine vérifié chez Resend** — la clé reçue utilise `onboarding@resend.dev`, qui n'écrit qu'à l'adresse du compte | mettre L1 en service |
+| Staging HTTPS | un **nom de domaine** pointant sur le VPS OVHcloud | finir L0 |
+| Pipeline de traitement | `ASSEMBLYAI_API_KEY`, `OPENAI_API_KEY` (Deepgram reçue le 2026-09-08) | L2 |
 | Paiement | clés sandbox Flutterwave | L5 |
 
 Le VPS OVHcloud est disponible en SSH ; le déploiement est **volontairement
@@ -154,6 +145,27 @@ l'extra `dev`. Les tests l'avaient pour leur propre transport ASGI ; l'image
 Docker ne l'installait pas et l'API ne démarrait plus. Seul le job « Docker
 stack » l'a vu.
 
+### Windows n'a pas de base de fuseaux horaires
+
+`zoneinfo.ZoneInfo("Africa/Douala")` lève `ZoneInfoNotFoundError` sur un Python
+Windows : la bibliothèque standard lit la base du système, et Windows n'en a
+pas. Le paquet `tzdata` (données seules) est donc une dépendance **runtime**,
+pas de développement — même piège que `httpx` plus haut.
+
+Le fond du problème est ailleurs : un fuseau non validé est accepté à
+l'inscription et n'explose que des mois plus tard, dans une tâche planifiée
+(rappels d'échéance à 08:00, section 20.3), loin de qui l'a saisi. D'où le type
+`Timezone` dans `packages/schemas/auth.py`, appliqué partout où le champ existe.
+
+### `PATCH` : « absent » et « mis à vide » ne sont pas la même chose
+
+Avec des champs `X | None = None`, un `None` peut vouloir dire « je ne touche
+pas » ou « efface ». Les routes passent donc `model_dump(exclude_unset=True)` au
+service, qui ne voit que ce que le client a réellement envoyé. Un `null`
+explicite n'est accepté que sur `legal_id`, seule colonne nullable ; ailleurs
+c'est un 422. Sans ça, un formulaire web qui renvoie tout son état écraserait
+avec des valeurs vides ce que l'utilisateur n'a pas touché.
+
 ### La perte audio est invisible
 
 Sur 60 min, 10,25 % de l'audio a disparu pendant que Windows ne signalait que
@@ -176,6 +188,8 @@ Elles ne sont pas dans le cahier des charges et priment sur lui.
 | 2026-09-08 | Déploiement reporté : finir le code d'abord |
 | 2026-09-08 | **Campagne des 200 réunions annulée.** Le pipeline L2 est construit et testé avec des doubles ; aucun appel réel aux fournisseurs d'IA. Le critère de sortie « 200 réunions en COMPLETED » et le test T-11 ne seront donc pas prononcés. |
 | 2026-09-08 | Déploiement sur le VPS OVHcloud **après** la fin du lot L2 |
+| 2026-09-08 | **EF-06** : export **JSON + audio** maintenant, **PDF reporté au lot L4** ; suppression définitive avec **7 jours de rétractation** |
+| 2026-09-08 | Clés `RESEND_API_KEY` et `DEEPGRAM_API_KEY` fournies |
 
 **Le risque « l'IA invente une décision » (risque n°2 du cahier des charges)
 reste non mesuré.** Il se manifestera en recette plutôt qu'en phase 0.
@@ -216,5 +230,13 @@ base de données rapporte un skip.
   le développement. En production il doit venir de l'environnement.
 - **Aucune paire de clés RS256** n'existe. L'API refuse de démarrer sans, ce qui
   est voulu.
+- **La fixture de base de données est copiée dans cinq fichiers de tests**
+  (`test_auth_endpoints`, `test_auth_service`, `test_members`,
+  `test_rls_isolation`, `test_organization_settings`) : 45 lignes identiques à
+  chaque fois. À remonter dans `conftest.py` par une tâche dédiée, pas au
+  détour d'un lot.
+- **Les clés API ont transité par la conversation.** Elles vivent dans `.env`,
+  ignoré par Git, mais doivent être **régénérées par Novafrik avant la mise en
+  production**.
 - `nb-testsignal` et `measure_drift.py` restent des squelettes : la dérive est
   mesurée par horodatage QPC, ce qui s'écarte du brief du POC #1.

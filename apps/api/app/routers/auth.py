@@ -14,15 +14,14 @@ from fastapi import APIRouter, Depends, status
 from app.config import Settings, get_settings
 from app.deps import CurrentCaller, UnscopedSession
 from app.errors import ProblemError
+from app.presenters import current_session
 from app.services import auth
 from schemas.auth import (
     CurrentSession,
     LoginRequest,
-    OrganizationProfile,
     RefreshRequest,
     RegisterRequest,
     TokenPair,
-    UserProfile,
 )
 
 router = APIRouter(tags=["auth"])
@@ -137,31 +136,8 @@ async def logout(payload: RefreshRequest, session: UnscopedSession) -> None:
 
 @router.get("/me", response_model=CurrentSession, summary="The signed-in user")
 async def me(caller: CurrentCaller) -> CurrentSession:
-    """EF-04 and EF-05: the profile and the organization behind it."""
-    return CurrentSession(
-        user=UserProfile(
-            id=caller.user.id,
-            email=caller.user.email,
-            phone=caller.user.phone,
-            full_name=caller.user.full_name,
-            role=caller.user.role,  # type: ignore[arg-type]
-            locale=caller.user.locale,  # type: ignore[arg-type]
-            timezone=caller.user.timezone,
-            email_verified=caller.user.email_verified_at is not None,
-            created_at=caller.user.created_at,
-        ),
-        organization=OrganizationProfile(
-            id=caller.organization.id,
-            name=caller.organization.name,
-            legal_id=caller.organization.legal_id,
-            market=caller.organization.market,
-            plan_code=caller.organization.plan_code,
-            default_language=caller.organization.default_language,
-            audio_retention_days=caller.organization.audio_retention_days,
-            quota_seconds=caller.organization.quota_seconds,
-            consumed_seconds=caller.organization.consumed_seconds,
-            status=caller.organization.status,
-            lexicon=caller.organization.lexicon,
-            created_at=caller.organization.created_at,
-        ),
-    )
+    """EF-04 and EF-05: the profile and the organization behind it.
+
+    Built by the shared presenter, so this and `PATCH /me` cannot drift.
+    """
+    return current_session(user=caller.user, organization=caller.organization)
