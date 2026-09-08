@@ -1,5 +1,5 @@
-# API image. Multi-arch by construction: the base is available for arm64, which
-# is what the Hetzner CAX instances run (section 22.1).
+# API image. Multi-arch by construction: the base is available for both arm64
+# and x86, so the hosting decision of ADR-011 does not constrain it.
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
@@ -8,15 +8,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /srv
 
-# Dependencies are installed from the manifest alone, so editing application
-# code does not invalidate the layer.
+# Installed from pyproject.toml rather than a list repeated here. That list was
+# duplicated once and drifted immediately: two dependencies ended up in a
+# developer environment and in neither manifest, which CI caught only because
+# it builds from the file. Copying the manifest alone still keeps this layer
+# cached when application code changes.
 COPY pyproject.toml ./
 RUN python -m pip install --upgrade pip \
-    && python -m pip install \
-        "fastapi==0.121.2" "uvicorn[standard]==0.41.0" \
-        "pydantic==2.12.4" "pydantic-settings==2.13.0" \
-        "sqlalchemy[asyncio]==2.0.45" "asyncpg==0.31.0" \
-        "alembic==1.17.1" "structlog==25.5.0" "sentry-sdk[fastapi]==2.44.0"
+    && python -m pip install .
 
 COPY apps/api /srv/apps/api
 COPY packages /srv/packages

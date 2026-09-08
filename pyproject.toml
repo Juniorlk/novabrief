@@ -17,6 +17,9 @@ dependencies = [
     "alembic==1.17.1",
     "structlog==25.5.0",
     "sentry-sdk[fastapi]==2.44.0",
+    "argon2-cffi==25.1.0",
+    "pyjwt[crypto]==2.11.0",
+    "email-validator==2.3.0",
 ]
 
 [project.optional-dependencies]
