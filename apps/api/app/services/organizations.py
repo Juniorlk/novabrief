@@ -1,4 +1,4 @@
-"""Profile and organization settings (EF-04, EF-05).
+"""Profile, organization settings, export and deletion (EF-04, EF-05, EF-06).
 
 Both updates are partial: the caller sends only what changes, and anything
 absent is left alone. That distinction is carried by the request model's
@@ -21,16 +21,27 @@ is read by operators.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+import uuid
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
+from sqlalchemy import CursorResult, delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import Settings
+from app.db import set_current_organization
+from app.email import EmailProvider, Message
 from app.logging import get_logger
-from app.models import ActorType, AuditLog, Organization, User
+from app.models import ActorType, AuditLog, Invitation, Organization, User
 from app.uuid7 import uuid7
 
 logger = get_logger(__name__)
+
+# EF-06 fixes this at seven days. It is a promise made to the customer, not a
+# plan value, so it belongs here rather than in the `plans` table (ADR-09).
+DELETION_RETRACTION = timedelta(days=7)
 
 _PROFILE_FIELDS = ("full_name", "locale", "timezone")
 _ORGANIZATION_FIELDS = (
@@ -201,3 +212,217 @@ async def update_organization(
     )
     logger.info("organization_updated", fields=sorted(applied))
     return organization
+
+
+# --------------------------------------------------------------------------
+# EF-06: export and deletion
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DeletionSchedule:
+    """When a deletion was asked for, and when it becomes irreversible."""
+
+    requested_at: datetime
+    purge_after: datetime
+
+
+@dataclass(frozen=True)
+class ExportBundle:
+    """Every row an organization owns, gathered but not yet formatted.
+
+    Rows rather than a response model: the service decides *what* leaves the
+    database, `app.presenters` decides how it looks. Keeping the split means
+    the rule that matters here — no credential ever enters an export — is
+    stated where the rows are read.
+    """
+
+    organization: Organization
+    members: Sequence[User]
+    invitations: Sequence[Invitation]
+    audit_entries: Sequence[AuditLog]
+
+
+async def export_organization(session: AsyncSession, *, organization: Organization) -> ExportBundle:
+    """EF-06: gather everything the organization owns.
+
+    No filter is written here. The session is scoped, so RLS is what confines
+    the reads to one tenant — the same mechanism as everywhere else, rather
+    than a `where` clause that could be forgotten.
+
+    Meetings, reports and the audio manifest join this when those tables exist
+    (lot L2). The audio itself will be listed as presigned URLs rather than
+    embedded: a JSON document holding hours of Opus is not a document anyone
+    can open.
+    """
+    members = (await session.scalars(select(User).order_by(User.created_at))).all()
+    invitations = (await session.scalars(select(Invitation).order_by(Invitation.created_at))).all()
+    audit_entries = (await session.scalars(select(AuditLog).order_by(AuditLog.created_at))).all()
+
+    logger.info(
+        "organization_exported",
+        members=len(members),
+        invitations=len(invitations),
+        audit_entries=len(audit_entries),
+    )
+    return ExportBundle(
+        organization=organization,
+        members=members,
+        invitations=invitations,
+        audit_entries=audit_entries,
+    )
+
+
+async def request_deletion(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    email_provider: EmailProvider,
+    organization: Organization,
+    actor: User,
+) -> DeletionSchedule:
+    """EF-06: schedule the organization's deletion, seven days out.
+
+    Nothing is destroyed here. The row is marked and the clock starts, which is
+    what makes the promise keepable: an Owner who acted in anger, or whose
+    account was taken over, has a week to undo it. The purge itself is
+    :func:`purge_due_organizations`.
+    """
+    if organization.deletion_requested_at is not None:
+        # Re-requesting would silently restart the countdown, which is the
+        # opposite of what a retraction window is for.
+        raise OrganizationError(
+            "DELETION_ALREADY_REQUESTED",
+            "this organization is already scheduled for deletion",
+        )
+
+    requested_at = datetime.now(UTC)
+    organization.deletion_requested_at = requested_at
+    purge_after = requested_at + DELETION_RETRACTION
+
+    session.add(
+        AuditLog(
+            id=uuid7(),
+            organization_id=organization.id,
+            actor_id=actor.id,
+            actor_type=ActorType.USER.value,
+            action="organization.deletion_requested",
+            target_type="organization",
+            target_id=organization.id,
+            metadata_json={"purge_after": purge_after.isoformat()},
+        )
+    )
+
+    if actor.email:
+        # The Owner is told even though they are the one who asked: if they did
+        # not ask, this message is how they find out in time to stop it.
+        await email_provider.send(
+            Message(
+                to=actor.email,
+                subject="NovaBrief - suppression de votre organisation programmee",
+                text=(
+                    f"La suppression de l'organisation {organization.name} a ete demandee.\n\n"
+                    f"Toutes les donnees seront definitivement effacees le "
+                    f"{purge_after:%d/%m/%Y a %Hh%M UTC}.\n\n"
+                    f"Si vous n'etes pas a l'origine de cette demande, annulez-la "
+                    f"immediatement depuis {settings.web_base_url}/settings et changez "
+                    f"votre mot de passe.\n\n"
+                    f"Vous pouvez exporter vos donnees tant que le delai court."
+                ),
+            )
+        )
+
+    logger.info("organization_deletion_requested", purge_after=purge_after.isoformat())
+    return DeletionSchedule(requested_at=requested_at, purge_after=purge_after)
+
+
+async def cancel_deletion(
+    session: AsyncSession,
+    *,
+    email_provider: EmailProvider,
+    organization: Organization,
+    actor: User,
+) -> Organization:
+    """EF-06: change your mind, within the seven days."""
+    if organization.deletion_requested_at is None:
+        raise OrganizationError(
+            "NO_DELETION_PENDING",
+            "no deletion is scheduled for this organization",
+        )
+
+    organization.deletion_requested_at = None
+
+    session.add(
+        AuditLog(
+            id=uuid7(),
+            organization_id=organization.id,
+            actor_id=actor.id,
+            actor_type=ActorType.USER.value,
+            action="organization.deletion_cancelled",
+            target_type="organization",
+            target_id=organization.id,
+        )
+    )
+
+    if actor.email:
+        await email_provider.send(
+            Message(
+                to=actor.email,
+                subject="NovaBrief - suppression annulee",
+                text=(
+                    f"La suppression de l'organisation {organization.name} a ete annulee. "
+                    f"Vos donnees sont conservees et rien n'a ete efface."
+                ),
+            )
+        )
+
+    logger.info("organization_deletion_cancelled")
+    return organization
+
+
+async def purge_due_organizations(
+    session: AsyncSession, *, now: datetime | None = None
+) -> list[uuid.UUID]:
+    """EF-06: erase the organizations whose retraction window has expired.
+
+    Two steps, and the split is the point. Finding them crosses tenants, which
+    RLS forbids, so it goes through `organizations_due_for_purge` — a read-only
+    SECURITY DEFINER function. Deleting each one then happens inside a session
+    scoped to that organization, through the ordinary policy: the single
+    irreversible write in the system is not handed a way around RLS.
+
+    The six tenant tables cascade from `organizations`, so removing that row
+    removes the members, devices, tokens, invitations, resets and audit trail
+    with it. That is what EF-06's acceptance criterion asks for: nothing left
+    but encrypted backups, themselves purged within thirty days.
+
+    The caller passes an unscoped session and commits.
+    """
+    moment = now or datetime.now(UTC)
+    cutoff = moment - DELETION_RETRACTION
+
+    due = (
+        await session.execute(
+            text("SELECT id FROM organizations_due_for_purge(:before)"), {"before": cutoff}
+        )
+    ).all()
+
+    purged: list[uuid.UUID] = []
+    for row in due:
+        await set_current_organization(session, row.id)
+        # A Core delete, not `session.delete`: the ORM would load the members
+        # and try to null their `organization_id` rather than let the database
+        # cascade run. The cascade is the whole mechanism here, so nothing
+        # should come between it and the row.
+        result = cast(
+            "CursorResult[Any]",
+            await session.execute(delete(Organization).where(Organization.id == row.id)),
+        )
+        if result.rowcount == 0:  # pragma: no cover - only under a concurrent run
+            continue
+        purged.append(row.id)
+        # No audit entry: it lives in `audit_log`, which the cascade has just
+        # removed. The operational record is this log line and the backups.
+        logger.info("organization_purged", purged_organization_id=str(row.id))
+
+    return purged

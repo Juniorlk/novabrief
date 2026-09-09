@@ -10,8 +10,19 @@ Presenters only read. Anything that decides something belongs in a service.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from app.models import Organization, User
-from schemas.auth import CurrentSession, OrganizationProfile, UserProfile
+from app.services.organizations import ExportBundle
+from schemas.auth import (
+    CurrentSession,
+    ExportedAuditEntry,
+    ExportedInvitation,
+    ExportedMember,
+    OrganizationExport,
+    OrganizationProfile,
+    UserProfile,
+)
 
 
 def user_profile(user: User) -> UserProfile:
@@ -43,6 +54,7 @@ def organization_profile(organization: Organization) -> OrganizationProfile:
         consumed_seconds=organization.consumed_seconds,
         status=organization.status,
         lexicon=organization.lexicon,
+        deletion_requested_at=organization.deletion_requested_at,
         created_at=organization.created_at,
     )
 
@@ -52,4 +64,62 @@ def current_session(*, user: User, organization: Organization) -> CurrentSession
     return CurrentSession(
         user=user_profile(user),
         organization=organization_profile(organization),
+    )
+
+
+def organization_export(bundle: ExportBundle) -> OrganizationExport:
+    """EF-06: the export document.
+
+    Every field is named one by one rather than copied from the row. That is
+    the point of writing it out: a column added later — a TOTP secret, a
+    recovery code, a provider token — does not silently appear in a file the
+    customer downloads and forwards. Password hashes, token hashes and TOTP
+    secrets exist on these rows and none of them is listed below.
+    """
+    return OrganizationExport(
+        exported_at=datetime.now(UTC),
+        organization=organization_profile(bundle.organization),
+        members=[
+            ExportedMember(
+                id=member.id,
+                email=member.email,
+                phone=member.phone,
+                full_name=member.full_name,
+                role=member.role,  # type: ignore[arg-type]
+                locale=member.locale,
+                timezone=member.timezone,
+                email_verified=member.email_verified_at is not None,
+                revoked=member.revoked_at is not None,
+                created_at=member.created_at,
+            )
+            for member in bundle.members
+        ],
+        invitations=[
+            ExportedInvitation(
+                id=invitation.id,
+                email=invitation.email,
+                role=invitation.role,  # type: ignore[arg-type]
+                invited_by=invitation.invited_by,
+                expires_at=invitation.expires_at,
+                accepted_at=invitation.accepted_at,
+                revoked_at=invitation.revoked_at,
+                created_at=invitation.created_at,
+            )
+            for invitation in bundle.invitations
+        ],
+        audit_log=[
+            ExportedAuditEntry(
+                id=entry.id,
+                actor_id=entry.actor_id,
+                actor_type=entry.actor_type,
+                action=entry.action,
+                target_type=entry.target_type,
+                target_id=entry.target_id,
+                ip=entry.ip,
+                reason=entry.reason,
+                metadata=entry.metadata_json,
+                created_at=entry.created_at,
+            )
+            for entry in bundle.audit_entries
+        ],
     )
