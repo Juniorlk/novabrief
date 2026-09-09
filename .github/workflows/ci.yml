@@ -73,6 +73,10 @@ jobs:
       TEST_DATABASE_URL: postgresql+asyncpg://novabrief_app:novabrief-app-dev@localhost:5432/novabrief
       TEST_DATABASE_ADMIN_URL: postgresql+asyncpg://novabrief:novabrief@localhost:5432/novabrief
       DATABASE_ADMIN_URL: postgresql+asyncpg://novabrief:novabrief@localhost:5432/novabrief
+      TEST_R2_ENDPOINT: http://localhost:9000
+      TEST_R2_ACCESS_KEY_ID: novabrief
+      TEST_R2_SECRET_ACCESS_KEY: novabrief-dev-secret
+      TEST_R2_BUCKET_AUDIO: novabrief-audio
 
     steps:
       - uses: actions/checkout@v5
@@ -93,6 +97,26 @@ jobs:
         env:
           PGPASSWORD: novabrief
         run: psql -h localhost -U novabrief -d novabrief -v ON_ERROR_STOP=1 -f infra/postgres-init/01-app-role.sql
+
+      - name: Start MinIO
+        # A real S3 implementation, for the same reason PostgreSQL is real:
+        # only a server can say whether a presigned URL is signed correctly.
+        # Started as a step rather than a service because the image needs a
+        # command, and service containers cannot be given one. The same image
+        # the compose stack uses, so the two cannot drift.
+        run: |
+          set -euo pipefail
+          docker run -d --name minio -p 9000:9000             -e MINIO_ROOT_USER=novabrief             -e MINIO_ROOT_PASSWORD=novabrief-dev-secret             minio/minio:latest server /data
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/live > /dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -sf http://localhost:9000/minio/health/live > /dev/null
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+            mc alias set local http://localhost:9000 novabrief novabrief-dev-secret &&
+            mc mb --ignore-existing local/novabrief-audio"
 
       - name: Apply migrations
         working-directory: apps/api
@@ -116,9 +140,9 @@ jobs:
         # no run at all, because it looks like proof.
         run: |
           set -euo pipefail
-          python -m pytest apps/api/tests/test_rls_isolation.py             apps/api/tests/test_auth_service.py -q --no-header | tee result.txt
+          python -m pytest apps/api/tests/test_rls_isolation.py             apps/api/tests/test_auth_service.py             apps/api/tests/test_storage.py -q --no-header | tee result.txt
           if grep -qi "skipped" result.txt; then
-            echo "::error::database tests were skipped; T-07 was not verified"
+            echo "::error::database or storage tests were skipped; T-07 and the presigned-URL checks were not verified"
             exit 1
           fi
 

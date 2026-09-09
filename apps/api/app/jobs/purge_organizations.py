@@ -5,8 +5,10 @@ that after the seven days nothing survives; this is what keeps the promise, so
 a deployment that never schedules it is a deployment that quietly breaks the
 commitment.
 
-It is deliberately not a Celery task yet — Celery arrives with lot L2. When it
-does, the task will call `purge_due_organizations` rather than reimplement it.
+Celery now schedules the same work nightly (`novabrief.purge_organizations`).
+This entry point stays for the case the scheduler is what broke: an operator
+needs a way to run the purge by hand without a broker, and both call the same
+service function so neither can drift from the other.
 """
 
 from __future__ import annotations

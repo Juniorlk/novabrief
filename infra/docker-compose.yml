@@ -117,6 +117,64 @@ services:
       retries: 5
       start_period: 15s
 
+  # The queue. Section 15.1: the user never waits on a request, so everything
+  # slow happens here.
+  worker:
+    build:
+      context: ..
+      dockerfile: infra/api.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      ENVIRONMENT: dev
+      LOG_FORMAT: console
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql+asyncpg://novabrief_app:${DATABASE_APP_PASSWORD:-novabrief-app-dev}@postgres:5432/${POSTGRES_DB:-novabrief}
+      REDIS_URL: redis://redis:6379/0
+      R2_ENDPOINT: http://minio:9000
+      R2_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-novabrief}
+      R2_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-novabrief-dev-secret}
+      R2_BUCKET_AUDIO: novabrief-audio
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.worker.celery_app", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # The scheduler. One replica and one only: two beats would run every purge
+  # twice, and a purge is not something to run twice.
+  beat:
+    build:
+      context: ..
+      dockerfile: infra/api.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      ENVIRONMENT: dev
+      LOG_FORMAT: console
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql+asyncpg://novabrief_app:${DATABASE_APP_PASSWORD:-novabrief-app-dev}@postgres:5432/${POSTGRES_DB:-novabrief}
+      REDIS_URL: redis://redis:6379/0
+      R2_ENDPOINT: http://minio:9000
+      R2_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-novabrief}
+      R2_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-novabrief-dev-secret}
+      R2_BUCKET_AUDIO: novabrief-audio
+    command: celery -A app.worker.celery_app beat --loglevel=info
+
 volumes:
   postgres_data:
   minio_data:

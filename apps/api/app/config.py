@@ -53,6 +53,28 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
 
+    # Celery falls back to the same Redis. Separate settings because a busy
+    # deployment moves the queue to its own instance, and the API's cache
+    # should not be evicted by a backlog of meetings.
+    celery_broker_url: str | None = None
+    celery_result_backend: str | None = None
+    # A meeting of an hour takes minutes; this is the ceiling past which a task
+    # is assumed stuck rather than slow.
+    celery_task_soft_time_limit_seconds: int = 1800
+    # Section 22.3: 02:00 UTC, when nobody is recording.
+    purge_cron_hour: int = 2
+    purge_cron_minute: int = 0
+
+    @property
+    def broker_url(self) -> str:
+        """Where the queue lives."""
+        return self.celery_broker_url or self.redis_url
+
+    @property
+    def result_backend(self) -> str:
+        """Where task results live."""
+        return self.celery_result_backend or self.redis_url
+
     # RS256 key pair, PEM encoded. Asymmetric so workers can verify a token with
     # the public key alone while only the API can mint one (section 17.3).
     jwt_private_key: str | None = None

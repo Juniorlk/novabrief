@@ -32,6 +32,9 @@ dependencies = [
     # control on every meeting recording, and hand-rolling SigV4 to save an
     # image layer would put that on our own signing code.
     "aioboto3==15.5.0",
+    # The processing queue and its scheduler (section 15.1). Redis is already a
+    # dependency, so this adds a worker runtime rather than a datastore.
+    "celery[redis]==5.6.3",
 ]
 
 [project.optional-dependencies]
@@ -116,8 +119,15 @@ namespace_packages = true
 # a global ignore_missing_imports would also swallow a typo in one of our own
 # imports, which is exactly the mistake strict mode exists to catch.
 [[tool.mypy.overrides]]
-module = ["aioboto3.*", "botocore.*", "boto3.*"]
+module = ["aioboto3.*", "botocore.*", "boto3.*", "celery.*"]
 ignore_missing_imports = true
+
+# Celery's task decorator is untyped, so every task it wraps is reported as
+# untyped too. Scoped to the task modules, which are thin wrappers over
+# services that are themselves checked strictly.
+[[tool.mypy.overrides]]
+module = ["app.tasks.*"]
+disallow_untyped_decorators = false
 
 # ---------------------------------------------------------------------------
 # pytest - the 70% coverage gate applies to apps/api once it exists
