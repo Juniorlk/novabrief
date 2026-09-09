@@ -113,6 +113,20 @@ class Settings(BaseSettings):
     # in it — and a rate in code would breach ADR-09 besides.
     transcription_price_per_hour_usd: float | None = None
 
+    # LLM (ADR-01, ADR-03, section 18.5). Audio never reaches it (ADR-02).
+    llm_provider: str = "openai"
+    openai_api_key: str | None = None
+    openai_model_default: str = "gpt-5-mini"
+    llm_temperature: float = 0.1
+    llm_max_output_tokens: int = 4000
+    llm_timeout_seconds: float = 120.0
+    # Unset rather than guessed, like every other rate (ADR-09).
+    llm_price_per_million_in_usd: float | None = None
+    llm_price_per_million_out_usd: float | None = None
+    # Which prompt runs. Section 18.6: a change to it is evaluated before it
+    # ships, and the version is written next to every report it produced.
+    prompt_version: str = "extract_v1"
+
     resend_api_key: str | None = None
     # The domain verified with the email provider. Sending from anything else
     # is refused by the provider, so this default has to be the real one.

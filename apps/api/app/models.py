@@ -9,7 +9,7 @@ find the tenant is both slower and easier to get wrong.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -505,6 +506,120 @@ class TranscriptSegment(Base):
     )
 
 
+class HumanStatus(StrEnum):
+    """What a person did with an extracted item (section 19.1, EF-52)."""
+
+    UNREVIEWED = "UNREVIEWED"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    EDITED = "EDITED"
+
+
+class Report(Base):
+    """The structured report of one meeting (EF-42)."""
+
+    __tablename__ = "reports"
+
+    id: Mapped[uuid.UUID] = _pk()
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    meeting_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("meetings.id", ondelete="CASCADE"), nullable=False
+    )
+
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    participants: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    summary: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+
+    # Which model and which prompt produced this. Section 18.6 evaluates every
+    # change to either; without both recorded, a regression cannot be traced to
+    # what caused it.
+    model_version: Mapped[str | None] = mapped_column(String(64))
+    prompt_version: Mapped[str | None] = mapped_column(String(32))
+
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (UniqueConstraint("meeting_id", name="reports_meeting_unique"),)
+
+
+class Decision(Base):
+    """An arbitration the meeting settled (EF-42, EF-43)."""
+
+    __tablename__ = "decisions"
+
+    id: Mapped[uuid.UUID] = _pk()
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    meeting_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("meetings.id", ondelete="CASCADE"), nullable=False
+    )
+
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # EF-43: every extracted item resolves to a passage the user can play.
+    source_start_ms: Mapped[int] = mapped_column(nullable=False)
+    confidence: Mapped[float] = mapped_column(nullable=False)
+
+    human_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=HumanStatus.UNREVIEWED.value
+    )
+    edited_content: Mapped[str | None] = mapped_column(Text)
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("decisions_meeting_idx", "meeting_id", "source_start_ms"),)
+
+
+class Task(Base):
+    """A concrete action somebody took on (EF-42)."""
+
+    __tablename__ = "tasks"
+
+    id: Mapped[uuid.UUID] = _pk()
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    meeting_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("meetings.id", ondelete="CASCADE"), nullable=False
+    )
+
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    # Only a name that was spoken. Never inferred.
+    assignee_name: Mapped[str | None] = mapped_column(String(200))
+    # Filled in when the spoken name matches a member exactly; a near match is
+    # a suggestion for a human, not an assignment.
+    assignee_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    # The words used, kept beside the date computed from them: when the
+    # normalisation is wrong, the original is the only way to see that.
+    deadline_text: Mapped[str | None] = mapped_column(String(120))
+    deadline_date: Mapped[date | None] = mapped_column(Date)
+
+    source_start_ms: Mapped[int] = mapped_column(nullable=False)
+    confidence: Mapped[float] = mapped_column(nullable=False)
+
+    human_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=HumanStatus.UNREVIEWED.value
+    )
+    edited_content: Mapped[str | None] = mapped_column(Text)
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("tasks_assignee_idx", "organization_id", "assignee_user_id", "human_status"),
+    )
+
+
 class UsageEntry(Base):
     """What one meeting actually cost (ADR-08, section 19.1).
 
@@ -596,6 +711,9 @@ TENANT_TABLES: tuple[str, ...] = (
     "usage_ledger",
     "transcripts",
     "transcript_segments",
+    "reports",
+    "decisions",
+    "tasks",
 )
 
 # `organizations` is the tenant itself: its policy compares `id`, not
@@ -613,8 +731,10 @@ __all__ = [
     "TENANT_TABLES",
     "ActorType",
     "AuditLog",
+    "Decision",
     "Device",
     "EmailVerification",
+    "HumanStatus",
     "Invitation",
     "Meeting",
     "MeetingStatus",
@@ -622,7 +742,9 @@ __all__ = [
     "OrganizationStatus",
     "PasswordReset",
     "RefreshToken",
+    "Report",
     "Role",
+    "Task",
     "Transcript",
     "TranscriptSegment",
     "UsageEntry",

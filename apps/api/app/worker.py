@@ -59,7 +59,7 @@ def build_celery(settings: Settings | None = None) -> Celery:
         # and every task module importing `celery_app` back is then a circular
         # import. It only fails in a real worker: a test that imports the task
         # module first has already finished loading this one.
-        include=["app.tasks.maintenance", "app.tasks.pipeline"],
+        include=["app.tasks.maintenance", "app.tasks.pipeline", "app.tasks.analysis"],
     )
     app.conf.update(
         task_serializer="json",
