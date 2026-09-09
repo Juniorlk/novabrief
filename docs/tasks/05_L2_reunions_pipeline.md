@@ -44,8 +44,13 @@ d'aucune clé fournisseur.
 
 ### L2.1 — Le modèle `meetings` et la machine à états
 
-Tables `meetings`, `transcript_segments`, `reports`, `decisions`, `tasks`,
-`speakers`, avec RLS sur chacune et ajout à `TENANT_TABLES`.
+Table `meetings` seule, avec RLS et ajout à `TENANT_TABLES`.
+
+Les tables de contenu — `transcripts`, `transcript_segments`, `reports`,
+`decisions`, `tasks` — arrivent **avec la sous-tâche qui les remplit** (L2.5 et
+L2.6). Les créer ici reviendrait à écrire un schéma que rien ne lit ni n'écrit,
+donc à figer des colonnes avant de savoir ce que les fournisseurs renvoient
+vraiment. Une migration par besoin réel, pas une migration d'anticipation.
 
 La machine à états de la section 11 est implémentée comme une **table de
 transitions autorisées**, pas comme une suite de `if`. Un passage non prévu
