@@ -239,6 +239,7 @@ async def finalize(
         queued = await meetings.finalize(
             session,
             storage=storage,
+            organization=caller.organization,
             meeting=meeting,
             caller=caller.user,
             upload_id=payload.upload_id,

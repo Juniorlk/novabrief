@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.debug_id import new_debug_id
 from app.logging import get_logger
 from app.models import ActorType, AuditLog, Meeting, MeetingStatus, Organization, Role, User
+from app.services import usage
 from app.storage import MultipartUpload, StorageError, StorageProvider, audio_key
 from app.uuid7 import uuid7
 
@@ -353,6 +354,7 @@ async def finalize(
     session: AsyncSession,
     *,
     storage: StorageProvider,
+    organization: Organization,
     meeting: Meeting,
     caller: User,
     upload_id: str,
@@ -372,7 +374,8 @@ async def finalize(
     The digest is stored and checked by the worker that fetches the recording
     for transcription, which is the first place the bytes actually exist.
 
-    Answers by advancing to QUEUED; the caller replies 202 (EF-40).
+    Answers by advancing to QUEUED, or to QUOTA_HOLD when the organization has
+    no seconds left; the caller replies 202 either way (EF-40).
     """
     if meeting.created_by != caller.id:
         raise MeetingError("FORBIDDEN", "only the author may finalize a meeting")
@@ -400,16 +403,26 @@ async def finalize(
     # number that describes what actually exists.
     meeting.audio_bytes = stored.size_bytes
 
-    # QUOTA_HOLD belongs here too (section 11), and deliberately is not yet:
-    # deciding it needs the quota rules and the ledger, which arrive together
-    # in L2.3. Inventing a quota semantic now - "0 means unlimited" - would be
-    # a plan value written in application code, which ADR-09 forbids.
+    # Section 20.3: going over quota blocks the *processing*, never the
+    # recording. The audio is already stored and stays stored; the meeting
+    # waits for a pack or a renewal instead of being refused. Losing it here
+    # would be the one failure a customer cannot recover from.
+    entry: dict[str, Any] = {}
+    if client_version:
+        entry["client_version"] = client_version
+
+    if usage.can_afford(organization, meeting.duration_seconds):
+        destination = MeetingStatus.QUEUED
+    else:
+        destination = MeetingStatus.QUOTA_HOLD
+        entry["remaining_seconds"] = usage.remaining_seconds(organization)
+
     await advance(
         session,
         meeting=meeting,
-        to=MeetingStatus.QUEUED,
+        to=destination,
         actor=caller,
-        metadata={"client_version": client_version} if client_version else None,
+        metadata=entry or None,
     )
     logger.info("meeting_finalized", meeting_id=str(meeting.id), size_bytes=stored.size_bytes)
     return meeting

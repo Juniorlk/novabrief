@@ -161,7 +161,10 @@ class OrganizationProfile(_Base):
     plan_code: str
     default_language: str
     audio_retention_days: int
-    quota_seconds: int
+    # Null until a plan is assigned (lot L5): "no quota configured" is not the
+    # same fact as "a quota of zero", and a client showing 0 h remaining to an
+    # organization that simply has no plan yet would be lying to it.
+    quota_seconds: int | None
     consumed_seconds: int
     status: str
     # Proper nouns and acronyms handed to the transcription provider as
