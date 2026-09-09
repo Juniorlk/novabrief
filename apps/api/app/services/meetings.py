@@ -16,7 +16,7 @@ the queue.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.debug_id import new_debug_id
 from app.logging import get_logger
 from app.models import ActorType, AuditLog, Meeting, MeetingStatus, Organization, Role, User
+from app.storage import MultipartUpload, StorageError, StorageProvider, audio_key
 from app.uuid7 import uuid7
 
 logger = get_logger(__name__)
@@ -301,3 +302,128 @@ async def remove(session: AsyncSession, *, meeting: Meeting, caller: User) -> Me
         raise MeetingError("FORBIDDEN", "only the author or an administrator may delete a meeting")
 
     return await advance(session, meeting=meeting, to=MeetingStatus.DELETED, actor=caller)
+
+
+# --------------------------------------------------------------------------
+# Upload and finalisation (EF-40, section 16.4)
+# --------------------------------------------------------------------------
+
+
+async def start_upload(
+    session: AsyncSession,
+    *,
+    storage: StorageProvider,
+    meeting: Meeting,
+    caller: User,
+    size_bytes: int,
+    sha256: str,
+    duration_seconds: int,
+    paused_seconds: int,
+) -> MultipartUpload:
+    """`finalize-local`: the recording is encoded; hand back somewhere to put it.
+
+    The declared size, duration and digest are written now, before a byte
+    moves. That ordering is what makes the finalisation checkable at all: at
+    `finalize` we compare what the store actually holds against what was
+    promised here, and a mismatch means the upload is not what it claimed.
+
+    Only the author may upload: a colleague has no business attaching audio to
+    someone else's recording.
+    """
+    if meeting.created_by != caller.id:
+        raise MeetingError("FORBIDDEN", "only the author may upload a meeting's audio")
+
+    meeting.audio_sha256 = sha256
+    meeting.audio_bytes = size_bytes
+    meeting.duration_seconds = duration_seconds
+    meeting.paused_seconds = paused_seconds
+    meeting.audio_key = audio_key(organization_id=meeting.organization_id, meeting_id=meeting.id)
+
+    # CREATED → UPLOADING. Refused if the meeting already moved on, which is
+    # what stops a replayed request from reopening a finished recording.
+    await advance(session, meeting=meeting, to=MeetingStatus.UPLOADING, actor=caller)
+
+    try:
+        return await storage.start_multipart(key=meeting.audio_key, size_bytes=size_bytes)
+    except StorageError as exc:
+        raise MeetingError("STORAGE_UNAVAILABLE", str(exc)) from exc
+
+
+async def finalize(
+    session: AsyncSession,
+    *,
+    storage: StorageProvider,
+    meeting: Meeting,
+    caller: User,
+    upload_id: str,
+    parts: Sequence[tuple[int, str]],
+    client_version: str | None = None,
+) -> Meeting:
+    """`finalize`: assemble the parts and queue the work.
+
+    What is verified here is the **size**: the store is asked what it actually
+    holds and the answer must match what was declared at `finalize-local`. A
+    truncated or padded upload is refused and the meeting does not enter the
+    queue.
+
+    What is *not* verified here is the SHA-256, and it is worth being precise
+    about why. Computing it server-side means reading the whole object, and the
+    API never touches the audio — that is the point of presigned uploads.
+    The digest is stored and checked by the worker that fetches the recording
+    for transcription, which is the first place the bytes actually exist.
+
+    Answers by advancing to QUEUED; the caller replies 202 (EF-40).
+    """
+    if meeting.created_by != caller.id:
+        raise MeetingError("FORBIDDEN", "only the author may finalize a meeting")
+    if meeting.audio_key is None:
+        raise MeetingError("UPLOAD_NOT_STARTED", "this meeting has no upload in progress")
+
+    try:
+        stored = await storage.complete_multipart(
+            key=meeting.audio_key, upload_id=upload_id, etags=list(parts)
+        )
+    except StorageError as exc:
+        raise MeetingError("UPLOAD_INCOMPLETE", str(exc)) from exc
+
+    if meeting.audio_bytes is not None and stored.size_bytes != meeting.audio_bytes:
+        # Refused rather than accepted-and-flagged: transcribing a truncated
+        # recording would produce a confident, incomplete report, which is
+        # worse than no report at all.
+        await storage.delete(key=meeting.audio_key)
+        raise MeetingError(
+            "SIZE_MISMATCH",
+            f"the stored audio is {stored.size_bytes} bytes, {meeting.audio_bytes} were declared",
+        )
+
+    # The size the store reports wins over the declared one: it is the only
+    # number that describes what actually exists.
+    meeting.audio_bytes = stored.size_bytes
+
+    # QUOTA_HOLD belongs here too (section 11), and deliberately is not yet:
+    # deciding it needs the quota rules and the ledger, which arrive together
+    # in L2.3. Inventing a quota semantic now - "0 means unlimited" - would be
+    # a plan value written in application code, which ADR-09 forbids.
+    await advance(
+        session,
+        meeting=meeting,
+        to=MeetingStatus.QUEUED,
+        actor=caller,
+        metadata={"client_version": client_version} if client_version else None,
+    )
+    logger.info("meeting_finalized", meeting_id=str(meeting.id), size_bytes=stored.size_bytes)
+    return meeting
+
+
+async def abandon(
+    session: AsyncSession, *, storage: StorageProvider, meeting: Meeting, caller: User
+) -> Meeting:
+    """Give up on a recording before it is queued.
+
+    The parts left in the store are dropped: an abandoned multipart upload is
+    billed until it is aborted, and nobody notices those.
+    """
+    if meeting.created_by != caller.id:
+        raise MeetingError("FORBIDDEN", "only the author may cancel a meeting")
+
+    return await advance(session, meeting=meeting, to=MeetingStatus.CANCELLED, actor=caller)

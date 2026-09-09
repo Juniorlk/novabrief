@@ -30,6 +30,7 @@ from app.main import create_app
 from app.models import Meeting, MeetingStatus
 from app.ratelimit import InMemoryRateLimiter
 from app.services import meetings
+from app.storage import InMemoryStorageProvider
 
 APP_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL",
@@ -44,11 +45,12 @@ pytestmark = pytest.mark.asyncio
 
 @dataclass
 class Harness:
-    """The API, the mailbox and the database."""
+    """The API, the mailbox, the object store and the database."""
 
     client: AsyncClient
     mailbox: RecordingProvider
     engine: AsyncEngine
+    storage: InMemoryStorageProvider
 
 
 @pytest_asyncio.fixture
@@ -84,12 +86,20 @@ async def api(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Harness]:
         pytest.skip(f"no test database reachable ({type(exc).__name__})")
 
     mailbox = RecordingProvider()
-    app = create_app(limiter=InMemoryRateLimiter(), email_provider=mailbox)
+    # The store is passed explicitly rather than left to the configuration: a
+    # .env that happens to hold real R2 credentials must never turn a test run
+    # into writes against the production bucket.
+    storage = InMemoryStorageProvider()
+    app = create_app(
+        limiter=InMemoryRateLimiter(),
+        email_provider=mailbox,
+        storage=storage,
+    )
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as http:
-        yield Harness(client=http, mailbox=mailbox, engine=engine)
+        yield Harness(client=http, mailbox=mailbox, engine=engine, storage=storage)
 
     await engine.dispose()
     get_settings.cache_clear()
@@ -420,3 +430,193 @@ async def test_completion_stamps_the_time(api: Harness) -> None:
 
     assert completed_at is not None
     assert completed_at >= before
+
+
+# --------------------------------------------------------------------------
+# Upload and finalisation (L2.2)
+# --------------------------------------------------------------------------
+
+
+def _sha256() -> str:
+    return uuid.uuid4().hex + uuid.uuid4().hex
+
+
+async def _ticket(
+    api: Harness, headers: dict[str, str], meeting_id: str, *, size_bytes: int = 6_000_000
+) -> dict[str, object]:
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting_id}/finalize-local",
+        json={
+            "size_bytes": size_bytes,
+            "sha256": _sha256(),
+            "duration_seconds": 1800,
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    body: dict[str, object] = response.json()
+    return body
+
+
+async def test_finalize_local_returns_upload_slots(api: Harness) -> None:
+    """Section 16.4: the client uploads straight to the bucket, never through us."""
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+
+    ticket = await _ticket(api, headers, meeting["id"])
+
+    assert ticket["upload_id"]
+    assert len(ticket["parts"]) >= 1  # type: ignore[arg-type]
+    assert ticket["expires_in_seconds"] == 900
+
+
+async def test_finalize_local_moves_the_meeting_to_uploading(api: Harness) -> None:
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+    await _ticket(api, headers, meeting["id"])
+
+    current = (await api.client.get(f"{PREFIX}/meetings/{meeting['id']}", headers=headers)).json()
+
+    assert current["status"] == "UPLOADING"
+
+
+async def test_a_declared_size_of_zero_is_refused(api: Harness) -> None:
+    """A meeting with no audio is a bug upstream, not a zero-byte object."""
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize-local",
+        json={"size_bytes": 0, "sha256": _sha256(), "duration_seconds": 10},
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+
+
+async def test_a_malformed_digest_is_refused(api: Harness) -> None:
+    """The digest is checked at the boundary, not months later by a worker."""
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize-local",
+        json={"size_bytes": 1024, "sha256": "not-a-digest", "duration_seconds": 10},
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+
+
+async def test_only_the_author_may_upload(api: Harness) -> None:
+    """A colleague has no business attaching audio to someone else's recording."""
+    owner = await _owner(api.client)
+    meeting = await _declare(api.client, owner)
+    other = await _owner(api.client)
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize-local",
+        json={"size_bytes": 1024, "sha256": _sha256(), "duration_seconds": 10},
+        headers=other,
+    )
+
+    # Another tenant cannot even see it.
+    assert response.status_code == 404
+
+
+async def test_starting_an_upload_twice_is_refused(api: Harness) -> None:
+    """A replayed request must not reopen a recording that already moved on."""
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+    await _ticket(api, headers, meeting["id"])
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize-local",
+        json={"size_bytes": 6_000_000, "sha256": _sha256(), "duration_seconds": 10},
+        headers=headers,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "ILLEGAL_TRANSITION"
+
+
+async def test_finalizing_queues_the_meeting(api: Harness) -> None:
+    """EF-40: 202, and the meeting is in the queue."""
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+    ticket = await _ticket(api, headers, meeting["id"])
+    parts = [
+        {"part_number": part["part_number"], "etag": "e"}  # type: ignore[index]
+        for part in ticket["parts"]  # type: ignore[union-attr]
+    ]
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize",
+        json={"upload_id": ticket["upload_id"], "parts": parts, "client_version": "0.1.0"},
+        headers=headers,
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "QUEUED"
+
+
+async def test_finalizing_a_short_upload_is_refused(api: Harness) -> None:
+    """A truncated recording would become a confident, incomplete report."""
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+    ticket = await _ticket(api, headers, meeting["id"], size_bytes=6_000_000)
+    # The store ends up holding less than was promised: a dropped part, a
+    # client that stopped early, a disk that filled.
+    api.storage.stored_size_override = 4_000_000
+    parts = [
+        {"part_number": part["part_number"], "etag": "e"}  # type: ignore[index]
+        for part in ticket["parts"]  # type: ignore[union-attr]
+    ]
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize",
+        json={"upload_id": ticket["upload_id"], "parts": parts},
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "SIZE_MISMATCH"
+
+
+async def test_finalizing_with_a_missing_part_is_refused(api: Harness) -> None:
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+    ticket = await _ticket(api, headers, meeting["id"], size_bytes=11 * 1024 * 1024)
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize",
+        json={"upload_id": ticket["upload_id"], "parts": [{"part_number": 1, "etag": "e"}]},
+        headers=headers,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "UPLOAD_INCOMPLETE"
+
+
+async def test_finalizing_without_an_upload_is_refused(api: Harness) -> None:
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize",
+        json={"upload_id": "nope", "parts": [{"part_number": 1, "etag": "e"}]},
+        headers=headers,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "UPLOAD_NOT_STARTED"
+
+
+async def test_a_recording_can_be_abandoned(api: Harness) -> None:
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+
+    response = await api.client.post(f"{PREFIX}/meetings/{meeting['id']}/cancel", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "CANCELLED"

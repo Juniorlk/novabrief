@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,9 +33,14 @@ MeetingState = Literal[
 
 __all__ = [
     "DeclareMeetingRequest",
+    "FinalizeRequest",
+    "FinalizeUploadRequest",
     "MeetingState",
     "MeetingSummary",
     "UpdateMeetingRequest",
+    "UploadPart",
+    "UploadTicket",
+    "UploadedPart",
 ]
 
 
@@ -90,3 +95,64 @@ class MeetingSummary(_Base):
     purge_at: datetime | None
     created_at: datetime
     completed_at: datetime | None
+
+
+# --------------------------------------------------------------------------
+# Upload and finalisation (EF-40, section 16.4, section 17.2)
+# --------------------------------------------------------------------------
+
+# Hex, lower case, 64 characters. Written out rather than left as a plain `str`
+# so a client sending a base64 digest is told at the boundary.
+Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class FinalizeUploadRequest(_Base):
+    """The local manifest: what the desktop is about to upload.
+
+    Sent once the Opus file is encoded and hashed, before a single byte leaves
+    the machine. The size is what determines how many presigned slots come
+    back, so it has to be the real one.
+    """
+
+    size_bytes: int = Field(gt=0)
+    sha256: Sha256
+    duration_seconds: int = Field(ge=0)
+    paused_seconds: int = Field(default=0, ge=0)
+
+
+class UploadPart(_Base):
+    """One presigned slot, to be filled with a chunk of the recording."""
+
+    part_number: int = Field(ge=1)
+    url: str
+
+
+class UploadTicket(_Base):
+    """Everything the client needs to upload, and nothing else.
+
+    The URLs are bearer credentials with a short life: whoever holds one can
+    write that part until it expires. They are handed to a caller who has
+    already been authorised, and never logged.
+    """
+
+    upload_id: str
+    part_size_bytes: int
+    parts: list[UploadPart]
+    expires_in_seconds: int
+
+
+class UploadedPart(_Base):
+    """What the store returned for one part, echoed back at finalisation."""
+
+    part_number: int = Field(ge=1)
+    etag: str = Field(min_length=1, max_length=128)
+
+
+class FinalizeRequest(_Base):
+    """Every part is uploaded; assemble the object and queue the work."""
+
+    upload_id: str = Field(min_length=1, max_length=256)
+    parts: list[UploadedPart] = Field(min_length=1)
+    # Which build produced this recording. It costs nothing to record and is
+    # the first thing worth knowing when one version starts failing.
+    client_version: str | None = Field(default=None, max_length=32)

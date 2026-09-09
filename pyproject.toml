@@ -27,6 +27,11 @@ dependencies = [
     # this. Data only, no code: it is what lets a timezone be rejected at the
     # boundary instead of failing months later inside a scheduled job.
     "tzdata==2026.3",
+    # S3 client for Cloudflare R2 (and MinIO in development). Heavier than the
+    # rest of this list, and taken deliberately: presigned URLs are the access
+    # control on every meeting recording, and hand-rolling SigV4 to save an
+    # image layer would put that on our own signing code.
+    "aioboto3==15.5.0",
 ]
 
 [project.optional-dependencies]
@@ -106,6 +111,13 @@ files = ["packages", "apps/api/app"]
 mypy_path = ["packages", "apps/api"]
 explicit_package_bases = true
 namespace_packages = true
+
+# The AWS SDK ships no type information. Scoped to these modules on purpose:
+# a global ignore_missing_imports would also swallow a typo in one of our own
+# imports, which is exactly the mistake strict mode exists to catch.
+[[tool.mypy.overrides]]
+module = ["aioboto3.*", "botocore.*", "boto3.*"]
+ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------
 # pytest - the 70% coverage gate applies to apps/api once it exists

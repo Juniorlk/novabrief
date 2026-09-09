@@ -5,7 +5,7 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-09** (lot L1 terminé ; prochaine étape : le brief du lot L2).
+> Dernière mise à jour : **2026-09-09** (lot L2 en cours : L2.1 et L2.2 faites).
 
 ---
 
@@ -19,7 +19,8 @@
 | POC #3 — extraction structurée | **sauté** (décision Novafrik 2026-09-08) | §5 ci-dessous |
 | Lot L0 — socle backend | **fait sauf staging** | PR #2 ; `docker compose up` répond sur `/health` |
 | Lot L1 — comptes & organisations | **terminé** (EF-01 a EF-06) | PR #2, #4, #6, #7, #8, #9, #10 |
-| Lots L2 à L7 | non commencés | `docs/tasks/04_APRES_LES_POC_lots_MVP.md` |
+| Lot L2 — réunions & pipeline | **en cours** : L2.1 et L2.2 faites, six sous-tâches restantes | `docs/tasks/05_L2_reunions_pipeline.md` ; PR #11 |
+| Lots L3 à L7 | non commencés | `docs/tasks/04_APRES_LES_POC_lots_MVP.md` |
 
 ### Lot L1 en détail
 
@@ -44,25 +45,28 @@
 
 ## 2. Prochaine étape
 
-**Écrire `docs/tasks/05_L2_reunions_pipeline.md`**, le brief du lot L2, puis
-l'exécuter. Le lot L1 est terminé ; la PR #10 le ferme.
+**L2.3 — quota et registre de consommation** (`usage_ledger`, décrément
+atomique, ADR-08 et ADR-09), puis L2.4 (Celery), L2.5 (transcription et
+fallback), L2.6 (LLM et extraction), L2.7 (WebSocket), L2.8 (relance et purge).
 
-Commencer par ce qui ne dépend d'aucune clé fournisseur :
+Le découpage et les critères sont dans `docs/tasks/05_L2_reunions_pipeline.md`.
 
-1. Le modèle `meetings` et la machine à états de la section 11.
-2. `finalize-local` et `finalize` avec les URL présignées multipart vers MinIO.
-3. `usage_ledger` et le décompte atomique de quota.
-4. La file Celery et son ordonnanceur — qui reprendra
-   `app.jobs.purge_organizations`, aujourd'hui lancé à la main.
-5. Le statut par WebSocket, la purge audio planifiée, la reprise après FAILED.
+**Fait dans le lot L2 :**
 
-`TranscriptionProvider` et `LLMProvider` sont écrits et testés **avec des
-doubles uniquement** : décision Novafrik du 2026-09-08, aucun appel réel aux
-fournisseurs d'IA.
+| Sous-tâche | État |
+|---|---|
+| L2.1 modèle `meetings` + machine à états §11 | fait — PR #11 |
+| L2.2 stockage objet, URL présignées, `finalize-local` et `finalize` | fait |
+| L2.3 à L2.8 | à faire |
 
-Après L2, **déploiement sur le VPS OVHcloud** : `ubuntu@novabrief.cloud`,
-51.75.120.252. Le DNS est prêt (`api.` et `app.` pointent déjà dessus). Une
-reconnaissance en lecture seule d'abord, puis validation de Novafrik.
+**Point ouvert de L2.2, à trancher au plus tard en L2.5** : le cahier des
+charges demande une vérification du « checksum global » à la finalisation.
+C'est **impossible côté API sans lire l'objet**, ce qui contredirait le
+principe que l'audio ne transite jamais par le serveur. Ce qui est vérifié
+aujourd'hui, c'est la **taille** rapportée par le magasin contre la taille
+déclarée — une troncature est donc refusée. Le SHA-256 est stocké et devra
+être vérifié par le worker de transcription, seul endroit où les octets
+existent réellement.
 
 ---
 
@@ -70,8 +74,8 @@ reconnaissance en lecture seule d'abord, puis validation de Novafrik.
 
 | Bloqué | Ce qu'il faut | Pour |
 |---|---|---|
-| Pipeline de traitement | `ASSEMBLYAI_API_KEY`, `OPENAI_API_KEY` (Deepgram reçue le 2026-09-08) | L2 |
-| Stockage des audios | identifiants Cloudflare R2 (MinIO tient le rôle en local) | L2 |
+| Second fournisseur de transcription | une **vraie clé Deepgram** : celle fournie le 2026-09-08 était en fait la clé AssemblyAI (Deepgram la rejette en 401). AssemblyAI et OpenAI sont vérifiées et en place. | L2.5 |
+| Stockage des audios en production | un **Account API token** R2 (Object Read & Write, portée `novabrief-audio`) — MinIO tient le rôle en local et les tests passent contre lui | déploiement |
 | Paiement | clés sandbox Flutterwave | L5 |
 
 **Débloqué le 2026-09-09** : domaine `novabrief.cloud` (DNS chez OVH,
@@ -212,6 +216,7 @@ Elles ne sont pas dans le cahier des charges et priment sur lui.
 | 2026-09-08 | Déploiement sur le VPS OVHcloud **après** la fin du lot L2 |
 | 2026-09-08 | **EF-06** : export **JSON + audio** maintenant, **PDF reporté au lot L4** ; suppression définitive avec **7 jours de rétractation** |
 | 2026-09-08 | Clés `RESEND_API_KEY` et `DEEPGRAM_API_KEY` fournies |
+| 2026-09-09 | **Cloudflare R2 retenu** plutôt que MinIO sur le VPS : à ce volume R2 coûte quelques centimes par mois, et sortir l'audio du disque qui porte PostgreSQL vaut plus que l'économie |
 | 2026-09-09 | Domaine **`novabrief.cloud`** (OVH) ; DNS Resend configure ; redirection `contact@` vers l'adresse personnelle faute de boite OVH disponible |
 
 **Le risque « l'IA invente une décision » (risque n°2 du cahier des charges)
