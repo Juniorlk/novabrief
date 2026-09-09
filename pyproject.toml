@@ -23,6 +23,10 @@ dependencies = [
     "redis==6.4.0",
     # Runtime, not just tests: ResendProvider calls the email API over HTTP.
     "httpx==0.28.1",
+    # Windows ships no time zone database, so `zoneinfo` finds nothing without
+    # this. Data only, no code: it is what lets a timezone be rejected at the
+    # boundary instead of failing months later inside a scheduled job.
+    "tzdata==2026.3",
 ]
 
 [project.optional-dependencies]

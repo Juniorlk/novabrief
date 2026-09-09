@@ -23,7 +23,7 @@ from app.errors import install_error_handlers
 from app.logging import configure_logging, get_logger
 from app.middleware import DEBUG_ID_HEADER, RateLimitMiddleware, RequestContextMiddleware
 from app.ratelimit import InMemoryRateLimiter, RateLimiter, RedisRateLimiter
-from app.routers import auth, health, members
+from app.routers import auth, health, members, organizations
 
 API_PREFIX = "/api/v1"
 VERSION = "0.1.0"
@@ -169,6 +169,7 @@ def create_app(
     app.include_router(health.router)
     app.include_router(auth.router, prefix=API_PREFIX)
     app.include_router(members.router, prefix=API_PREFIX)
+    app.include_router(organizations.router, prefix=API_PREFIX)
 
     return app
 

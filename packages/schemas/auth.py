@@ -11,8 +11,17 @@ import re
 import uuid
 from datetime import datetime
 from typing import Annotated, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 # EF-01: phone numbers are stored in E.164, which is unambiguous across the
 # countries NovaBrief will open in and is what Mobile Money expects.
@@ -24,6 +33,32 @@ Role = Literal["OWNER", "ADMIN", "MEMBER"]
 Locale = Literal["fr", "en"]
 
 Password = Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH, max_length=200)]
+
+# One entry of an organization's lexicon: a proper noun or an acronym, not a
+# sentence.
+LexiconTerm = Annotated[str, Field(min_length=1, max_length=80)]
+
+
+def _known_timezone(value: str) -> str:
+    """Reject anything the IANA database does not know.
+
+    A timezone is not decoration: renewal reminders go out at 08:00 in the
+    user's zone (section 20.3) and retention is counted in local days. An
+    unchecked string would be accepted here and blow up months later inside a
+    scheduled job, far from whoever typed it.
+    """
+    candidate = value.strip()
+    try:
+        ZoneInfo(candidate)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        message = f"unknown timezone: {candidate!r}"
+        raise ValueError(message) from exc
+    return candidate
+
+
+# `str` rather than a Literal of every zone: the IANA list changes twice a year
+# and freezing it here would mean a release to accept a new one.
+Timezone = Annotated[str, Field(max_length=64), AfterValidator(_known_timezone)]
 
 
 class _Base(BaseModel):
@@ -45,7 +80,7 @@ class RegisterRequest(_Base):
     phone: str | None = Field(default=None, max_length=20)
 
     locale: Locale = "fr"
-    timezone: str = Field(default="Africa/Douala", max_length=64)
+    timezone: Timezone = "Africa/Douala"
 
     @field_validator("phone")
     @classmethod
@@ -156,7 +191,10 @@ __all__ = [
     "RefreshRequest",
     "RegisterRequest",
     "Role",
+    "Timezone",
     "TokenPair",
+    "UpdateOrganizationRequest",
+    "UpdateProfileRequest",
     "UserProfile",
 ]
 
@@ -186,7 +224,7 @@ class AcceptInvitationRequest(_Base):
     full_name: str = Field(min_length=1, max_length=200)
     password: Password
     locale: Locale = "fr"
-    timezone: str = Field(default="Africa/Douala", max_length=64)
+    timezone: Timezone = "Africa/Douala"
 
 
 class MemberSummary(_Base):
@@ -211,3 +249,36 @@ class PasswordResetConfirm(_Base):
 
     token: str = Field(min_length=1, max_length=512)
     password: Password
+
+
+class UpdateProfileRequest(_Base):
+    """EF-04: what a user may change about themselves.
+
+    Every field is optional: a client sends only what it is changing, and
+    omitting a field leaves it alone. Role is absent on purpose — nobody
+    promotes themselves.
+    """
+
+    full_name: str | None = Field(default=None, min_length=1, max_length=200)
+    locale: Locale | None = None
+    timezone: Timezone | None = None
+
+
+class UpdateOrganizationRequest(_Base):
+    """EF-05: organization settings an administrator may change.
+
+    Plan, quota and status are absent: they are billing state, changed by the
+    payment flow and never by a customer request (ADR-09).
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    # RCCM or NIU in Cameroon; free text because the format differs per market.
+    legal_id: str | None = Field(default=None, max_length=64)
+    default_language: Locale | None = None
+    # Reducing is always allowed; raising it is a plan matter (see the service).
+    audio_retention_days: int | None = Field(default=None, ge=1, le=3650)
+    # Proper nouns and acronyms handed to the transcription provider as
+    # keyterms, which is what makes local names come back spelled correctly.
+    # Bounded on both axes: the provider charges for the list and refuses an
+    # oversized one, so a paste of a whole document has to fail here.
+    lexicon: list[LexiconTerm] | None = Field(default=None, max_length=500)
