@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
@@ -19,6 +20,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -102,7 +104,10 @@ class Organization(Base):
     plan_code: Mapped[str] = mapped_column(String(32), nullable=False, default="free")
     cycle_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cycle_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    quota_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # Null until a plan is assigned (lot L5). Deliberately not 0: "no quota
+    # configured" and "a quota of zero seconds" are different things, and
+    # conflating them would put every meeting on hold before billing exists.
+    quota_seconds: Mapped[int | None] = mapped_column(BigInteger)
     consumed_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     audio_retention_days: Mapped[int] = mapped_column(nullable=False, default=30)
 
@@ -426,6 +431,52 @@ class Meeting(Base):
     )
 
 
+class UsageEntry(Base):
+    """What one meeting actually cost (ADR-08, section 19.1).
+
+    Written once, at publication, and never updated: it is an accounting
+    record, and the unit-economics dashboard of section 5.9 reads it as
+    history. Amounts are `numeric`, never floats — a cost summed over
+    thousands of meetings in binary floating point drifts.
+
+    Both foreign keys release rather than block. The reference DDL puts
+    `ON DELETE RESTRICT` on the organization, which would make an organization
+    undeletable and directly contradict EF-06's promise that nothing survives a
+    deletion. Setting them to NULL keeps both promises: Novafrik retains the
+    aggregate cost history it needs to run the business, and the row stops
+    naming the customer who asked to be forgotten.
+    """
+
+    __tablename__ = "usage_ledger"
+
+    id: Mapped[uuid.UUID] = _pk()
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="SET NULL")
+    )
+    meeting_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("meetings.id", ondelete="SET NULL")
+    )
+
+    seconds_billed: Mapped[int] = mapped_column(nullable=False)
+
+    stt_provider: Mapped[str | None] = mapped_column(String(40))
+    stt_cost_usd: Mapped[Decimal] = mapped_column(Numeric(10, 5), nullable=False, default=0)
+    llm_provider: Mapped[str | None] = mapped_column(String(40))
+    llm_tokens_in: Mapped[int] = mapped_column(nullable=False, default=0)
+    llm_tokens_out: Mapped[int] = mapped_column(nullable=False, default=0)
+    llm_cost_usd: Mapped[Decimal] = mapped_column(Numeric(10, 5), nullable=False, default=0)
+    storage_cost_usd: Mapped[Decimal] = mapped_column(Numeric(10, 5), nullable=False, default=0)
+
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("seconds_billed >= 0", name="usage_ledger_seconds_non_negative"),
+        Index("usage_ledger_org_recorded_idx", "organization_id", "recorded_at"),
+    )
+
+
 class EmailVerification(Base):
     """A single-use link proving an address belongs to whoever signed up (EF-02)."""
 
@@ -468,6 +519,7 @@ TENANT_TABLES: tuple[str, ...] = (
     "password_resets",
     "email_verifications",
     "meetings",
+    "usage_ledger",
 )
 
 # `organizations` is the tenant itself: its policy compares `id`, not
@@ -495,6 +547,7 @@ __all__ = [
     "PasswordReset",
     "RefreshToken",
     "Role",
+    "UsageEntry",
     "User",
     "is_tenant_scoped",
 ]
