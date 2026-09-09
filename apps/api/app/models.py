@@ -99,7 +99,11 @@ class Organization(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
-    users: Mapped[list[User]] = relationship(back_populates="organization")
+    # passive_deletes: without it SQLAlchemy loads the members on a delete and
+    # issues `UPDATE users SET organization_id = NULL`, which detaches them
+    # instead of removing them — and under RLS fails outright. The database
+    # already cascades (EF-06 depends on it), so the ORM must stand aside.
+    users: Mapped[list[User]] = relationship(back_populates="organization", passive_deletes=True)
 
     __table_args__ = (
         CheckConstraint("consumed_seconds >= 0", name="organizations_consumed_non_negative"),

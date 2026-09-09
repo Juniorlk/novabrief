@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
@@ -167,6 +167,10 @@ class OrganizationProfile(_Base):
     # Proper nouns and acronyms handed to the transcription provider as
     # keyterms, which is what makes local names come back spelled correctly.
     lexicon: list[str]
+    # EF-06: set while a deletion is pending, null otherwise. The client needs
+    # it to show the banner and the countdown, so it belongs in the profile
+    # rather than behind a second call.
+    deletion_requested_at: datetime | None = None
     created_at: datetime
 
 
@@ -181,10 +185,15 @@ __all__ = [
     "MIN_PASSWORD_LENGTH",
     "AcceptInvitationRequest",
     "CurrentSession",
+    "DeletionScheduled",
+    "ExportedAuditEntry",
+    "ExportedInvitation",
+    "ExportedMember",
     "InvitationCreated",
     "InviteMemberRequest",
     "LoginRequest",
     "MemberSummary",
+    "OrganizationExport",
     "OrganizationProfile",
     "PasswordResetConfirm",
     "PasswordResetRequest",
@@ -282,3 +291,88 @@ class UpdateOrganizationRequest(_Base):
     # Bounded on both axes: the provider charges for the list and refuses an
     # oversized one, so a paste of a whole document has to fail here.
     lexicon: list[LexiconTerm] | None = Field(default=None, max_length=500)
+
+
+# --------------------------------------------------------------------------
+# EF-06: export and deletion
+# --------------------------------------------------------------------------
+
+
+class ExportedMember(_Base):
+    """One member inside an export.
+
+    Deliberately not a `MemberSummary`: an export is a durable file the
+    customer keeps, so it carries the settings that would be needed to
+    recreate the account. It carries no password hash, no TOTP secret and no
+    token — an export is handed over, and a credential in it would outlive
+    every revocation.
+    """
+
+    id: uuid.UUID
+    email: EmailStr | None
+    phone: str | None
+    full_name: str
+    role: Role
+    locale: str
+    timezone: str
+    email_verified: bool
+    revoked: bool
+    created_at: datetime
+
+
+class ExportedInvitation(_Base):
+    """One invitation inside an export. The token itself is never included."""
+
+    id: uuid.UUID
+    email: EmailStr
+    role: Role
+    invited_by: uuid.UUID | None
+    expires_at: datetime
+    accepted_at: datetime | None
+    revoked_at: datetime | None
+    created_at: datetime
+
+
+class ExportedAuditEntry(_Base):
+    """One audit entry inside an export (section 21.2)."""
+
+    id: uuid.UUID
+    actor_id: uuid.UUID | None
+    actor_type: str
+    action: str
+    target_type: str | None
+    target_id: uuid.UUID | None
+    ip: str | None
+    reason: str | None
+    metadata: dict[str, Any] | None
+    created_at: datetime
+
+
+class OrganizationExport(_Base):
+    """EF-06: everything the organization owns, in one document.
+
+    `format` is a version string rather than a number so a reader can tell at
+    a glance what it is holding. Meetings, reports and the audio manifest join
+    this document when those tables exist (lot L2), which is why the version
+    is stated in the file rather than assumed by whoever opens it.
+    """
+
+    format: Literal["novabrief.export.v1"] = "novabrief.export.v1"
+    exported_at: datetime
+    organization: OrganizationProfile
+    members: list[ExportedMember]
+    invitations: list[ExportedInvitation]
+    audit_log: list[ExportedAuditEntry]
+
+
+class DeletionScheduled(_Base):
+    """EF-06: the answer to a deletion request.
+
+    Both instants are returned because the difference is the whole point: the
+    request is recorded now, the data disappears later, and until then the
+    customer can change their mind.
+    """
+
+    deletion_requested_at: datetime
+    purge_after: datetime
+    retraction_days: int
