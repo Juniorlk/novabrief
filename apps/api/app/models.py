@@ -332,6 +332,36 @@ class PasswordReset(Base):
     __table_args__ = (UniqueConstraint("token_hash", name="password_resets_token_unique"),)
 
 
+class EmailVerification(Base):
+    """A single-use link proving an address belongs to whoever signed up (EF-02)."""
+
+    __tablename__ = "email_verifications"
+
+    id: Mapped[uuid.UUID] = _pk()
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+
+    # The address the link proves, stored beside the user rather than read from
+    # it: when changing an address becomes possible, a link issued for the old
+    # one must not confirm the new one.
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (UniqueConstraint("token_hash", name="email_verifications_token_unique"),)
+
+
 # Tables that hold customer data and therefore need an RLS policy. The list is
 # used by the migration and asserted by a test, so a new table cannot be added
 # without either a policy or a deliberate exemption.
@@ -342,6 +372,7 @@ TENANT_TABLES: tuple[str, ...] = (
     "invitations",
     "audit_log",
     "password_resets",
+    "email_verifications",
 )
 
 # `organizations` is the tenant itself: its policy compares `id`, not
@@ -360,6 +391,7 @@ __all__ = [
     "ActorType",
     "AuditLog",
     "Device",
+    "EmailVerification",
     "Invitation",
     "Organization",
     "OrganizationStatus",

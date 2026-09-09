@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.db import set_current_organization
+from app.email import EmailDeliveryError, EmailProvider
 from app.logging import get_logger
 from app.models import ActorType, AuditLog, Organization, RefreshToken, Role, User
 from app.security import (
@@ -25,6 +26,7 @@ from app.security import (
     new_refresh_token,
     verify_password,
 )
+from app.services import verification
 from app.uuid7 import uuid7
 
 logger = get_logger(__name__)
@@ -53,6 +55,7 @@ async def register(
     session: AsyncSession,
     *,
     settings: Settings,
+    email_provider: EmailProvider | None = None,
     full_name: str,
     organization_name: str,
     password: str,
@@ -65,6 +68,12 @@ async def register(
 
     The caller must supply an *unscoped* session: there is no organization to
     scope to until this function creates one.
+
+    An `email_provider` also sends the EF-02 verification link. A failure to
+    deliver it does not fail the signup: the account is real, the address is
+    simply not proven yet, and there is a resend endpoint for that. Rolling the
+    registration back because the mail provider hiccuped would take the whole
+    signup funnel down with it.
     """
     normalised_email = email.lower().strip() if email else None
 
@@ -122,6 +131,17 @@ async def register(
         target_type="organization",
         target_id=organization.id,
     )
+
+    if email_provider is not None:
+        try:
+            await verification.send_verification(
+                session, settings=settings, email_provider=email_provider, user=user
+            )
+        except EmailDeliveryError:
+            # Logged, not raised. See the docstring: an account without its
+            # verification mail is recoverable, a failed signup is a lost
+            # customer.
+            logger.warning("verification_email_not_sent")
 
     return await _issue_session(session, settings=settings, user=user, organization=organization)
 

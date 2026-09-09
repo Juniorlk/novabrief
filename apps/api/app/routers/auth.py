@@ -12,16 +12,19 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, status
 
 from app.config import Settings, get_settings
-from app.deps import CurrentCaller, UnscopedSession
+from app.deps import CurrentCaller, ScopedSession, UnscopedSession
+from app.email import EmailDeliveryError
 from app.errors import ProblemError
 from app.presenters import current_session
-from app.services import auth
+from app.routers.members import EmailSender
+from app.services import auth, verification
 from schemas.auth import (
     CurrentSession,
     LoginRequest,
     RefreshRequest,
     RegisterRequest,
     TokenPair,
+    VerifyEmailRequest,
 )
 
 router = APIRouter(tags=["auth"])
@@ -36,6 +39,9 @@ _STATUS_FOR_CODE = {
     "INVALID_REFRESH_TOKEN": status.HTTP_401_UNAUTHORIZED,
     "REFRESH_TOKEN_EXPIRED": status.HTTP_401_UNAUTHORIZED,
     "REFRESH_TOKEN_REUSED": status.HTTP_401_UNAUTHORIZED,
+    "INVALID_VERIFICATION_TOKEN": status.HTTP_400_BAD_REQUEST,
+    "EMAIL_ALREADY_VERIFIED": status.HTTP_409_CONFLICT,
+    "NO_EMAIL_ON_ACCOUNT": status.HTTP_409_CONFLICT,
 }
 
 
@@ -65,13 +71,19 @@ def _tokens(issued: auth.IssuedSession) -> TokenPair:
 async def register(
     payload: RegisterRequest,
     session: UnscopedSession,
+    sender: EmailSender,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> TokenPair:
-    """EF-01: one step, and the creator becomes Owner."""
+    """EF-01: one step, and the creator becomes Owner.
+
+    Also sends the EF-02 verification link. A delivery failure does not fail
+    the signup; see `auth.register`.
+    """
     try:
         issued = await auth.register(
             session,
             settings=settings,
+            email_provider=sender,
             full_name=payload.full_name,
             organization_name=payload.organization_name,
             password=payload.password,
@@ -141,3 +153,59 @@ async def me(caller: CurrentCaller) -> CurrentSession:
     Built by the shared presenter, so this and `PATCH /me` cannot drift.
     """
     return current_session(user=caller.user, organization=caller.organization)
+
+
+@router.post(
+    "/auth/email/verify",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Confirm an email address from its link",
+)
+async def verify_email(payload: VerifyEmailRequest, session: UnscopedSession) -> None:
+    """EF-02.
+
+    Unscoped, and deliberately unauthenticated: the link arrives in a mail
+    client and is followed in whatever browser is open, which is usually not
+    the one holding a session.
+    """
+    try:
+        await verification.confirm(session, token=payload.token)
+    except verification.VerificationError as error:
+        raise ProblemError(
+            status_code=_STATUS_FOR_CODE.get(error.code, status.HTTP_400_BAD_REQUEST),
+            code=error.code,
+            title=str(error),
+        ) from error
+
+
+@router.post(
+    "/auth/email/resend",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Send the verification link again",
+)
+async def resend_verification(
+    caller: CurrentCaller,
+    session: ScopedSession,
+    sender: EmailSender,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> None:
+    """EF-02: for the link that never arrived, or expired.
+
+    Authenticated, so it names no address and cannot be used to send mail to
+    someone else.
+    """
+    try:
+        await verification.resend(
+            session, settings=settings, email_provider=sender, user=caller.user
+        )
+    except verification.VerificationError as error:
+        raise ProblemError(
+            status_code=_STATUS_FOR_CODE.get(error.code, status.HTTP_400_BAD_REQUEST),
+            code=error.code,
+            title=str(error),
+        ) from error
+    except EmailDeliveryError as error:
+        raise ProblemError(
+            status_code=502,
+            code="EMAIL_DELIVERY_FAILED",
+            title="The verification email could not be sent.",
+        ) from error
