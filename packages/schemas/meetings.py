@@ -7,7 +7,7 @@ generate their types from here, so the three cannot drift apart.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -32,15 +32,22 @@ MeetingState = Literal[
 ]
 
 __all__ = [
+    "DecisionOut",
     "DeclareMeetingRequest",
     "FinalizeRequest",
     "FinalizeUploadRequest",
+    "MeetingDetail",
     "MeetingState",
+    "MeetingStatusEvent",
     "MeetingSummary",
+    "ReportOut",
+    "TaskOut",
+    "TranscriptSegmentOut",
     "UpdateMeetingRequest",
     "UploadPart",
     "UploadTicket",
     "UploadedPart",
+    "WebSocketTicket",
 ]
 
 
@@ -156,3 +163,94 @@ class FinalizeRequest(_Base):
     # Which build produced this recording. It costs nothing to record and is
     # the first thing worth knowing when one version starts failing.
     client_version: str | None = Field(default=None, max_length=32)
+
+
+# --------------------------------------------------------------------------
+# Reading a finished meeting (EF-42, EF-43, EF-52)
+# --------------------------------------------------------------------------
+
+
+class TranscriptSegmentOut(_Base):
+    """One diarised passage, as the player shows it."""
+
+    id: uuid.UUID
+    speaker_tag: str
+    speaker_name: str | None
+    start_ms: int
+    end_ms: int
+    text: str
+    confidence: float | None
+    channel: str | None
+
+
+class DecisionOut(_Base):
+    """A decision, with the moment it was taken."""
+
+    id: uuid.UUID
+    content: str
+    # EF-43: clicking this plays the passage it came from.
+    source_start_ms: int
+    confidence: float
+    human_status: str
+    edited_content: str | None
+
+
+class TaskOut(_Base):
+    """A task, with what was said about its deadline and what that resolves to."""
+
+    id: uuid.UUID
+    action: str
+    assignee_name: str | None
+    assignee_user_id: uuid.UUID | None
+    # Both, always: when the computed date is wrong the original wording is
+    # the only way anyone can tell.
+    deadline_text: str | None
+    deadline_date: date | None
+    source_start_ms: int
+    confidence: float
+    human_status: str
+    edited_content: str | None
+
+
+class ReportOut(_Base):
+    """The structured report of one meeting."""
+
+    id: uuid.UUID
+    title: str
+    participants: list[str]
+    summary: list[str]
+    decisions: list[DecisionOut]
+    tasks: list[TaskOut]
+    # Which model and which prompt produced it (section 18.6).
+    model_version: str | None
+    prompt_version: str | None
+    generated_at: datetime
+
+
+class MeetingDetail(_Base):
+    """A meeting with everything the player needs."""
+
+    meeting: MeetingSummary
+    report: ReportOut | None
+    segments: list[TranscriptSegmentOut]
+    # Presigned and short-lived, absent once the audio has been purged
+    # (ADR-06). Null is a normal answer, not an error.
+    audio_url: str | None
+
+
+class WebSocketTicket(_Base):
+    """A single-use ticket for the status socket (section 17.2)."""
+
+    ticket: str
+    expires_in_seconds: int
+
+
+class MeetingStatusEvent(_Base):
+    """One frame on the status socket (EF-44)."""
+
+    meeting_id: uuid.UUID
+    status: MeetingState
+    # Null when there is nothing useful to say. A made-up number that keeps
+    # slipping is worse than no estimate at all.
+    estimated_seconds_remaining: int | None = None
+    failed_reason: str | None = None

@@ -23,9 +23,10 @@ from app.errors import install_error_handlers
 from app.logging import configure_logging, get_logger
 from app.middleware import DEBUG_ID_HEADER, RateLimitMiddleware, RequestContextMiddleware
 from app.ratelimit import InMemoryRateLimiter, RateLimiter, RedisRateLimiter
-from app.routers import auth, health, meetings, members, organizations
+from app.routers import auth, health, meetings, members, organizations, status
 from app.services.meetings import Dispatch
 from app.storage import InMemoryStorageProvider, S3StorageProvider, StorageProvider
+from app.tickets import InMemoryTicketStore, RedisTicketStore, TicketStore
 
 API_PREFIX = "/api/v1"
 VERSION = "0.1.0"
@@ -133,6 +134,7 @@ def create_app(
     email_provider: EmailProvider | None = None,
     storage: StorageProvider | None = None,
     dispatch: Dispatch | None = None,
+    tickets: TicketStore | None = None,
 ) -> FastAPI:
     """Build the application.
 
@@ -185,6 +187,13 @@ def create_app(
     # None means the real queue. A test passes a recorder instead, so no
     # unit test needs a broker to run.
     app.state.dispatch = dispatch
+    # In memory outside production: a status socket is not worth making a
+    # developer run Redis, and a test certainly should not need one.
+    app.state.tickets = tickets or (
+        RedisTicketStore(Redis.from_url(settings.redis_url))
+        if settings.environment != "dev"
+        else InMemoryTicketStore()
+    )
 
     install_error_handlers(app)
 
@@ -195,6 +204,7 @@ def create_app(
     app.include_router(members.router, prefix=API_PREFIX)
     app.include_router(organizations.router, prefix=API_PREFIX)
     app.include_router(meetings.router, prefix=API_PREFIX)
+    app.include_router(status.router, prefix=API_PREFIX)
 
     return app
 

@@ -5,7 +5,7 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-09** (lot L2 en cours : L2.1 et L2.2 faites).
+> Dernière mise à jour : **2026-09-10** (lot L2 terminé ; prochaine étape : le déploiement sur le VPS).
 
 ---
 
@@ -19,7 +19,7 @@
 | POC #3 — extraction structurée | **sauté** (décision Novafrik 2026-09-08) | §5 ci-dessous |
 | Lot L0 — socle backend | **fait sauf staging** | PR #2 ; `docker compose up` répond sur `/health` |
 | Lot L1 — comptes & organisations | **terminé** (EF-01 a EF-06) | PR #2, #4, #6, #7, #8, #9, #10 |
-| Lot L2 — réunions & pipeline | **en cours** : L2.1 et L2.2 faites, six sous-tâches restantes | `docs/tasks/05_L2_reunions_pipeline.md` ; PR #11 |
+| Lot L2 — réunions & pipeline | **terminé** (L2.1 à L2.8) | `docs/tasks/05_L2_reunions_pipeline.md` ; PR #11 à #17 |
 | Lots L3 à L7 | non commencés | `docs/tasks/04_APRES_LES_POC_lots_MVP.md` |
 
 ### Lot L1 en détail
@@ -45,28 +45,39 @@
 
 ## 2. Prochaine étape
 
-**L2.3 — quota et registre de consommation** (`usage_ledger`, décrément
-atomique, ADR-08 et ADR-09), puis L2.4 (Celery), L2.5 (transcription et
-fallback), L2.6 (LLM et extraction), L2.7 (WebSocket), L2.8 (relance et purge).
+**Le déploiement sur le VPS OVHcloud**, décidé par Novafrik pour la fin du lot
+L2 (`ubuntu@novabrief.cloud`, 51.75.120.252). Le DNS est prêt : `api.` et
+`app.` pointent déjà dessus.
 
-Le découpage et les critères sont dans `docs/tasks/05_L2_reunions_pipeline.md`.
+Marche à suivre : une reconnaissance **en lecture seule** d'abord (version
+d'Ubuntu, disque, Docker présent ou non, ports ouverts), puis un compte rendu à
+Novafrik, puis le déploiement seulement après validation.
 
-**Fait dans le lot L2 :**
+Ce qu'il faudra décider avant : où tournent PostgreSQL et Redis (conteneurs sur
+le VPS ou service managé), et comment les secrets arrivent sur la machine — le
+`.env` de production ne doit pas être construit à la main dans un terminal.
+
+### Lot L2 en détail
 
 | Sous-tâche | État |
 |---|---|
 | L2.1 modèle `meetings` + machine à états §11 | fait — PR #11 |
-| L2.2 stockage objet, URL présignées, `finalize-local` et `finalize` | fait |
-| L2.3 à L2.8 | à faire |
+| L2.2 stockage objet, URL présignées, finalisation | fait — PR #12 |
+| L2.3 quota atomique + `usage_ledger` | fait — PR #13 |
+| L2.4 Celery, beat, purge planifiée | fait — PR #14 |
+| L2.5 transcription, fallback, disjoncteur | fait — PR #15 |
+| L2.6 LLM, extraction structurée, jeu d'évaluation | fait — PR #16 |
+| L2.7 statut temps réel par WebSocket | fait — PR #17 |
+| L2.8 relance et purge audio | fait — PR #17 |
 
-**Point ouvert de L2.2, à trancher au plus tard en L2.5** : le cahier des
-charges demande une vérification du « checksum global » à la finalisation.
-C'est **impossible côté API sans lire l'objet**, ce qui contredirait le
-principe que l'audio ne transite jamais par le serveur. Ce qui est vérifié
-aujourd'hui, c'est la **taille** rapportée par le magasin contre la taille
-déclarée — une troncature est donc refusée. Le SHA-256 est stocké et devra
-être vérifié par le worker de transcription, seul endroit où les octets
-existent réellement.
+**Non prononcés, et il faut le savoir** : le critère « 200 réunions en
+COMPLETED » et le test T-11 (campagne annulée), **EF-41** (taux d'erreur de
+transcription ≤ 15 %) et **EF-42** (zéro hallucination) — aucun appel réel n'a
+été fait à AssemblyAI, Deepgram ou OpenAI. T-06 est prononcé *en simulation*.
+
+Le jeu d'évaluation anti-hallucination est écrit et exécutable :
+`python -m ai.evaluation.hallucination` le lance contre OpenAI le jour où tu
+veux le chiffre. C'est la mesure du risque n°2 du cahier des charges.
 
 ---
 
@@ -191,6 +202,31 @@ la purge utilise un `delete()` Core.
 Corollaire : le test compte les lignes survivantes **avec le role proprietaire**,
 pas via l'API — a travers RLS, « rien » veut seulement dire que l'isolation
 fonctionne, pas que les lignes ont disparu.
+
+### Un import circulaire qu'aucun test ne pouvait voir
+
+Construire l'application Celery avec `autodiscover_tasks(force=True)` importe
+les tâches **pendant** la construction, et chaque tâche réimporte `celery_app`.
+Les conteneurs worker et beat refusaient de démarrer.
+
+En pytest ça ne se voit jamais : le fichier de test importe la tâche en premier,
+donc `app.worker` est déjà chargé quand le cycle se refermerait. **C'est le
+conteneur qui l'a attrapé.** Les tâches sont maintenant listées dans `include`
+et importées à la finalisation, et un test les importe dans un sous-processus
+nu, comme le fait un vrai worker.
+
+### `model_copy` ne valide pas
+
+`result.model_copy(update={"utterances": [dicts]})` accepte des dictionnaires
+là où le modèle déclare des `Utterance`, sans rien dire. L'erreur ne sort que
+bien plus loin, chez le premier qui lit la valeur comme un modèle.
+
+### Un test qui saute n'est pas un test qui passe
+
+La CI n'avait pas de MinIO : les sept tests de stockage — ceux qui prouvent
+qu'une URL présignée est correctement signée, ce qu'aucun double ne peut
+vérifier — **sautaient depuis le lot L2.2** en affichant du vert. Le garde-fou
+anti-skip couvre maintenant `test_storage.py` en plus de la suite RLS.
 
 ### La perte audio est invisible
 

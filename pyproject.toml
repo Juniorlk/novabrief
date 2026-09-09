@@ -139,7 +139,16 @@ testpaths = ["apps/api", "packages", "tools"]
 pythonpath = ["apps/api", "packages"]
 asyncio_mode = "auto"
 addopts = "-ra --strict-markers --strict-config"
-filterwarnings = ["error"]
+filterwarnings = [
+    # Every warning is an error, because a warning nobody reads is a bug
+    # waiting for production.
+    "error",
+    # Except this one, which comes from Starlette's TestClient reaching for an
+    # anyio alias that moved. It is not ours to fix, and it is the only way to
+    # drive a WebSocket in a test. Named precisely so a different deprecation
+    # still fails the suite.
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
+]
 
 [tool.coverage.run]
 branch = true

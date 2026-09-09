@@ -85,6 +85,14 @@ def build_celery(settings: Settings | None = None) -> Celery:
                     hour=resolved.purge_cron_hour, minute=resolved.purge_cron_minute
                 ),
             },
+            # Half an hour later, so the two never contend for the same rows:
+            # an organization being erased has no audio left to purge.
+            "purge-expired-audio": {
+                "task": "novabrief.purge_audio",
+                "schedule": crontab(
+                    hour=resolved.purge_cron_hour, minute=(resolved.purge_cron_minute + 30) % 60
+                ),
+            },
         },
     )
     return app
