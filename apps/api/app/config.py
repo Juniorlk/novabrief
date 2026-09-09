@@ -98,6 +98,21 @@ class Settings(BaseSettings):
     # rather than a preference (section 16.4).
     r2_multipart_part_size_bytes: int = 5 * 1024 * 1024
 
+    # Transcription (ADR-01). The order is configuration, so the back-office
+    # can reorder suppliers without a deployment (section 18.1).
+    transcription_provider_order: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["assemblyai", "deepgram"]
+    )
+    assemblyai_api_key: str | None = None
+    assemblyai_model: str = "universal-3.5"
+    deepgram_api_key: str | None = None
+    deepgram_model: str = "nova-3"
+    transcription_timeout_seconds: float = 1800.0
+    # Left unset rather than guessed. A made-up rate in `usage_ledger` would
+    # quietly corrupt the margin dashboard, which is worse than a visible gap
+    # in it — and a rate in code would breach ADR-09 besides.
+    transcription_price_per_hour_usd: float | None = None
+
     resend_api_key: str | None = None
     # The domain verified with the email provider. Sending from anything else
     # is refused by the provider, so this default has to be the real one.
@@ -113,6 +128,26 @@ class Settings(BaseSettings):
     default_market: str = "CM"
     default_locale: str = "fr"
     default_timezone: str = "Africa/Douala"
+
+    @property
+    def transcription_order(self) -> list[str]:
+        """Supplier names, lower-cased and de-duplicated, in preference order."""
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for name in self.transcription_provider_order:
+            cleaned = name.strip().lower()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                ordered.append(cleaned)
+        return ordered
+
+    @field_validator("transcription_provider_order", mode="before")
+    @classmethod
+    def _split_providers(cls, value: object) -> object:
+        """Accept the comma-separated form the environment carries."""
+        if isinstance(value, str):
+            return [name.strip() for name in value.split(",") if name.strip()]
+        return value
 
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod

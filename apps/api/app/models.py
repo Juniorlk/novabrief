@@ -431,6 +431,80 @@ class Meeting(Base):
     )
 
 
+class Transcript(Base):
+    """The full text of one meeting (section 19.1).
+
+    Separate from `meetings` because it is large and rarely read together with
+    the listing: a dashboard showing thirty meetings has no business loading
+    thirty transcripts.
+    """
+
+    __tablename__ = "transcripts"
+
+    id: Mapped[uuid.UUID] = _pk()
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    meeting_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("meetings.id", ondelete="CASCADE"), nullable=False
+    )
+
+    language: Mapped[str] = mapped_column(String(5), nullable=False)
+    raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # What the supplier said about the job - model, confidence, detected
+    # language - kept for diagnosis. Never the audio, never a credential.
+    provider_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        # One transcript per meeting: a second one means a retry wrote twice,
+        # and two transcripts for one recording is a bug nobody would spot.
+        UniqueConstraint("meeting_id", name="transcripts_meeting_unique"),
+    )
+
+
+class TranscriptSegment(Base):
+    """One diarised, timestamped stretch of speech (EF-41, EF-43).
+
+    These are what make a decision clickable: every extracted item points at a
+    timestamp, and the timestamp has to resolve to a real passage.
+    """
+
+    __tablename__ = "transcript_segments"
+
+    id: Mapped[uuid.UUID] = _pk()
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    transcript_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("transcripts.id", ondelete="CASCADE"), nullable=False
+    )
+
+    # The provider's label (A, B, C…). `speaker_name` is filled in later, and
+    # only when the meeting actually names someone.
+    speaker_tag: Mapped[str] = mapped_column(String(16), nullable=False)
+    speaker_name: Mapped[str | None] = mapped_column(String(200))
+
+    start_ms: Mapped[int] = mapped_column(nullable=False)
+    end_ms: Mapped[int] = mapped_column(nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float | None] = mapped_column()
+    # "local" or "remote": which side of the stereo mix this came from (EF-31).
+    channel: Mapped[str | None] = mapped_column(String(8))
+
+    __table_args__ = (
+        CheckConstraint("end_ms >= start_ms", name="transcript_segments_ordered"),
+        Index("transcript_segments_transcript_idx", "transcript_id", "start_ms"),
+    )
+
+
 class UsageEntry(Base):
     """What one meeting actually cost (ADR-08, section 19.1).
 
@@ -520,6 +594,8 @@ TENANT_TABLES: tuple[str, ...] = (
     "email_verifications",
     "meetings",
     "usage_ledger",
+    "transcripts",
+    "transcript_segments",
 )
 
 # `organizations` is the tenant itself: its policy compares `id`, not
@@ -547,6 +623,8 @@ __all__ = [
     "PasswordReset",
     "RefreshToken",
     "Role",
+    "Transcript",
+    "TranscriptSegment",
     "UsageEntry",
     "User",
     "is_tenant_scoped",
