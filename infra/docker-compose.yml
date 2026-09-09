@@ -43,8 +43,8 @@ services:
     image: minio/minio:latest
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER: ${R2_ACCESS_KEY_ID:-novabrief}
-      MINIO_ROOT_PASSWORD: ${R2_SECRET_ACCESS_KEY:-novabrief-dev-secret}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-novabrief}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-novabrief-dev-secret}
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -63,8 +63,8 @@ services:
       minio:
         condition: service_healthy
     environment:
-      MINIO_ROOT_USER: ${R2_ACCESS_KEY_ID:-novabrief}
-      MINIO_ROOT_PASSWORD: ${R2_SECRET_ACCESS_KEY:-novabrief-dev-secret}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-novabrief}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-novabrief-dev-secret}
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
@@ -100,7 +100,13 @@ services:
       # Migrations need DDL, which the application role does not have.
       DATABASE_ADMIN_URL: postgresql+asyncpg://${POSTGRES_USER:-novabrief}:${POSTGRES_PASSWORD:-novabrief}@postgres:5432/${POSTGRES_DB:-novabrief}
       REDIS_URL: redis://redis:6379/0
+      # The dev stack always talks to MinIO, never to real R2: these override
+      # whatever the root .env holds, so a production key sitting in that file
+      # cannot be reached by accident from a laptop.
       R2_ENDPOINT: http://minio:9000
+      R2_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-novabrief}
+      R2_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-novabrief-dev-secret}
+      R2_BUCKET_AUDIO: novabrief-audio
       CORS_ALLOWED_ORIGINS: http://localhost:3000
     ports:
       - "8000:8000"

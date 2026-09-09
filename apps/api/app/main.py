@@ -24,6 +24,7 @@ from app.logging import configure_logging, get_logger
 from app.middleware import DEBUG_ID_HEADER, RateLimitMiddleware, RequestContextMiddleware
 from app.ratelimit import InMemoryRateLimiter, RateLimiter, RedisRateLimiter
 from app.routers import auth, health, meetings, members, organizations
+from app.storage import InMemoryStorageProvider, S3StorageProvider, StorageProvider
 
 API_PREFIX = "/api/v1"
 VERSION = "0.1.0"
@@ -46,6 +47,22 @@ def _build_email_provider(settings: Settings) -> EmailProvider:
         sender=settings.email_from,
         reply_to=settings.email_reply_to,
     )
+
+
+def _build_storage(settings: Settings) -> StorageProvider:
+    """The object store, or an in-memory stand-in for a developer without one.
+
+    Unlike email, a missing bucket is not something to paper over silently in
+    production: an upload that appears to succeed and stores nothing would lose
+    a customer's meeting. The stand-in is therefore refused outside dev.
+    """
+    try:
+        return S3StorageProvider(settings)
+    except RuntimeError:
+        if settings.environment != "dev":
+            raise
+        logger.warning("storage_in_memory_provider", reason="no R2 credentials configured")
+        return InMemoryStorageProvider()
 
 
 def _build_limiter(settings: Settings) -> RateLimiter:
@@ -113,6 +130,7 @@ def create_app(
     *,
     limiter: RateLimiter | None = None,
     email_provider: EmailProvider | None = None,
+    storage: StorageProvider | None = None,
 ) -> FastAPI:
     """Build the application.
 
@@ -161,6 +179,7 @@ def create_app(
     # Attached to the app rather than resolved per request: building a
     # provider is configuration, not request state.
     app.state.email_provider = email_provider or _build_email_provider(settings)
+    app.state.storage = storage or _build_storage(settings)
 
     install_error_handlers(app)
 

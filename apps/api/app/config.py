@@ -60,6 +60,22 @@ class Settings(BaseSettings):
     jwt_access_ttl_minutes: int = 15
     refresh_token_ttl_days: int = 30
 
+    # Object storage. Cloudflare R2 in production, MinIO in development: both
+    # speak the S3 API, so only these values change between the two (ADR-01).
+    r2_account_id: str | None = None
+    r2_endpoint: str = "http://localhost:9000"
+    r2_access_key_id: str | None = None
+    r2_secret_access_key: str | None = None
+    # R2 has no regions and rejects anything else; MinIO ignores it.
+    r2_region: str = "auto"
+    r2_bucket_audio: str = "novabrief-audio"
+    # Section 21.1: long enough to upload a part on a poor connection, short
+    # enough that a URL found in a log is already dead.
+    r2_presign_ttl_seconds: int = 900
+    # S3 refuses parts under 5 MiB except the last one, so this is a floor
+    # rather than a preference (section 16.4).
+    r2_multipart_part_size_bytes: int = 5 * 1024 * 1024
+
     resend_api_key: str | None = None
     # The domain verified with the email provider. Sending from anything else
     # is refused by the provider, so this default has to be the real one.
@@ -102,6 +118,21 @@ class Settings(BaseSettings):
     def is_production(self) -> bool:
         """True in production, where defaults must never be assumed."""
         return self.environment == "prod"
+
+    def require_storage_credentials(self) -> tuple[str, str]:
+        """The object-storage key pair, or a clear failure.
+
+        Falling back to anonymous access would look like it works against a
+        permissive MinIO and fail only once it reached R2, which is the worst
+        possible moment to find out.
+        """
+        if not self.r2_access_key_id or not self.r2_secret_access_key:
+            message = (
+                "R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY are not set; "
+                "object storage cannot be reached."
+            )
+            raise RuntimeError(message)
+        return self.r2_access_key_id, self.r2_secret_access_key
 
     def require_jwt_private_key(self) -> str:
         """The signing key, or a clear failure.
