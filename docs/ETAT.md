@@ -5,7 +5,7 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-08** (EF-04 et EF-05 faits ; reste EF-06 et la vérification d'email).
+> Dernière mise à jour : **2026-09-09** (lot L1 terminé ; prochaine étape : le brief du lot L2).
 
 ---
 
@@ -18,7 +18,7 @@
 | POC #2 — benchmark transcription | **sauté** (décision Novafrik 2026-09-08) | §5 ci-dessous |
 | POC #3 — extraction structurée | **sauté** (décision Novafrik 2026-09-08) | §5 ci-dessous |
 | Lot L0 — socle backend | **fait sauf staging** | PR #2 ; `docker compose up` répond sur `/health` |
-| Lot L1 — comptes & organisations | **partiel** (EF-01 a EF-05 faits ; EF-06 et la verification d'email restent) | PR #2, #4, #6, #7 |
+| Lot L1 — comptes & organisations | **terminé** (EF-01 a EF-06) | PR #2, #4, #6, #7, #8, #9, #10 |
 | Lots L2 à L7 | non commencés | `docs/tasks/04_APRES_LES_POC_lots_MVP.md` |
 
 ### Lot L1 en détail
@@ -33,34 +33,36 @@
 | `EmailProvider` (Resend / console / enregistreur) | fait |
 | Invitations (EF-03) : inviter, accepter, révoquer, lister | fait |
 | Réinitialisation de mot de passe (EF-02) | fait |
-| EF-02 vérification d'email à l'inscription | **non fait** — prouvée seulement en acceptant une invitation |
+| EF-02 vérification d'email à l'inscription | fait — lien 24 h, `POST /auth/email/verify` et `/auth/email/resend` |
 | EF-04 modification du profil (nom, langue, fuseau) | fait — `PATCH /api/v1/me` |
 | EF-05 paramètres d'organisation (nom, RCCM, langue, rétention, lexique) | fait — `PATCH /api/v1/organizations/current`, Admin ou Owner |
-| EF-06 export complet et suppression de l'organisation | **non fait** |
+| EF-06 export complet et suppression de l'organisation | fait — export JSON, suppression Owner avec 7 jours de rétractation, job de purge |
 | Journal d'audit | écrit sur inscription, connexion, réutilisation de jeton, invitation, adhésion, révocation, réinitialisation, `profile.updated`, `organization.updated` |
-| Envoi réel d'emails | clé reçue le 2026-09-08 et posée dans `.env` ; **pas encore branchée dans `infra/docker-compose.yml`** (à faire avec EF-02) |
+| Envoi réel d'emails | **opérationnel** — domaine `novabrief.cloud` vérifié chez Resend, clé dans `.env`, service `api` branché dessus. Un envoi réel a été accepté par le fournisseur le 2026-09-09. |
 
 ---
 
 ## 2. Prochaine étape
 
-**EF-06 : export et suppression de l'organisation**, sur une nouvelle branche
-partant de `main` une fois la PR de `feat/profile-and-organization-settings`
-mergée.
+**Écrire `docs/tasks/05_L2_reunions_pipeline.md`**, le brief du lot L2, puis
+l'exécuter. Le lot L1 est terminé ; la PR #10 le ferme.
 
-Arbitrage rendu par Novafrik le 2026-09-08 : **export JSON + audio maintenant,
-PDF reporté au lot L4**, suppression définitive avec **7 jours de
-rétractation**. La colonne `organizations.deletion_requested_at` existe déjà et
-attend son endpoint.
+Commencer par ce qui ne dépend d'aucune clé fournisseur :
 
-Ensuite, dans cet ordre :
+1. Le modèle `meetings` et la machine à états de la section 11.
+2. `finalize-local` et `finalize` avec les URL présignées multipart vers MinIO.
+3. `usage_ledger` et le décompte atomique de quota.
+4. La file Celery et son ordonnanceur — qui reprendra
+   `app.jobs.purge_organizations`, aujourd'hui lancé à la main.
+5. Le statut par WebSocket, la purge audio planifiée, la reprise après FAILED.
 
-1. EF-02 — vérification d'email à l'inscription. Aujourd'hui l'adresse n'est
-   prouvée qu'en acceptant une invitation ; une inscription directe laisse
-   `email_verified_at` à NULL sans jamais rien envoyer. C'est aussi le moment
-   de passer `RESEND_API_KEY` et `EMAIL_FROM` au conteneur `api` dans
-   `infra/docker-compose.yml`, ce qui n'est pas fait.
-2. Le brief `docs/tasks/05_L2_reunions_pipeline.md`, puis le lot L2.
+`TranscriptionProvider` et `LLMProvider` sont écrits et testés **avec des
+doubles uniquement** : décision Novafrik du 2026-09-08, aucun appel réel aux
+fournisseurs d'IA.
+
+Après L2, **déploiement sur le VPS OVHcloud** : `ubuntu@novabrief.cloud`,
+51.75.120.252. Le DNS est prêt (`api.` et `app.` pointent déjà dessus). Une
+reconnaissance en lecture seule d'abord, puis validation de Novafrik.
 
 ---
 
@@ -68,10 +70,14 @@ Ensuite, dans cet ordre :
 
 | Bloqué | Ce qu'il faut | Pour |
 |---|---|---|
-| Envoi à de vrais destinataires | un **domaine vérifié chez Resend** — la clé reçue utilise `onboarding@resend.dev`, qui n'écrit qu'à l'adresse du compte | mettre L1 en service |
-| Staging HTTPS | un **nom de domaine** pointant sur le VPS OVHcloud | finir L0 |
 | Pipeline de traitement | `ASSEMBLYAI_API_KEY`, `OPENAI_API_KEY` (Deepgram reçue le 2026-09-08) | L2 |
+| Stockage des audios | identifiants Cloudflare R2 (MinIO tient le rôle en local) | L2 |
 | Paiement | clés sandbox Flutterwave | L5 |
+
+**Débloqué le 2026-09-09** : domaine `novabrief.cloud` (DNS chez OVH,
+`novabrief.cloud`, `www`, `api` et `app` pointent sur le VPS), domaine vérifié
+chez Resend (CNAME `send`, DKIM `resend._domainkey`, DMARC `p=none`), MX et SPF
+racine OVH laissés intacts.
 
 Le VPS OVHcloud est disponible en SSH ; le déploiement est **volontairement
 reporté** (décision Novafrik du 2026-09-08 : « finissons d'abord »). Les accès
@@ -166,6 +172,22 @@ explicite n'est accepté que sur `legal_id`, seule colonne nullable ; ailleurs
 c'est un 422. Sans ça, un formulaire web qui renvoie tout son état écraserait
 avec des valeurs vides ce que l'utilisateur n'a pas touché.
 
+### `session.delete()` detache les enfants au lieu de les supprimer
+
+SQLAlchemy charge les lignes liees et emet `UPDATE users SET
+organization_id = NULL` plutot que de laisser la cascade `ON DELETE CASCADE`
+faire son travail. Sur la purge EF-06 ca aurait laisse des membres orphelins
+tout en rapportant un succes — le critere « aucune donnee ne subsiste » aurait
+ete faux en silence.
+
+**C'est RLS qui l'a attrape** : la politique a refuse l'`UPDATE`. Sans elle le
+bug passait inapercu. La relation declare maintenant `passive_deletes=True` et
+la purge utilise un `delete()` Core.
+
+Corollaire : le test compte les lignes survivantes **avec le role proprietaire**,
+pas via l'API — a travers RLS, « rien » veut seulement dire que l'isolation
+fonctionne, pas que les lignes ont disparu.
+
 ### La perte audio est invisible
 
 Sur 60 min, 10,25 % de l'audio a disparu pendant que Windows ne signalait que
@@ -190,6 +212,7 @@ Elles ne sont pas dans le cahier des charges et priment sur lui.
 | 2026-09-08 | Déploiement sur le VPS OVHcloud **après** la fin du lot L2 |
 | 2026-09-08 | **EF-06** : export **JSON + audio** maintenant, **PDF reporté au lot L4** ; suppression définitive avec **7 jours de rétractation** |
 | 2026-09-08 | Clés `RESEND_API_KEY` et `DEEPGRAM_API_KEY` fournies |
+| 2026-09-09 | Domaine **`novabrief.cloud`** (OVH) ; DNS Resend configure ; redirection `contact@` vers l'adresse personnelle faute de boite OVH disponible |
 
 **Le risque « l'IA invente une décision » (risque n°2 du cahier des charges)
 reste non mesuré.** Il se manifestera en recette plutôt qu'en phase 0.
@@ -231,12 +254,16 @@ base de données rapporte un skip.
 - **Aucune paire de clés RS256** n'existe. L'API refuse de démarrer sans, ce qui
   est voulu.
 - **La fixture de base de données est copiée dans cinq fichiers de tests**
-  (`test_auth_endpoints`, `test_auth_service`, `test_members`,
-  `test_rls_isolation`, `test_organization_settings`) : 45 lignes identiques à
-  chaque fois. À remonter dans `conftest.py` par une tâche dédiée, pas au
+  — sept, désormais (`test_auth_endpoints`, `test_auth_service`, `test_members`,
+  `test_rls_isolation`, `test_organization_settings`,
+  `test_organization_lifecycle`, `test_email_verification`) : 45 lignes
+  identiques à chaque fois. À remonter dans `conftest.py` par une tâche dédiée, pas au
   détour d'un lot.
 - **Les clés API ont transité par la conversation.** Elles vivent dans `.env`,
   ignoré par Git, mais doivent être **régénérées par Novafrik avant la mise en
   production**.
+- **Les emails transactionnels sont en français codé en dur.** `CLAUDE.md` §6
+  demande que toute chaîne visible passe par i18n, et `users.locale` existe
+  déjà. À reprendre quand le lot L4 apportera l'i18n côté serveur.
 - `nb-testsignal` et `measure_drift.py` restent des squelettes : la dérive est
   mesurée par horodatage QPC, ce qui s'écarte du brief du POC #1.
