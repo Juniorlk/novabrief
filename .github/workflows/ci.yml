@@ -67,23 +67,6 @@ jobs:
           --health-timeout 3s
           --health-retries 10
 
-      # A real S3 implementation, for the same reason PostgreSQL is real: only
-      # a server can say whether a presigned URL is signed correctly. Against a
-      # double those tests prove our own arithmetic and nothing else.
-      minio:
-        image: bitnami/minio:latest
-        env:
-          MINIO_ROOT_USER: novabrief
-          MINIO_ROOT_PASSWORD: novabrief-dev-secret
-          MINIO_DEFAULT_BUCKETS: novabrief-audio
-        ports:
-          - 9000:9000
-        options: >-
-          --health-cmd "mc ready local || curl -f http://localhost:9000/minio/health/live"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
-
     env:
       # The API connects as the restricted role; a superuser would bypass RLS
       # and every isolation test would pass while proving nothing.
@@ -114,6 +97,26 @@ jobs:
         env:
           PGPASSWORD: novabrief
         run: psql -h localhost -U novabrief -d novabrief -v ON_ERROR_STOP=1 -f infra/postgres-init/01-app-role.sql
+
+      - name: Start MinIO
+        # A real S3 implementation, for the same reason PostgreSQL is real:
+        # only a server can say whether a presigned URL is signed correctly.
+        # Started as a step rather than a service because the image needs a
+        # command, and service containers cannot be given one. The same image
+        # the compose stack uses, so the two cannot drift.
+        run: |
+          set -euo pipefail
+          docker run -d --name minio -p 9000:9000             -e MINIO_ROOT_USER=novabrief             -e MINIO_ROOT_PASSWORD=novabrief-dev-secret             minio/minio:latest server /data
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/live > /dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -sf http://localhost:9000/minio/health/live > /dev/null
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+            mc alias set local http://localhost:9000 novabrief novabrief-dev-secret &&
+            mc mb --ignore-existing local/novabrief-audio"
 
       - name: Apply migrations
         working-directory: apps/api
