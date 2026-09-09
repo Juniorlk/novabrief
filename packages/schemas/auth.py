@@ -205,6 +205,7 @@ __all__ = [
     "UpdateOrganizationRequest",
     "UpdateProfileRequest",
     "UserProfile",
+    "VerifyEmailRequest",
 ]
 
 
@@ -245,6 +246,12 @@ class MemberSummary(_Base):
     role: Role
     revoked: bool
     created_at: datetime
+
+
+class VerifyEmailRequest(_Base):
+    """EF-02: confirm an address from the link that was emailed to it."""
+
+    token: str = Field(min_length=1, max_length=512)
 
 
 class PasswordResetRequest(_Base):

@@ -61,7 +61,9 @@ class Settings(BaseSettings):
     refresh_token_ttl_days: int = 30
 
     resend_api_key: str | None = None
-    email_from: str = "NovaBrief <no-reply@novabrief.com>"
+    # The domain verified with the email provider. Sending from anything else
+    # is refused by the provider, so this default has to be the real one.
+    email_from: str = "NovaBrief <no-reply@novabrief.cloud>"
     email_reply_to: str | None = None
 
     rate_limit_auth_per_minute: int = 10
