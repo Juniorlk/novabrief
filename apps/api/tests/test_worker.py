@@ -101,6 +101,15 @@ async def test_the_worker_imports_its_tasks_without_a_cycle() -> None:
     """
     import asyncio
     import sys
+    from pathlib import Path
+
+    import app
+
+    # The import root is derived from where the package actually is, not from
+    # the working directory: CI runs pytest from the repository root and a
+    # laptop runs it from apps/api.
+    api_root = str(Path(app.__file__).resolve().parent.parent)
+    environment = {**os.environ, "PYTHONPATH": api_root}
 
     process = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -110,6 +119,7 @@ async def test_the_worker_imports_its_tasks_without_a_cycle() -> None:
         "assert 'novabrief.purge_organizations' in celery_app.tasks",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=environment,
     )
     _, stderr = await process.communicate()
 
