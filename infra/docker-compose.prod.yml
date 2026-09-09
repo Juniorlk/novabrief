@@ -1,0 +1,119 @@
+# Production stack.
+#
+# Run it from the repository root on the server:
+#
+#     docker compose -f infra/docker-compose.prod.yml up -d
+#
+# What differs from the development stack, and why:
+#
+# **Nothing but Caddy is published.** PostgreSQL and Redis listen only on the
+# internal network. A database reachable from the internet is a database that
+# will be found, and the development stack publishing 5432 is a convenience
+# that has no business on a public address.
+#
+# **No MinIO.** Production writes to Cloudflare R2. MinIO exists so a laptop
+# does not need a bucket.
+#
+# **Everything restarts.** A worker that dies at 3am comes back on its own;
+# nobody is watching.
+#
+# Configuration comes from `.env` at the repository root, which is not in Git.
+
+name: novabrief
+
+x-api-image: &api-image
+  build:
+    context: ..
+    dockerfile: infra/api.Dockerfile
+  restart: unless-stopped
+  env_file:
+    - ../.env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      # Read by the init script, which creates the restricted role the API
+      # connects as. Without it the API cannot connect at all, which is the
+      # right way to fail.
+      DATABASE_APP_PASSWORD: ${DATABASE_APP_PASSWORD:?set DATABASE_APP_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # No persistence: Redis holds the Celery queue and short-lived tickets.
+    # Losing it loses queued work, which the state machine can recover by
+    # retrying; keeping it would only add a file to back up and to corrupt.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    <<: *api-image
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    <<: *api-image
+    # Two, on two vCPUs. The tasks spend their time waiting on providers rather
+    # than computing, so this is about how many meetings can be in flight, not
+    # about cores.
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+
+  beat:
+    <<: *api-image
+    # One replica, and one only: two schedulers would run every purge twice,
+    # and a purge is not something to run twice.
+    command: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel=info"]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # The certificates live here. Losing this volume means asking Let's
+      # Encrypt for new ones, and their rate limit is per week.
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
+      WEB_DOMAIN: ${WEB_DOMAIN:?set WEB_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
