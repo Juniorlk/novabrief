@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.models import Organization, User
+from app.models import Meeting, Organization, User
 from app.services.organizations import ExportBundle
 from schemas.auth import (
     CurrentSession,
@@ -23,6 +23,7 @@ from schemas.auth import (
     OrganizationProfile,
     UserProfile,
 )
+from schemas.meetings import MeetingSummary
 
 
 def user_profile(user: User) -> UserProfile:
@@ -122,4 +123,27 @@ def organization_export(bundle: ExportBundle) -> OrganizationExport:
             )
             for entry in bundle.audit_entries
         ],
+    )
+
+
+def meeting_summary(meeting: Meeting) -> MeetingSummary:
+    """A meeting as the API returns it.
+
+    The storage key is absent on purpose: it names an object in a private
+    bucket and belongs in a presigned URL, not in a listing.
+    """
+    return MeetingSummary(
+        id=meeting.id,
+        title=meeting.title,
+        status=meeting.status,  # type: ignore[arg-type]
+        language=meeting.language,
+        started_at=meeting.started_at,
+        duration_seconds=meeting.duration_seconds,
+        is_private=meeting.is_private,
+        debug_id=meeting.debug_id,
+        created_by=meeting.created_by,
+        failed_reason=meeting.failed_reason,
+        purge_at=meeting.purge_at,
+        created_at=meeting.created_at,
+        completed_at=meeting.completed_at,
     )
