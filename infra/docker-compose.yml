@@ -14,6 +14,10 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-novabrief}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-novabrief}
       POSTGRES_DB: ${POSTGRES_DB:-novabrief}
+      # Read by the init script, which creates the restricted role the API
+      # connects as. It used to be written in the script itself, which was
+      # fine on a laptop and not fine on a server.
+      DATABASE_APP_PASSWORD: ${DATABASE_APP_PASSWORD:-novabrief-app-dev}
     ports:
       - "5432:5432"
     volumes:
