@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.models import Meeting, Organization, User
+from app.models import Decision, Meeting, Organization, Report, Task, TranscriptSegment, User
 from app.services.organizations import ExportBundle
 from schemas.auth import (
     CurrentSession,
@@ -23,7 +23,13 @@ from schemas.auth import (
     OrganizationProfile,
     UserProfile,
 )
-from schemas.meetings import MeetingSummary
+from schemas.meetings import (
+    DecisionOut,
+    MeetingSummary,
+    ReportOut,
+    TaskOut,
+    TranscriptSegmentOut,
+)
 
 
 def user_profile(user: User) -> UserProfile:
@@ -146,4 +152,57 @@ def meeting_summary(meeting: Meeting) -> MeetingSummary:
         purge_at=meeting.purge_at,
         created_at=meeting.created_at,
         completed_at=meeting.completed_at,
+    )
+
+
+def transcript_segment(segment: TranscriptSegment) -> TranscriptSegmentOut:
+    """One diarised passage."""
+    return TranscriptSegmentOut(
+        id=segment.id,
+        speaker_tag=segment.speaker_tag,
+        speaker_name=segment.speaker_name,
+        start_ms=segment.start_ms,
+        end_ms=segment.end_ms,
+        text=segment.text,
+        confidence=segment.confidence,
+        channel=segment.channel,
+    )
+
+
+def report(row: Report, *, decisions: list[Decision], tasks: list[Task]) -> ReportOut:
+    """The structured report and everything extracted from it."""
+    return ReportOut(
+        id=row.id,
+        title=row.title,
+        participants=list(row.participants or []),
+        summary=list(row.summary or []),
+        decisions=[
+            DecisionOut(
+                id=decision.id,
+                content=decision.content,
+                source_start_ms=decision.source_start_ms,
+                confidence=decision.confidence,
+                human_status=decision.human_status,
+                edited_content=decision.edited_content,
+            )
+            for decision in decisions
+        ],
+        tasks=[
+            TaskOut(
+                id=task.id,
+                action=task.action,
+                assignee_name=task.assignee_name,
+                assignee_user_id=task.assignee_user_id,
+                deadline_text=task.deadline_text,
+                deadline_date=task.deadline_date,
+                source_start_ms=task.source_start_ms,
+                confidence=task.confidence,
+                human_status=task.human_status,
+                edited_content=task.edited_content,
+            )
+            for task in tasks
+        ],
+        model_version=row.model_version,
+        prompt_version=row.prompt_version,
+        generated_at=row.generated_at,
     )

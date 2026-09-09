@@ -10,29 +10,39 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request, status
+from sqlalchemy import select
 
 from app.config import Settings, get_settings
 from app.deps import CurrentCaller, ScopedSession
 from app.errors import ProblemError
-from app.models import MeetingStatus
-from app.presenters import meeting_summary
-from app.services import meetings
+from app.models import Decision, MeetingStatus, Report, Task, TranscriptSegment
+from app.presenters import meeting_summary, report, transcript_segment
+from app.services import meetings, transcription
 from app.storage import StorageProvider
+from app.tickets import (
+    TICKET_TTL_SECONDS,
+    TicketClaims,
+    TicketStore,
+    new_ticket,
+)
 from schemas.meetings import (
     DeclareMeetingRequest,
     FinalizeRequest,
     FinalizeUploadRequest,
+    MeetingDetail,
     MeetingState,
     MeetingSummary,
     UpdateMeetingRequest,
     UploadPart,
     UploadTicket,
+    WebSocketTicket,
 )
 
 router = APIRouter(tags=["meetings"])
 
 _STATUS_FOR_CODE = {
     "MEETING_NOT_FOUND": 404,
+    "NOT_FAILED": 409,
     "FORBIDDEN": 403,
     "ILLEGAL_TRANSITION": 409,
     "UPLOAD_NOT_STARTED": 409,
@@ -62,6 +72,21 @@ def dispatch_pipeline(request: Request) -> meetings.Dispatch:
 
 
 Dispatcher = Annotated[meetings.Dispatch, Depends(dispatch_pipeline)]
+
+
+def ticket_store(request: Request) -> TicketStore:
+    """Where single-use WebSocket tickets live."""
+    store: TicketStore | None = getattr(request.app.state, "tickets", None)
+    if store is None:  # pragma: no cover - only if the app was built wrongly
+        raise ProblemError(
+            status_code=503,
+            code="TICKETS_UNAVAILABLE",
+            title="Realtime status is not configured.",
+        )
+    return store
+
+
+Tickets = Annotated[TicketStore, Depends(ticket_store)]
 
 
 def storage_provider(request: Request) -> StorageProvider:
@@ -295,3 +320,126 @@ async def cancel(
     except meetings.MeetingError as error:
         raise _as_problem(error) from error
     return meeting_summary(cancelled)
+
+
+@router.get(
+    "/meetings/{meeting_id}/report",
+    response_model=MeetingDetail,
+    summary="The report, the transcript and a link to the audio",
+)
+async def detail(
+    meeting_id: uuid.UUID,
+    caller: CurrentCaller,
+    session: ScopedSession,
+    storage: Storage,
+) -> MeetingDetail:
+    """Everything the player needs (EF-52).
+
+    The audio link is presigned and short-lived, and absent once the recording
+    has been purged (ADR-06) — a null there is a normal answer, not an error.
+    """
+    try:
+        meeting = await meetings.get(session, meeting_id=meeting_id)
+    except meetings.MeetingError as error:
+        raise _as_problem(error) from error
+
+    transcript = await transcription.existing_transcript(session, meeting_id=meeting_id)
+    segments: list[TranscriptSegment] = []
+    if transcript is not None:
+        segments = list(
+            (
+                await session.scalars(
+                    select(TranscriptSegment)
+                    .where(TranscriptSegment.transcript_id == transcript.id)
+                    .order_by(TranscriptSegment.start_ms)
+                )
+            ).all()
+        )
+
+    row = await session.scalar(select(Report).where(Report.meeting_id == meeting_id))
+    rendered = None
+    if row is not None:
+        decisions = list(
+            (
+                await session.scalars(
+                    select(Decision)
+                    .where(Decision.meeting_id == meeting_id)
+                    .order_by(Decision.source_start_ms)
+                )
+            ).all()
+        )
+        tasks = list(
+            (
+                await session.scalars(
+                    select(Task).where(Task.meeting_id == meeting_id).order_by(Task.source_start_ms)
+                )
+            ).all()
+        )
+        rendered = report(row, decisions=decisions, tasks=tasks)
+
+    audio_url = None
+    if meeting.audio_key:
+        audio_url = await storage.presign_get(key=meeting.audio_key)
+
+    return MeetingDetail(
+        meeting=meeting_summary(meeting),
+        report=rendered,
+        segments=[transcript_segment(segment) for segment in segments],
+        audio_url=audio_url,
+    )
+
+
+@router.post(
+    "/meetings/{meeting_id}/retry",
+    response_model=MeetingSummary,
+    summary="Retry a failed meeting",
+)
+async def retry(
+    meeting_id: uuid.UUID,
+    caller: CurrentCaller,
+    session: ScopedSession,
+    dispatch: Dispatcher,
+) -> MeetingSummary:
+    """EF-45's Retry button. Author or administrator, and only from FAILED."""
+    try:
+        meeting = await meetings.get(session, meeting_id=meeting_id)
+        requeued = await meetings.retry(session, meeting=meeting, caller=caller.user)
+    except meetings.MeetingError as error:
+        raise _as_problem(error) from error
+
+    dispatch(organization_id=requeued.organization_id, meeting_id=requeued.id)
+    return meeting_summary(requeued)
+
+
+@router.post(
+    "/meetings/{meeting_id}/ws-ticket",
+    response_model=WebSocketTicket,
+    summary="A single-use ticket for the status socket",
+)
+async def issue_ticket(
+    meeting_id: uuid.UUID,
+    caller: CurrentCaller,
+    session: ScopedSession,
+    tickets: Tickets,
+) -> WebSocketTicket:
+    """Section 17.2.
+
+    A browser cannot set an Authorization header on a WebSocket, and a token in
+    a query string ends up in every access log. This grants one thing, once,
+    for sixty seconds: watching this meeting's status.
+    """
+    try:
+        meeting = await meetings.get(session, meeting_id=meeting_id)
+    except meetings.MeetingError as error:
+        raise _as_problem(error) from error
+
+    ticket = new_ticket()
+    await tickets.issue(
+        ticket,
+        TicketClaims(
+            organization_id=caller.organization.id,
+            user_id=caller.user.id,
+            meeting_id=meeting.id,
+        ),
+    )
+    return WebSocketTicket(ticket=ticket, expires_in_seconds=TICKET_TTL_SECONDS)

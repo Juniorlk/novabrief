@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from sqlalchemy import select
@@ -415,6 +415,10 @@ async def finalize(
     # The size the store reports wins over the declared one: it is the only
     # number that describes what actually exists.
     meeting.audio_bytes = stored.size_bytes
+    # ADR-06: the clock starts when the recording lands, not when it is
+    # processed. A meeting stuck in a queue must not have its retention
+    # silently extended by the backlog.
+    meeting.purge_at = retention_deadline(organization)
 
     # Section 20.3: going over quota blocks the *processing*, never the
     # recording. The audio is already stored and stays stored; the meeting
@@ -459,3 +463,80 @@ async def abandon(
         raise MeetingError("FORBIDDEN", "only the author may cancel a meeting")
 
     return await advance(session, meeting=meeting, to=MeetingStatus.CANCELLED, actor=caller)
+
+
+# --------------------------------------------------------------------------
+# Retry and audio retention (EF-45, ADR-06)
+# --------------------------------------------------------------------------
+
+
+async def retry(session: AsyncSession, *, meeting: Meeting, caller: User) -> Meeting:
+    """EF-45: put a failed meeting back in the queue.
+
+    Only from FAILED. Re-running a meeting that succeeded would pay for a
+    second transcription and overwrite a report somebody may already have read
+    and corrected.
+    """
+    if not _may_administer(meeting, caller):
+        raise MeetingError("FORBIDDEN", "only the author or an administrator may retry a meeting")
+    if meeting.status != MeetingStatus.FAILED.value:
+        raise MeetingError("NOT_FAILED", "only a failed meeting can be retried")
+
+    # Cleared so the next failure is not confused with the last one.
+    meeting.failed_reason = None
+    return await advance(session, meeting=meeting, to=MeetingStatus.QUEUED, actor=caller)
+
+
+def retention_deadline(organization: Organization, *, now: datetime | None = None) -> datetime:
+    """When this organization's audio should disappear (ADR-06).
+
+    Read from the organization's own row, never from a constant: the retention
+    a customer bought is data, and writing 30 here would make ADR-09 a
+    suggestion.
+    """
+    moment = now or datetime.now(UTC)
+    return moment + timedelta(days=organization.audio_retention_days)
+
+
+async def purge_due_audio(
+    session: AsyncSession, *, storage: StorageProvider, now: datetime | None = None
+) -> list[uuid.UUID]:
+    """ADR-06: the audio goes, the text stays.
+
+    Published meetings past their retention lose the recording and nothing
+    else. The report, the transcript and the tasks are the durable part of the
+    product; the audio is the expensive, sensitive part nobody agreed to keep
+    for ever.
+
+    The session must be scoped by the caller, one organization at a time: this
+    reads and writes tenant rows, and a cross-tenant sweep has no business
+    holding a session that could see them all.
+    """
+    moment = now or datetime.now(UTC)
+    due = (
+        await session.scalars(
+            select(Meeting).where(
+                Meeting.status == MeetingStatus.PUBLISHED.value,
+                Meeting.purge_at.is_not(None),
+                Meeting.purge_at <= moment,
+            )
+        )
+    ).all()
+
+    purged: list[uuid.UUID] = []
+    for meeting in due:
+        if meeting.audio_key:
+            try:
+                await storage.delete(key=meeting.audio_key)
+            except StorageError:
+                # Left for the next run rather than marked purged: claiming the
+                # audio is gone while it sits in the bucket is the one outcome
+                # ADR-06 cannot tolerate.
+                logger.warning("audio_purge_failed", meeting_id=str(meeting.id))
+                continue
+
+        # `advance` clears the key and stamps the time.
+        await advance(session, meeting=meeting, to=MeetingStatus.AUDIO_PURGED)
+        purged.append(meeting.id)
+
+    return purged
