@@ -207,6 +207,11 @@ async def _persist(
             "provider": result.provider,
             "utterances": len(result.utterances),
             "duration_seconds": result.duration_seconds,
+            # Carried here because the analysis stage writes the ledger entry
+            # and has no other way to know what transcription cost (ADR-08).
+            # A string, not a float: JSON has no decimals, and a cost that
+            # drifts through binary floating point is a corrupted margin.
+            "cost_usd": str(result.cost_usd),
         },
     )
     session.add(transcript)

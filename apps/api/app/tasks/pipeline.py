@@ -92,6 +92,13 @@ def transcribe_meeting(self: object, organization_id: str, meeting_id: str) -> s
 
     try:
         outcome = run_async(work)
+        if outcome == MeetingStatus.ANALYZING.value:
+            # Dispatched after the transaction commits, never inside it: a task
+            # queued from an open transaction can be picked up by a worker
+            # before the row it needs is visible.
+            from app.tasks.analysis import analyse_meeting
+
+            analyse_meeting.delay(organization_id, meeting_id)
     except Exception as exc:
         task_failure("novabrief.transcribe_meeting", exc, meeting_id=meeting_id)
         raise

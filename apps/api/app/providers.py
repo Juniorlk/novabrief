@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from decimal import Decimal
 
+from ai.llm import LLMProvider, OpenAIProvider
 from ai.transcription import (
     AssemblyAIProvider,
     DeepgramProvider,
@@ -91,3 +92,35 @@ def build_transcription_router(settings: Settings) -> TranscriptionRouter:
         else None
     )
     return TranscriptionRouter(providers, price_per_hour_usd=price)
+
+
+def build_llm(settings: Settings) -> LLMProvider:
+    """The configured analysis model.
+
+    One vendor today. The abstraction is not speculative: ADR-01 requires the
+    business code never to name one, and swapping models is the single most
+    likely change this system will face.
+    """
+    if settings.llm_provider != "openai":
+        message = f"unknown LLM provider {settings.llm_provider!r}"
+        raise RuntimeError(message)
+    if not settings.openai_api_key:
+        message = "OPENAI_API_KEY is not set; meetings cannot be analysed"
+        raise RuntimeError(message)
+
+    return OpenAIProvider(
+        api_key=settings.openai_api_key,
+        model=settings.openai_model_default,
+        timeout_seconds=settings.llm_timeout_seconds,
+        max_output_tokens=settings.llm_max_output_tokens,
+        price_per_million_in_usd=(
+            Decimal(str(settings.llm_price_per_million_in_usd))
+            if settings.llm_price_per_million_in_usd is not None
+            else None
+        ),
+        price_per_million_out_usd=(
+            Decimal(str(settings.llm_price_per_million_out_usd))
+            if settings.llm_price_per_million_out_usd is not None
+            else None
+        ),
+    )
