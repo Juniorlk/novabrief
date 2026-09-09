@@ -63,6 +63,20 @@ async def main() -> int:
     body = body[:MIN_PART_SIZE_BYTES]
 
     try:
+        return await _probe(storage, settings, key=key, body=body)
+    finally:
+        # In a finally block because every failure above used to return early
+        # and leave a five-megabyte object behind in the customer's bucket.
+        try:
+            await storage.delete(key=key)
+            print("ok      cleaned up")
+        except StorageError as exc:  # pragma: no cover - operational tool
+            print(f"WARNING could not delete {key}: {exc}")
+
+
+async def _probe(storage: S3StorageProvider, settings: Settings, *, key: str, body: bytes) -> int:
+    """Write, read back, check the endpoint refuses an unsigned read."""
+    try:
         upload = await storage.start_multipart(key=key, size_bytes=len(body))
         print(f"ok      opened an upload in {len(upload.parts)} part(s)")
 
@@ -90,17 +104,17 @@ async def main() -> int:
                 return 1
             print("ok      read it back through a presigned URL")
 
+            # Any refusal counts. R2 answers 400 rather than 403 to a request
+            # carrying no signature at all, and both mean the same thing: the
+            # object was not served.
             bare = await client.get(f"{settings.r2_endpoint}/{settings.r2_bucket_audio}/{key}")
-            if bare.status_code not in {401, 403}:
+            if bare.status_code < 400 or bare.content == body:
                 print(
-                    f"FAILED  the bucket answered an unsigned read with HTTP {bare.status_code}. "
-                    "Meeting audio must not be publicly readable."
+                    f"FAILED  an unsigned read returned HTTP {bare.status_code} and content. "
+                    "Meeting audio must not be readable without a signature."
                 )
                 return 1
-            print("ok      refused an unsigned read, so the bucket is private")
-
-        await storage.delete(key=key)
-        print("ok      cleaned up")
+            print(f"ok      refused an unsigned read (HTTP {bare.status_code})")
     except StorageError as exc:
         print(f"FAILED  {exc}")
         return 1
@@ -110,6 +124,12 @@ async def main() -> int:
 
     print()
     print("object storage is usable.")
+    print()
+    print(
+        "One thing this cannot check: R2 serves public objects through an r2.dev "
+        "subdomain or a custom domain, not through the S3 endpoint tested above. "
+        "Confirm in the bucket settings that public access is disabled."
+    )
     return 0
 
 
