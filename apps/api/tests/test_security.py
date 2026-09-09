@@ -236,3 +236,67 @@ def test_hashing_a_refresh_token_is_deterministic() -> None:
     token = new_refresh_token()
 
     assert hash_refresh_token(token) == hash_refresh_token(token)
+
+
+# --------------------------------------------------------------------------
+# Carrying a PEM through the environment
+# --------------------------------------------------------------------------
+
+
+def test_a_pem_written_on_one_line_is_restored() -> None:
+    r"""Deployments write the key with \n, because env_file cannot carry newlines.
+
+    Docker Compose's parser does not reliably keep a multi-line value, so every
+    deployment escapes the key. If this stops working the API starts, accepts
+    requests, and fails to sign the first token - which looks like a key
+    problem rather than a parsing one.
+    """
+    escaped = "-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----"
+
+    settings = Settings(jwt_private_key=escaped)
+
+    assert settings.require_jwt_private_key() == (
+        "-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----"
+    )
+
+
+def test_a_pem_with_real_newlines_is_left_alone() -> None:
+    """A key exported straight from a shell must keep working."""
+    real = "-----BEGIN PUBLIC KEY-----\nMIIabc\n-----END PUBLIC KEY-----"
+
+    settings = Settings(jwt_public_key=real)
+
+    assert settings.require_jwt_public_key() == real
+
+
+def test_an_escaped_key_still_signs_and_verifies() -> None:
+    """The property that matters, end to end rather than by string comparison."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    public_pem = (
+        key.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode()
+    )
+
+    settings = Settings(
+        jwt_private_key=private_pem.replace("\n", "\n"),
+        jwt_public_key=public_pem.replace("\n", "\n"),
+    )
+
+    token = create_access_token(
+        settings=settings,
+        user_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        role="OWNER",
+    )
+    claims = decode_access_token(settings=settings, token=token)
+
+    assert claims.role == "OWNER"

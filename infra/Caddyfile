@@ -50,6 +50,13 @@
 		-Server
 	}
 
+	# Until the web application exists (lot L4) there is nothing behind this.
+	# A sentence beats a bare 502: somebody typing the address should learn
+	# that it is not deployed yet, not that something is broken.
+	handle_errors {
+		respond "NovaBrief : l'application web n'est pas encore deployee." 503
+	}
+
 	reverse_proxy web:3000
 
 	log {

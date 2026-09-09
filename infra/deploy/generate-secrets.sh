@@ -1,0 +1,171 @@
+#!/bin/bash
+# Fill in the secrets NovaBrief generates for itself.
+#
+#     bash infra/deploy/generate-secrets.sh
+#
+# Run from the repository root on the server. It creates `.env` from
+# `.env.example` if it does not exist, then fills the values a machine can
+# invent for itself: database passwords, the application signing key, and the
+# RS256 key pair.
+#
+# **It never overwrites a value that is already set.** Rotating a secret is a
+# deliberate act with consequences - a new JWT key invalidates every session,
+# a new database password locks the API out until PostgreSQL agrees - and a
+# script that quietly rotated on every run would make redeploying dangerous.
+#
+# Provider keys (Resend, AssemblyAI, Deepgram, OpenAI, R2) are not generated
+# here. Nobody can invent those; they are pasted in once by hand.
+set -euo pipefail
+
+ENV_FILE=${ENV_FILE:-.env}
+EXAMPLE_FILE=.env.example
+
+if [[ ! -f $EXAMPLE_FILE ]]; then
+    echo "run this from the repository root" >&2
+    exit 1
+fi
+
+if [[ ! -f $ENV_FILE ]]; then
+    cp "$EXAMPLE_FILE" "$ENV_FILE"
+    # Only the owner: this file ends up holding every credential the service
+    # has, on a machine with more than one account.
+    chmod 600 "$ENV_FILE"
+    echo "created $ENV_FILE from $EXAMPLE_FILE"
+fi
+chmod 600 "$ENV_FILE"
+
+# Present means "has a non-empty value once the trailing comment is removed".
+# `.env.example` ships every key as `KEY=      # what it is for`, so a naive
+# grep for "something after the equals sign" reports every key as already
+# configured — and the script then leaves the database password empty while
+# announcing that all is well.
+is_set() {
+    python3 - "$ENV_FILE" "$1" <<'IS_SET'
+import sys
+from pathlib import Path
+
+path, key = Path(sys.argv[1]), sys.argv[2]
+for line in path.read_text(encoding="utf-8").splitlines():
+    if line.startswith(f"{key}="):
+        value = line[len(key) + 1 :].split("#", 1)[0].strip()
+        sys.exit(0 if value else 1)
+sys.exit(1)
+IS_SET
+}
+
+set_value() {
+    local key=$1 value=$2
+    if is_set "$key"; then
+        echo "  $key already set, left alone"
+        return
+    fi
+    # Written with python rather than sed: a generated secret contains slashes
+    # and ampersands, and sed would interpret them.
+    python3 - "$ENV_FILE" "$key" "$value" <<'SET_VALUE'
+import sys
+from pathlib import Path
+
+path, key, value = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+lines = path.read_text(encoding="utf-8").splitlines()
+written = False
+for index, line in enumerate(lines):
+    stripped = line.split("#", 1)[0].rstrip()
+    if stripped.startswith(f"{key}="):
+        # The comment after the value documents what it is; it is kept.
+        comment = line[len(stripped):] if len(line) > len(stripped) else ""
+        lines[index] = f"{key}={value}{comment}"
+        written = True
+        break
+if not written:
+    lines.append(f"{key}={value}")
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+SET_VALUE
+    echo "  $key generated"
+}
+
+# 32 bytes of randomness, base64 without padding or slashes so the value is
+# safe inside a URL, a connection string and a shell.
+secret() {
+    openssl rand -base64 48 | tr -d '\n=+/' | cut -c1-40
+}
+
+echo "=== database ==="
+set_value POSTGRES_USER novabrief
+set_value POSTGRES_DB novabrief
+set_value POSTGRES_PASSWORD "$(secret)"
+set_value DATABASE_APP_PASSWORD "$(secret)"
+
+echo "=== connection strings ==="
+# Built here rather than left to whoever edits the file. Assembling a URL by
+# hand from a generated password is exactly the step where a character gets
+# dropped, and the failure that follows - the API cannot authenticate to
+# PostgreSQL - reads like a permissions problem rather than a typing one.
+#
+# The hosts are the compose service names, not localhost: these are read from
+# inside the network, where `postgres` and `redis` are what resolves.
+read_value() {
+    python3 - "$ENV_FILE" "$1" <<'READ_VALUE'
+import sys
+from pathlib import Path
+
+path, key = Path(sys.argv[1]), sys.argv[2]
+for line in path.read_text(encoding="utf-8").splitlines():
+    if line.startswith(f"{key}="):
+        print(line[len(key) + 1 :].split("#", 1)[0].strip())
+        break
+READ_VALUE
+}
+
+db_user=$(read_value POSTGRES_USER)
+db_name=$(read_value POSTGRES_DB)
+db_password=$(read_value POSTGRES_PASSWORD)
+app_password=$(read_value DATABASE_APP_PASSWORD)
+
+# The API connects as the restricted role. A superuser bypasses RLS and would
+# leave every ADR-04 policy in place and enforcing nothing.
+set_value DATABASE_URL \
+    "postgresql+asyncpg://novabrief_app:${app_password}@postgres:5432/${db_name}"
+# Migrations need DDL, which the application role deliberately lacks.
+set_value DATABASE_ADMIN_URL \
+    "postgresql+asyncpg://${db_user}:${db_password}@postgres:5432/${db_name}"
+set_value REDIS_URL "redis://redis:6379/0"
+
+echo "=== application ==="
+set_value SECRET_KEY "$(secret)"
+set_value ENVIRONMENT prod
+# Production logs are parsed and correlated by debug_id (ADR-07); a console
+# format would break that silently, and config.py refuses the combination.
+set_value LOG_FORMAT json
+set_value LOG_LEVEL info
+
+echo "=== JWT key pair (RS256) ==="
+if is_set JWT_PRIVATE_KEY; then
+    echo "  JWT_PRIVATE_KEY already set, left alone"
+else
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$tmp/key.pem" 2> /dev/null
+    openssl rsa -in "$tmp/key.pem" -pubout -out "$tmp/key.pub" 2> /dev/null
+
+    # Escaped onto one line: a PEM is multi-line and Docker Compose's env_file
+    # parser does not carry that reliably. `app.config` turns it back.
+    escape() { awk '{printf "%s\\n", $0}' "$1"; }
+    set_value JWT_PRIVATE_KEY "$(escape "$tmp/key.pem")"
+    set_value JWT_PUBLIC_KEY "$(escape "$tmp/key.pub")"
+fi
+
+echo
+echo "=== what still has to be filled in by hand ==="
+missing=0
+for key in RESEND_API_KEY ASSEMBLYAI_API_KEY DEEPGRAM_API_KEY OPENAI_API_KEY \
+           R2_ACCOUNT_ID R2_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY \
+           API_DOMAIN WEB_DOMAIN ACME_EMAIL; do
+    if ! is_set "$key"; then
+        echo "  $key"
+        missing=$((missing + 1))
+    fi
+done
+[[ $missing -eq 0 ]] && echo "  nothing - every provider key is present"
+
+echo
+echo "$ENV_FILE is chmod 600. It is ignored by Git and must stay that way."

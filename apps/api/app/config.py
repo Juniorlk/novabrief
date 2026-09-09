@@ -163,6 +163,23 @@ class Settings(BaseSettings):
             return [name.strip() for name in value.split(",") if name.strip()]
         return value
 
+    @field_validator("jwt_private_key", "jwt_public_key", mode="before")
+    @classmethod
+    def _unescape_pem(cls, value: object) -> object:
+        r"""Accept a PEM written on one line, with \n standing for its newlines.
+
+        A PEM is multi-line, and Docker Compose's `env_file` parser does not
+        carry a multi-line value reliably. Every deployment therefore writes the
+        key escaped, and it is turned back here rather than in the four places
+        that use it — one of which would eventually forget.
+
+        A value that already contains real newlines is left alone, so a key
+        exported straight from a shell still works.
+        """
+        if isinstance(value, str) and "\\n" in value:
+            return value.replace("\\n", "\n")
+        return value
+
     @field_validator("cors_allowed_origins", mode="before")
     @classmethod
     def _split_origins(cls, value: object) -> object:

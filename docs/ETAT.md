@@ -46,7 +46,7 @@
 ## 2. Prochaine étape
 
 **Le déploiement sur le VPS OVHcloud**, décidé par Novafrik pour la fin du lot
-L2 (`ubuntu@novabrief.cloud`, 51.75.120.252). Le DNS est prêt : `api.` et
+L2. Les accès SSH ne sont pas dans le dépôt. Le DNS est prêt : `api.` et
 `app.` pointent déjà dessus.
 
 Marche à suivre : une reconnaissance **en lecture seule** d'abord (version

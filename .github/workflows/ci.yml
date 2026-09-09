@@ -96,7 +96,11 @@ jobs:
         # environments cannot drift into disagreeing about the role's rights.
         env:
           PGPASSWORD: novabrief
-        run: psql -h localhost -U novabrief -d novabrief -v ON_ERROR_STOP=1 -f infra/postgres-init/01-app-role.sql
+          PGHOST: localhost
+          POSTGRES_USER: novabrief
+          POSTGRES_DB: novabrief
+          DATABASE_APP_PASSWORD: novabrief-app-dev
+        run: bash infra/postgres-init/01-app-role.sh
 
       - name: Start MinIO
         # A real S3 implementation, for the same reason PostgreSQL is real:
