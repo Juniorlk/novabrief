@@ -51,6 +51,7 @@ class Harness:
     mailbox: RecordingProvider
     engine: AsyncEngine
     storage: InMemoryStorageProvider
+    dispatched: list[tuple[uuid.UUID, uuid.UUID]]
 
 
 @pytest_asyncio.fixture
@@ -90,16 +91,30 @@ async def api(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Harness]:
     # .env that happens to hold real R2 credentials must never turn a test run
     # into writes against the production bucket.
     storage = InMemoryStorageProvider()
+    # A recorder, not the real queue: a unit test must not need a broker, and
+    # this is also how a test can see what would have been dispatched.
+    dispatched: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    def record(*, organization_id: uuid.UUID, meeting_id: uuid.UUID) -> None:
+        dispatched.append((organization_id, meeting_id))
+
     app = create_app(
         limiter=InMemoryRateLimiter(),
         email_provider=mailbox,
         storage=storage,
+        dispatch=record,
     )
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as http:
-        yield Harness(client=http, mailbox=mailbox, engine=engine, storage=storage)
+        yield Harness(
+            client=http,
+            mailbox=mailbox,
+            engine=engine,
+            storage=storage,
+            dispatched=dispatched,
+        )
 
     await engine.dispose()
     get_settings.cache_clear()
@@ -620,3 +635,63 @@ async def test_a_recording_can_be_abandoned(api: Harness) -> None:
 
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "CANCELLED"
+
+
+async def test_finalizing_hands_the_meeting_to_the_workers(api: Harness) -> None:
+    """EF-40: the 202 means somebody else is now doing the work.
+
+    Without this the meeting would sit in QUEUED for ever and the API would
+    still answer 202, which is the most convincing way to be broken.
+    """
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+    ticket = await _ticket(api, headers, meeting["id"])
+
+    await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize",
+        json={
+            "upload_id": ticket["upload_id"],
+            "parts": [
+                {"part_number": part["part_number"], "etag": "e"}  # type: ignore[index]
+                for part in ticket["parts"]  # type: ignore[union-attr]
+            ],
+        },
+        headers=headers,
+    )
+
+    assert [str(pair[1]) for pair in api.dispatched] == [meeting["id"]]
+
+
+async def test_a_meeting_held_for_quota_is_not_dispatched(api: Harness) -> None:
+    """Section 11: the payment webhook releases it, not the finalisation."""
+    headers = await _owner(api.client)
+    organization_id = (await api.client.get(f"{PREFIX}/me", headers=headers)).json()[
+        "organization"
+    ]["id"]
+    async with api.engine.connect() as connection:
+        await connection.execute(
+            text("SELECT set_config('app.current_org_id', :org, false)"),
+            {"org": organization_id},
+        )
+        await connection.execute(
+            text("UPDATE organizations SET quota_seconds = 60 WHERE id = CAST(:org AS uuid)"),
+            {"org": organization_id},
+        )
+        await connection.commit()
+
+    meeting = await _declare(api.client, headers)
+    ticket = await _ticket(api, headers, meeting["id"])
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize",
+        json={
+            "upload_id": ticket["upload_id"],
+            "parts": [
+                {"part_number": part["part_number"], "etag": "e"}  # type: ignore[index]
+                for part in ticket["parts"]  # type: ignore[union-attr]
+            ],
+        },
+        headers=headers,
+    )
+
+    assert response.json()["status"] == "QUOTA_HOLD"
+    assert api.dispatched == []
