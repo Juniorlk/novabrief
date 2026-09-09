@@ -6,6 +6,6 @@ same code the tests exercise directly, not a second implementation that can
 drift from the first.
 """
 
-from app.tasks import maintenance
+from app.tasks import maintenance, pipeline
 
-__all__ = ["maintenance"]
+__all__ = ["maintenance", "pipeline"]

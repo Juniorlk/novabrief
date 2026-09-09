@@ -24,6 +24,7 @@ from app.logging import configure_logging, get_logger
 from app.middleware import DEBUG_ID_HEADER, RateLimitMiddleware, RequestContextMiddleware
 from app.ratelimit import InMemoryRateLimiter, RateLimiter, RedisRateLimiter
 from app.routers import auth, health, meetings, members, organizations
+from app.services.meetings import Dispatch
 from app.storage import InMemoryStorageProvider, S3StorageProvider, StorageProvider
 
 API_PREFIX = "/api/v1"
@@ -131,6 +132,7 @@ def create_app(
     limiter: RateLimiter | None = None,
     email_provider: EmailProvider | None = None,
     storage: StorageProvider | None = None,
+    dispatch: Dispatch | None = None,
 ) -> FastAPI:
     """Build the application.
 
@@ -180,6 +182,9 @@ def create_app(
     # provider is configuration, not request state.
     app.state.email_provider = email_provider or _build_email_provider(settings)
     app.state.storage = storage or _build_storage(settings)
+    # None means the real queue. A test passes a recorder instead, so no
+    # unit test needs a broker to run.
+    app.state.dispatch = dispatch
 
     install_error_handlers(app)
 

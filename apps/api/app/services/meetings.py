@@ -18,7 +18,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +31,18 @@ from app.storage import MultipartUpload, StorageError, StorageProvider, audio_ke
 from app.uuid7 import uuid7
 
 logger = get_logger(__name__)
+
+
+class Dispatch(Protocol):
+    """Hands a queued meeting to the workers.
+
+    A callable rather than an import of the Celery task: the service must not
+    depend on the queue, so tests can watch what would have been dispatched
+    without a broker anywhere in sight.
+    """
+
+    def __call__(self, *, organization_id: uuid.UUID, meeting_id: uuid.UUID) -> None: ...
+
 
 _S = MeetingStatus
 
@@ -360,6 +372,7 @@ async def finalize(
     upload_id: str,
     parts: Sequence[tuple[int, str]],
     client_version: str | None = None,
+    dispatch: Dispatch | None = None,
 ) -> Meeting:
     """`finalize`: assemble the parts and queue the work.
 
@@ -424,6 +437,12 @@ async def finalize(
         actor=caller,
         metadata=entry or None,
     )
+
+    if destination is MeetingStatus.QUEUED and dispatch is not None:
+        # Handed off, not run here: EF-40 promises a 202 in under 500 ms, and
+        # the user never waits on a request. A meeting held for quota is not
+        # dispatched — the webhook that lifts the hold will do it (section 11).
+        dispatch(organization_id=meeting.organization_id, meeting_id=meeting.id)
     logger.info("meeting_finalized", meeting_id=str(meeting.id), size_bytes=stored.size_bytes)
     return meeting
 

@@ -86,10 +86,18 @@ async def api(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Harness]:
         pytest.skip(f"no test database reachable ({type(exc).__name__})")
 
     storage = InMemoryStorageProvider()
+    # A recorder, not the real queue: a unit test must not need a broker, and
+    # this is also how a test can see what would have been dispatched.
+    dispatched: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    def record(*, organization_id: uuid.UUID, meeting_id: uuid.UUID) -> None:
+        dispatched.append((organization_id, meeting_id))
+
     app = create_app(
         limiter=InMemoryRateLimiter(),
         email_provider=RecordingProvider(),
         storage=storage,
+        dispatch=record,
     )
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)

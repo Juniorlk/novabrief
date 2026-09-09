@@ -103,13 +103,18 @@ async def test_the_worker_imports_its_tasks_without_a_cycle() -> None:
     import sys
     from pathlib import Path
 
+    import ai
     import app
 
-    # The import root is derived from where the package actually is, not from
-    # the working directory: CI runs pytest from the repository root and a
-    # laptop runs it from apps/api.
-    api_root = str(Path(app.__file__).resolve().parent.parent)
-    environment = {**os.environ, "PYTHONPATH": api_root}
+    # Both import roots, derived from where the packages actually are rather
+    # than from the working directory: CI runs pytest from the repository root
+    # and a laptop runs it from apps/api. The tasks reach into `ai` for the
+    # providers, so `app` alone is not enough.
+    roots = [
+        str(Path(app.__file__).resolve().parent.parent),
+        str(Path(ai.__file__).resolve().parent.parent),
+    ]
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join(roots)}
 
     process = await asyncio.create_subprocess_exec(
         sys.executable,

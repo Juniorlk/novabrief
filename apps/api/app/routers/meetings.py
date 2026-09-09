@@ -42,6 +42,28 @@ _STATUS_FOR_CODE = {
 }
 
 
+def dispatch_pipeline(request: Request) -> meetings.Dispatch:
+    """How a queued meeting reaches the workers.
+
+    Resolved through the app so a test can replace it with a recorder. Imported
+    inside the function on purpose: importing the Celery task at module scope
+    would make every API process build a broker connection it never uses.
+    """
+    override: meetings.Dispatch | None = getattr(request.app.state, "dispatch", None)
+    if override is not None:
+        return override
+
+    def send(*, organization_id: uuid.UUID, meeting_id: uuid.UUID) -> None:
+        from app.tasks.pipeline import transcribe_meeting
+
+        transcribe_meeting.delay(str(organization_id), str(meeting_id))
+
+    return send
+
+
+Dispatcher = Annotated[meetings.Dispatch, Depends(dispatch_pipeline)]
+
+
 def storage_provider(request: Request) -> StorageProvider:
     """The object store, attached to the app at startup."""
     provider: StorageProvider | None = getattr(request.app.state, "storage", None)
@@ -227,6 +249,7 @@ async def finalize(
     caller: CurrentCaller,
     session: ScopedSession,
     storage: Storage,
+    dispatch: Dispatcher,
 ) -> MeetingSummary:
     """EF-40: 202 in under 500 ms, and the user never waits on a request.
 
@@ -245,6 +268,7 @@ async def finalize(
             upload_id=payload.upload_id,
             parts=[(part.part_number, part.etag) for part in payload.parts],
             client_version=payload.client_version,
+            dispatch=dispatch,
         )
     except meetings.MeetingError as error:
         raise _as_problem(error) from error
