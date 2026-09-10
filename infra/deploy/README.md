@@ -28,7 +28,7 @@ bash infra/deploy/compose.sh up -d --build
 
 # 6. Appliquer les migrations. Alembic lit DATABASE_ADMIN_URL tout seul :
 #    le role applicatif n'a deliberement pas le DDL.
-docker compose -f infra/docker-compose.prod.yml run --rm \
+bash infra/deploy/compose.sh run --rm \
     --workdir /srv/apps/api api python -m alembic upgrade head
 ```
 
@@ -42,6 +42,18 @@ compose sont un autre mécanisme et fonctionnent dans les deux cas — c'est
 précisément ce qui rend la panne déroutante.
 
 `infra/deploy/compose.sh` passe les bons drapeaux et se place au bon endroit.
+
+**Y compris pour `run`.** Ce fichier a longtemps énoncé la règle ici puis
+donné, deux sections plus bas, une commande de migration en `docker compose -f`
+direct. Copiée telle quelle sur le serveur, elle échoue :
+
+```
+error while interpolating services.postgres.environment.POSTGRES_PASSWORD:
+required variable POSTGRES_PASSWORD is missing a value: set POSTGRES_PASSWORD in .env
+```
+
+C'est exactement le message trompeur décrit au paragraphe précédent — il accuse
+la variable, alors que le fichier la contient et que seul le chemin est faux.
 
 ## Ce que `generate-secrets.sh` fait, et ne fait pas
 
@@ -94,13 +106,34 @@ lignes fonctionne aussi : les deux formes sont acceptées et testées.
 ```bash
 cd /srv/novabrief
 git pull
-bash infra/deploy/compose.sh up -d --build
-docker compose -f infra/docker-compose.prod.yml run --rm \
+
+# 1. Construire la nouvelle image sans encore basculer dessus.
+bash infra/deploy/compose.sh build api worker beat
+
+# 2. Migrer pendant que l'ancienne version tourne toujours.
+bash infra/deploy/compose.sh run --rm \
     --workdir /srv/apps/api api python -m alembic upgrade head
+
+# 3. Basculer.
+bash infra/deploy/compose.sh up -d
 ```
 
+**L'ordre compte, et il n'est pas celui qu'on écrit spontanément.** Migrer
+*après* avoir basculé fait rencontrer à du code neuf un schéma ancien :
+SQLAlchemy sélectionne toutes les colonnes qu'il connaît, et une colonne
+absente transforme chaque requête sur les réunions en 500, le temps que la
+migration passe.
+
+L'inverse est sûr : une migration est écrite pour rester compatible avec la
+version déjà en service — on ajoute une colonne avant que quiconque la lise, on
+n'en retire une qu'une fois que plus personne ne l'écrit. C'est ce qui permet
+d'appliquer la migration pendant que l'ancienne image sert encore les requêtes,
+et de basculer ensuite sans fenêtre d'erreur.
+
 Les migrations sont réversibles et appliquées une par une. Une migration qui
-échoue laisse la base dans son état précédent ; l'ancienne image tourne encore.
+échoue laisse la base dans son état précédent ; l'ancienne image tourne encore
+— et à ce stade elle sert toujours le trafic, donc l'échec n'est pas une
+interruption.
 
 ## Vérifier
 
