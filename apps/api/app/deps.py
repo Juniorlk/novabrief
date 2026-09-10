@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings, get_settings
@@ -54,24 +55,37 @@ async def unscoped_session(request: Request) -> AsyncIterator[AsyncSession]:
         yield session
 
 
+# Declared so the generated OpenAPI document says these endpoints need a
+# bearer token, which is what puts the Authorize button in the interactive
+# documentation. Without it every authenticated endpoint answers 401 when tried
+# from a browser and looks broken rather than protected.
+#
+# `auto_error=False` on purpose: FastAPI's own 403 would bypass our Problem
+# Details format (ADR-07), and a client parsing error codes would meet a shape
+# it has never seen on exactly the path it hits most often.
+_bearer_scheme = HTTPBearer(
+    auto_error=False,
+    description="The access token returned by POST /auth/token or /auth/register.",
+)
+
+
 def access_claims(
-    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
 ) -> AccessClaims:
     """Verify the bearer token and return its claims.
 
     The token is read here once and reused by everything downstream, so a
     request never verifies the same signature twice.
     """
-    header = request.headers.get("Authorization")
-    if not header or not header.lower().startswith("bearer "):
+    if credentials is None or credentials.scheme.lower() != "bearer":
         raise ProblemError(
             status_code=401,
             code="UNAUTHENTICATED",
             title="This endpoint requires an access token.",
         )
     try:
-        return decode_access_token(settings=settings, token=header[7:].strip())
+        return decode_access_token(settings=settings, token=credentials.credentials.strip())
     except TokenError as exc:
         raise ProblemError(
             status_code=401,
