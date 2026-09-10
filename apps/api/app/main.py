@@ -168,8 +168,12 @@ def _install_docs(app: FastAPI) -> None:
             title="NovaBrief API",
             swagger_js_url=js_url,
             swagger_css_url=css_url,
-            # The default favicon is another third-party fetch, for an icon.
-            swagger_favicon_url=f"{API_PREFIX}/static/favicon.png" if vendored else "/favicon.ico",
+            # A transparent pixel. FastAPI's default points at tiangolo.com,
+            # which is a third-party request for an icon; a path to a file we
+            # do not ship would just be a 404 in everyone's console.
+            swagger_favicon_url=(
+                "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+            ),
         )
 
 

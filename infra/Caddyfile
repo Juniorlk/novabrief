@@ -20,22 +20,26 @@
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
 		Referrer-Policy "strict-origin-when-cross-origin"
-		Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
 		-Server
 	}
 
-	# The interactive documentation is the one HTML page this host serves, and
-	# `default-src 'none'` correctly refuses to run it. Its assets are vendored
-	# into the image rather than fetched from a CDN, so this stays at 'self':
-	# the page lives on the same origin as the authentication API and is where
-	# a person pastes an access token.
-	#
-	# 'unsafe-inline' is needed for the small bootstrap script FastAPI emits.
-	# Scoped to these two paths, so the API itself keeps refusing everything.
+	# The Content-Security-Policy is set by exactly one of the two rules below,
+	# never both. Two `header` directives naming the same field fight, and the
+	# winner is whichever Caddy happens to run last - which is how the strict
+	# policy kept applying to a page that cannot work under it. Complementary
+	# matchers remove the question.
 	@docs path /api/v1/docs /api/v1/docs/* /api/v1/static/*
-	header @docs {
-		Content-Security-Policy "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
-	}
+	@not_docs not path /api/v1/docs /api/v1/docs/* /api/v1/static/*
+
+	# Everything the API actually serves is JSON, and JSON needs nothing.
+	header @not_docs Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+
+	# The documentation is the one HTML page on this host. Its assets are
+	# vendored into the image rather than fetched from a CDN, so this stays at
+	# 'self': the page shares an origin with the authentication API and is
+	# where a person pastes an access token. 'unsafe-inline' covers the small
+	# bootstrap script FastAPI emits, and nothing else.
+	header @docs Content-Security-Policy "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
 
 	# The health probes stay out of the access log: they run every few seconds
 	# and would bury everything else.
