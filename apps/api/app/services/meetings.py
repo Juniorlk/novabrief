@@ -20,7 +20,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
-from sqlalchemy import or_, select, true
+from sqlalchemy import and_, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -402,9 +402,15 @@ async def start_upload(
     await advance(session, meeting=meeting, to=MeetingStatus.UPLOADING, actor=caller)
 
     try:
-        return await storage.start_multipart(key=meeting.audio_key, size_bytes=size_bytes)
+        upload = await storage.start_multipart(key=meeting.audio_key, size_bytes=size_bytes)
     except StorageError as exc:
         raise MeetingError("STORAGE_UNAVAILABLE", str(exc)) from exc
+
+    # Kept so the upload can be aborted if it is never finished. The store will
+    # not tell us later which uploads are open under a key, and parts left
+    # behind are billed until somebody names them.
+    meeting.audio_upload_id = upload.upload_id
+    return upload
 
 
 async def finalize(
@@ -460,6 +466,8 @@ async def finalize(
     # The size the store reports wins over the declared one: it is the only
     # number that describes what actually exists.
     meeting.audio_bytes = stored.size_bytes
+    # Closed: there is nothing left to abort.
+    meeting.audio_upload_id = None
     # ADR-06: the clock starts when the recording lands, not when it is
     # processed. A meeting stuck in a queue must not have its retention
     # silently extended by the backlog.
@@ -501,11 +509,26 @@ async def abandon(
 ) -> Meeting:
     """Give up on a recording before it is queued.
 
-    The parts left in the store are dropped: an abandoned multipart upload is
-    billed until it is aborted, and nobody notices those.
+    The parts left in the store are dropped. An abandoned multipart upload is
+    billed until it is aborted, nobody ever notices those, and this function
+    took a storage provider for a long time without using it — the docstring
+    described the intention and the code did not carry it out.
+
+    The abort is best-effort and deliberately does not block the cancellation:
+    the customer asked to abandon the recording, and a store that is briefly
+    unreachable must not turn that into an error they have to retry. What is
+    left behind is picked up by the sweep in :func:`purge_due_audio`.
     """
     if meeting.created_by != caller.id:
         raise MeetingError("FORBIDDEN", "only the author may cancel a meeting")
+
+    if meeting.audio_key and meeting.audio_upload_id:
+        try:
+            await storage.abort_multipart(key=meeting.audio_key, upload_id=meeting.audio_upload_id)
+        except StorageError:
+            logger.warning("upload_abort_failed", meeting_id=str(meeting.id))
+        else:
+            meeting.audio_upload_id = None
 
     return await advance(session, meeting=meeting, to=MeetingStatus.CANCELLED, actor=caller)
 
@@ -553,35 +576,98 @@ async def purge_due_audio(
     product; the audio is the expensive, sensitive part nobody agreed to keep
     for ever.
 
+    **A meeting that never reaches publication is swept too**, and for a long
+    time it was not. Only PUBLISHED was considered, so a recording that failed,
+    was cancelled or was deleted kept its audio in the bucket permanently —
+    which is the exact opposite of what ADR-06 says the audio is. Those are the
+    meetings least likely to be looked at again and most likely to be
+    forgotten.
+
+    Three cases, and they end differently on purpose:
+
+    * PUBLISHED past its deadline moves to AUDIO_PURGED. There is a report to
+      point at, so the state is worth recording.
+    * FAILED past its deadline loses the recording without changing state. The
+      Retry button lives on FAILED and a retry needs the audio, so the
+      retention window doubles as the retry window; past it, retrying would
+      fail on missing audio, which is honest rather than surprising.
+    * CANCELLED and DELETED lose it at the next sweep, deadline or not. Nothing
+      can be done with those recordings, and DELETED means somebody asked.
+
+    CANCELLED and DELETED are terminal in the transition table, so their key is
+    cleared in place rather than through :func:`advance`. That is a data
+    change, not a status change.
+
     The session must be scoped by the caller, one organization at a time: this
     reads and writes tenant rows, and a cross-tenant sweep has no business
     holding a session that could see them all.
     """
     moment = now or datetime.now(UTC)
+    expired = and_(Meeting.purge_at.is_not(None), Meeting.purge_at <= moment)
     due = (
         await session.scalars(
             select(Meeting).where(
-                Meeting.status == MeetingStatus.PUBLISHED.value,
-                Meeting.purge_at.is_not(None),
-                Meeting.purge_at <= moment,
+                or_(
+                    and_(Meeting.status == MeetingStatus.PUBLISHED.value, expired),
+                    and_(Meeting.status == MeetingStatus.FAILED.value, expired),
+                    Meeting.status.in_(
+                        [MeetingStatus.CANCELLED.value, MeetingStatus.DELETED.value]
+                    ),
+                ),
+                # Nothing to do for a meeting that never had a recording, or
+                # whose recording has already gone.
+                or_(Meeting.audio_key.is_not(None), Meeting.audio_upload_id.is_not(None)),
             )
         )
     ).all()
 
     purged: list[uuid.UUID] = []
     for meeting in due:
-        if meeting.audio_key:
-            try:
-                await storage.delete(key=meeting.audio_key)
-            except StorageError:
-                # Left for the next run rather than marked purged: claiming the
-                # audio is gone while it sits in the bucket is the one outcome
-                # ADR-06 cannot tolerate.
-                logger.warning("audio_purge_failed", meeting_id=str(meeting.id))
-                continue
+        if not await _drop_recording(storage, meeting):
+            # Left for the next run rather than marked purged: claiming the
+            # audio is gone while it sits in the bucket is the one outcome
+            # ADR-06 cannot tolerate.
+            continue
 
-        # `advance` clears the key and stamps the time.
-        await advance(session, meeting=meeting, to=MeetingStatus.AUDIO_PURGED)
+        if meeting.status == MeetingStatus.PUBLISHED.value:
+            # `advance` clears the key and stamps the time.
+            await advance(session, meeting=meeting, to=MeetingStatus.AUDIO_PURGED)
+        else:
+            meeting.audio_key = None
+            meeting.purged_at = moment
+            logger.info(
+                "audio_purged_without_transition",
+                meeting_id=str(meeting.id),
+                status=meeting.status,
+            )
         purged.append(meeting.id)
 
     return purged
+
+
+async def _drop_recording(storage: StorageProvider, meeting: Meeting) -> bool:
+    """Remove whatever this meeting still holds in the store.
+
+    Both an object and an unfinished upload, because a meeting can hold either.
+    A recording abandoned between `finalize-local` and `finalize` has no object
+    at all — only parts, which are billed and which nothing lists for us.
+
+    Answers whether the store is now clean, so the caller knows whether it may
+    say so in the database.
+    """
+    if meeting.audio_upload_id and meeting.audio_key:
+        try:
+            await storage.abort_multipart(key=meeting.audio_key, upload_id=meeting.audio_upload_id)
+        except StorageError:
+            logger.warning("upload_abort_failed", meeting_id=str(meeting.id))
+            return False
+        meeting.audio_upload_id = None
+
+    if meeting.audio_key:
+        try:
+            await storage.delete(key=meeting.audio_key)
+        except StorageError:
+            logger.warning("audio_purge_failed", meeting_id=str(meeting.id))
+            return False
+
+    return True

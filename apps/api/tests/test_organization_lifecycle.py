@@ -30,6 +30,7 @@ from app.main import create_app
 from app.models import TENANT_TABLES
 from app.ratelimit import InMemoryRateLimiter
 from app.services.organizations import DELETION_RETRACTION, purge_due_organizations
+from app.storage import InMemoryStorageProvider, StorageError, organization_prefix
 
 APP_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL",
@@ -44,11 +45,12 @@ pytestmark = pytest.mark.asyncio
 
 @dataclass
 class Harness:
-    """The API, the mailbox and the database."""
+    """The API, the mailbox, the database and the object store."""
 
     client: AsyncClient
     mailbox: RecordingProvider
     engine: AsyncEngine
+    storage: InMemoryStorageProvider
 
 
 @pytest_asyncio.fixture
@@ -84,12 +86,13 @@ async def api(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Harness]:
         pytest.skip(f"no test database reachable ({type(exc).__name__})")
 
     mailbox = RecordingProvider()
-    app = create_app(limiter=InMemoryRateLimiter(), email_provider=mailbox)
+    storage = InMemoryStorageProvider()
+    app = create_app(limiter=InMemoryRateLimiter(), email_provider=mailbox, storage=storage)
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as http:
-        yield Harness(client=http, mailbox=mailbox, engine=engine)
+        yield Harness(client=http, mailbox=mailbox, engine=engine, storage=storage)
 
     await engine.dispose()
     get_settings.cache_clear()
@@ -394,7 +397,7 @@ async def test_the_purge_leaves_nothing_behind(api: Harness) -> None:
     await _backdate_request(api, organization_id, days=DELETION_RETRACTION.days + 1)
     factory = create_session_factory(api.engine)
     async with factory() as session, session.begin():
-        purged = await purge_due_organizations(session)
+        purged = await purge_due_organizations(session, storage=api.storage)
 
     assert uuid.UUID(organization_id) in purged
     after = await _rows_left(api, organization_id)
@@ -410,7 +413,7 @@ async def test_the_purge_spares_an_organization_still_in_its_window(api: Harness
 
     factory = create_session_factory(api.engine)
     async with factory() as session, session.begin():
-        purged = await purge_due_organizations(session)
+        purged = await purge_due_organizations(session, storage=api.storage)
 
     assert uuid.UUID(organization_id) not in purged
     assert (await _rows_left(api, organization_id))["organizations"] == 1
@@ -422,7 +425,7 @@ async def test_the_purge_ignores_organizations_that_asked_for_nothing(api: Harne
 
     factory = create_session_factory(api.engine)
     async with factory() as session, session.begin():
-        purged = await purge_due_organizations(session)
+        purged = await purge_due_organizations(session, storage=api.storage)
 
     assert uuid.UUID(organization_id) not in purged
 
@@ -437,7 +440,7 @@ async def test_a_retracted_deletion_is_never_purged(api: Harness) -> None:
 
     factory = create_session_factory(api.engine)
     async with factory() as session, session.begin():
-        purged = await purge_due_organizations(session)
+        purged = await purge_due_organizations(session, storage=api.storage)
 
     assert uuid.UUID(organization_id) not in purged
     assert (await _rows_left(api, organization_id))["organizations"] == 1
@@ -455,8 +458,85 @@ async def test_the_purge_does_not_touch_a_neighbouring_organization(api: Harness
 
     factory = create_session_factory(api.engine)
     async with factory() as session, session.begin():
-        await purge_due_organizations(session)
+        await purge_due_organizations(session, storage=api.storage)
 
     assert (await _rows_left(api, doomed_id))["organizations"] == 0
     assert (await _rows_left(api, spared_id))["organizations"] == 1
     assert (await _rows_left(api, spared_id))["users"] == 1
+
+
+# --------------------------------------------------------------------------
+# EF-06 promises the recordings go too
+#
+# The cascade erases the rows that name the audio keys. Emptying the bucket
+# after that would be guesswork, so it has to happen before — and for a long
+# time it did not happen at all.
+# --------------------------------------------------------------------------
+
+
+async def test_purging_an_organization_empties_its_bucket(api: Harness) -> None:
+    _, headers = await _owner(api.client)
+    organization_id = await _organization_id(api, headers)
+
+    # Two recordings belonging to this organization, and one that does not.
+    prefix = organization_prefix(uuid.UUID(organization_id))
+    api.storage.objects[f"{prefix}meetings/a/audio.ogg"] = 1024
+    api.storage.objects[f"{prefix}meetings/b/audio.ogg"] = 2048
+    api.storage.objects["org/00000000-0000-0000-0000-000000000000/meetings/c/audio.ogg"] = 512
+
+    await api.client.delete(f"{PREFIX}/organizations/current", headers=headers)
+    await _backdate_request(api, organization_id, days=DELETION_RETRACTION.days + 1)
+
+    factory = create_session_factory(api.engine)
+    async with factory() as session, session.begin():
+        purged = await purge_due_organizations(session, storage=api.storage)
+
+    assert uuid.UUID(organization_id) in purged
+    assert not [key for key in api.storage.objects if key.startswith(prefix)]
+    # The neighbour's recording is untouched.
+    assert len(api.storage.objects) == 1
+
+
+async def test_an_organization_survives_a_store_that_refuses(api: Harness) -> None:
+    """The rows are the only remaining map of what belongs to this customer.
+
+    Dropping them while the audio is still in the bucket would strand it there
+    permanently, so a store that refuses postpones the whole purge.
+    """
+
+    class RefusingStore(InMemoryStorageProvider):
+        async def delete_prefix(self, *, prefix: str) -> int:
+            message = "simulated storage failure"
+            raise StorageError(message)
+
+    _, headers = await _owner(api.client)
+    organization_id = await _organization_id(api, headers)
+    await api.client.delete(f"{PREFIX}/organizations/current", headers=headers)
+    await _backdate_request(api, organization_id, days=DELETION_RETRACTION.days + 1)
+
+    factory = create_session_factory(api.engine)
+    async with factory() as session, session.begin():
+        purged = await purge_due_organizations(session, storage=RefusingStore())
+
+    assert uuid.UUID(organization_id) not in purged
+    assert (await _rows_left(api, organization_id))["organizations"] == 1
+
+
+async def test_the_prefix_of_one_organization_never_matches_another() -> None:
+    """A prefix that could match a sibling would erase somebody else's audio."""
+    first = uuid.uuid4()
+    second = uuid.uuid4()
+
+    assert not organization_prefix(first).startswith(organization_prefix(second))
+    assert organization_prefix(first).endswith("/")
+
+
+async def test_deleting_an_empty_prefix_is_refused() -> None:
+    """An empty prefix matches every object in the bucket."""
+    store = InMemoryStorageProvider()
+    store.objects["org/a/meetings/b/audio.ogg"] = 1
+
+    with pytest.raises(StorageError):
+        await store.delete_prefix(prefix="")
+
+    assert store.objects

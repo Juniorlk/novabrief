@@ -399,6 +399,12 @@ class Meeting(Base):
     audio_key: Mapped[str | None] = mapped_column(String(512))
     audio_sha256: Mapped[str | None] = mapped_column(String(64))
     audio_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    # The open multipart upload, kept only while one is open. An upload that is
+    # never completed nor aborted keeps its parts in the bucket and is billed
+    # for them for ever, and the store will not name them for us: aborting
+    # needs the identifier the store handed out at the start. Cleared on
+    # completion and on cancellation, so a non-null value means "still open".
+    audio_upload_id: Mapped[str | None] = mapped_column(String(512))
 
     is_private: Mapped[bool] = mapped_column(nullable=False, default=False)
 

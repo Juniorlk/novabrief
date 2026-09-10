@@ -35,6 +35,7 @@ from app.db import set_current_organization
 from app.email import EmailProvider, Message
 from app.logging import get_logger
 from app.models import ActorType, AuditLog, Invitation, Organization, User
+from app.storage import StorageError, StorageProvider, organization_prefix
 from app.uuid7 import uuid7
 
 logger = get_logger(__name__)
@@ -381,7 +382,7 @@ async def cancel_deletion(
 
 
 async def purge_due_organizations(
-    session: AsyncSession, *, now: datetime | None = None
+    session: AsyncSession, *, storage: StorageProvider, now: datetime | None = None
 ) -> list[uuid.UUID]:
     """EF-06: erase the organizations whose retraction window has expired.
 
@@ -396,6 +397,18 @@ async def purge_due_organizations(
     with it. That is what EF-06's acceptance criterion asks for: nothing left
     but encrypted backups, themselves purged within thirty days.
 
+    **The recordings go first, and that ordering is the whole point.** The
+    cascade erases the rows that name the audio keys, so a bucket emptied after
+    the rows would have to be emptied by guesswork — the objects would sit in
+    R2 for ever, billed, unreferenced, and impossible to attribute. This was
+    exactly the state of things: the docstring above claimed nothing was left,
+    and every recording the customer ever made stayed behind.
+
+    Deleting the audio a moment early is the safe side of that trade. The
+    retraction window has already run out; a store that refuses skips the
+    organization entirely, so its rows survive to the next sweep rather than
+    losing their only pointer.
+
     The caller passes an unscoped session and commits.
     """
     moment = now or datetime.now(UTC)
@@ -409,6 +422,15 @@ async def purge_due_organizations(
 
     purged: list[uuid.UUID] = []
     for row in due:
+        try:
+            objects = await storage.delete_prefix(prefix=organization_prefix(row.id))
+        except StorageError:
+            # Skipped, not forced through: the rows are the only remaining map
+            # of what belongs to this organization, and dropping them now would
+            # strand the audio permanently.
+            logger.warning("organization_audio_purge_failed", purged_organization_id=str(row.id))
+            continue
+
         await set_current_organization(session, row.id)
         # A Core delete, not `session.delete`: the ORM would load the members
         # and try to null their `organization_id` rather than let the database
@@ -423,6 +445,8 @@ async def purge_due_organizations(
         purged.append(row.id)
         # No audit entry: it lives in `audit_log`, which the cascade has just
         # removed. The operational record is this log line and the backups.
-        logger.info("organization_purged", purged_organization_id=str(row.id))
+        logger.info(
+            "organization_purged", purged_organization_id=str(row.id), audio_objects=objects
+        )
 
     return purged
