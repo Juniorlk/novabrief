@@ -20,8 +20,9 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
-from sqlalchemy import select
+from sqlalchemy import or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.debug_id import new_debug_id
 from app.logging import get_logger
@@ -219,24 +220,63 @@ async def declare(
     return meeting
 
 
+def _is_administrator(caller: User) -> bool:
+    """Whether this caller administers the organization."""
+    return caller.role in {Role.OWNER.value, Role.ADMIN.value}
+
+
 def _may_administer(meeting: Meeting, caller: User) -> bool:
     """Whether this caller may edit or remove this meeting.
 
     Section 17.2 gives it to the author or an administrator. An ordinary member
     reads their colleagues' meetings but does not rewrite them.
     """
-    return meeting.created_by == caller.id or caller.role in {Role.OWNER.value, Role.ADMIN.value}
+    return meeting.created_by == caller.id or _is_administrator(caller)
 
 
-async def get(session: AsyncSession, *, meeting_id: uuid.UUID) -> Meeting:
+def may_read(meeting: Meeting, caller: User) -> bool:
+    """Whether this caller may see this meeting at all (EF-22, section 17.2).
+
+    A meeting marked private is visible to its author and to administrators,
+    and to nobody else. RLS cannot express this: the rows belong to the
+    organization, and the restriction is between colleagues inside it.
+
+    This is a read gate, and it has to be applied at every door — the list, the
+    single meeting, the report, the audio link and the status socket all reach
+    the same row by different routes. Anything that returns a `Meeting` goes
+    through here or through the query filter below.
+    """
+    return not meeting.is_private or _may_administer(meeting, caller)
+
+
+def _readable(caller: User) -> ColumnElement[bool]:
+    """The same rule as :func:`may_read`, as a SQL predicate.
+
+    Written twice on purpose, and kept next to its twin so the two are read
+    together: filtering in Python after a `LIMIT` would silently return short
+    pages, and paging by a rule the database does not know is how a private
+    meeting ends up occupying a slot in somebody else's list.
+    """
+    if _is_administrator(caller):
+        return true()
+    return or_(Meeting.is_private.is_(False), Meeting.created_by == caller.id)
+
+
+async def get(session: AsyncSession, *, meeting_id: uuid.UUID, caller: User) -> Meeting:
     """One meeting, or a 404-shaped refusal.
 
     RLS confines the lookup to the caller's organization, so a meeting in
     another tenant is indistinguishable from one that does not exist — which is
     the answer we want it to give.
+
+    A private meeting belonging to a colleague answers the same way, for the
+    same reason: 403 would confirm that the meeting exists, which is precisely
+    what its author asked us not to reveal.
     """
     meeting = await session.get(Meeting, meeting_id)
     if meeting is None or meeting.status == MeetingStatus.DELETED.value:
+        raise MeetingError("MEETING_NOT_FOUND", "no such meeting")
+    if not may_read(meeting, caller):
         raise MeetingError("MEETING_NOT_FOUND", "no such meeting")
     return meeting
 
@@ -244,6 +284,7 @@ async def get(session: AsyncSession, *, meeting_id: uuid.UUID) -> Meeting:
 async def listing(
     session: AsyncSession,
     *,
+    caller: User,
     status: MeetingStatus | None = None,
     limit: int = 50,
     offset: int = 0,
@@ -252,8 +293,12 @@ async def listing(
 
     Deleted ones are excluded rather than filtered by the caller: leaving that
     to each client is how a tombstone eventually shows up in somebody's list.
+    Private ones belonging to colleagues are excluded for the same reason.
     """
-    query = select(Meeting).where(Meeting.status != MeetingStatus.DELETED.value)
+    query = select(Meeting).where(
+        Meeting.status != MeetingStatus.DELETED.value,
+        _readable(caller),
+    )
     if status is not None:
         query = query.where(Meeting.status == status.value)
     query = query.order_by(Meeting.created_at.desc()).limit(limit).offset(offset)

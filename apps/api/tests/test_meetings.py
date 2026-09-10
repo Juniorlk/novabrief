@@ -9,6 +9,7 @@ one that never existed.
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -136,6 +137,45 @@ async def _owner(client: AsyncClient) -> dict[str, str]:
     )
     assert response.status_code == 201, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+async def _colleague(
+    client: AsyncClient,
+    mailbox: RecordingProvider,
+    owner_headers: dict[str, str],
+    *,
+    role: str = "MEMBER",
+) -> dict[str, str]:
+    """A second person inside the same organization.
+
+    Needed because the interesting privacy failures are between colleagues:
+    RLS already keeps other tenants out, and a test using a second organization
+    would prove nothing about `is_private`.
+    """
+    invitee = _email()
+    invited = await client.post(
+        f"{PREFIX}/organizations/current/members",
+        json={"email": invitee, "role": role},
+        headers=owner_headers,
+    )
+    assert invited.status_code < 300, invited.text
+
+    message = mailbox.last_to(invitee)
+    assert message is not None
+    match = re.search(r"token=([A-Za-z0-9_\-]+)", message.text)
+    assert match, message.text
+
+    accepted = await client.post(
+        f"{PREFIX}/auth/invitations/accept",
+        json={"token": match.group(1), "full_name": "Colleague", "password": PASSWORD},
+    )
+    assert accepted.status_code < 300, accepted.text
+
+    signed_in = await client.post(
+        f"{PREFIX}/auth/token", json={"email": invitee, "password": PASSWORD}
+    )
+    assert signed_in.status_code == 200, signed_in.text
+    return {"Authorization": f"Bearer {signed_in.json()['access_token']}"}
 
 
 async def _declare(client: AsyncClient, headers: dict[str, str], **extra: object) -> dict[str, str]:
@@ -695,3 +735,130 @@ async def test_a_meeting_held_for_quota_is_not_dispatched(api: Harness) -> None:
 
     assert response.json()["status"] == "QUOTA_HOLD"
     assert api.dispatched == []
+
+
+# --------------------------------------------------------------------------
+# Private meetings (EF-22, section 17.2)
+#
+# The field existed, was editable and was displayed long before anything
+# enforced it, which is the worst possible order: a person marking a meeting
+# private was told it was private and it was not. These tests exist so that
+# cannot silently come back.
+# --------------------------------------------------------------------------
+
+
+async def test_a_colleague_does_not_see_a_private_meeting_in_the_listing(api: Harness) -> None:
+    owner = await _owner(api.client)
+    colleague = await _colleague(api.client, api.mailbox, owner)
+
+    private = await _declare(api.client, owner, title="Entretien annuel", is_private=True)
+    shared = await _declare(api.client, owner, title="Comite du lundi")
+
+    listed = await api.client.get(f"{PREFIX}/meetings", headers=colleague)
+
+    assert listed.status_code == 200, listed.text
+    identifiers = {row["id"] for row in listed.json()}
+    assert shared["id"] in identifiers
+    assert private["id"] not in identifiers
+
+
+async def test_a_colleague_reading_a_private_meeting_is_told_it_does_not_exist(
+    api: Harness,
+) -> None:
+    """404, not 403.
+
+    403 would confirm the meeting exists, which is exactly the fact its author
+    asked us to keep. The answer is the same one another tenant gets.
+    """
+    owner = await _owner(api.client)
+    colleague = await _colleague(api.client, api.mailbox, owner)
+    private = await _declare(api.client, owner, title="Entretien annuel", is_private=True)
+
+    response = await api.client.get(f"{PREFIX}/meetings/{private['id']}", headers=colleague)
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "MEETING_NOT_FOUND"
+
+
+async def test_a_colleague_cannot_reach_the_report_of_a_private_meeting(api: Harness) -> None:
+    """The report route carries the presigned audio link, so it is the one that matters."""
+    owner = await _owner(api.client)
+    colleague = await _colleague(api.client, api.mailbox, owner)
+    private = await _declare(api.client, owner, title="Entretien annuel", is_private=True)
+
+    response = await api.client.get(f"{PREFIX}/meetings/{private['id']}/report", headers=colleague)
+
+    assert response.status_code == 404
+
+
+async def test_a_colleague_cannot_open_a_status_socket_on_a_private_meeting(api: Harness) -> None:
+    """The ticket is the socket's only credential, so the gate has to be here."""
+    owner = await _owner(api.client)
+    colleague = await _colleague(api.client, api.mailbox, owner)
+    private = await _declare(api.client, owner, title="Entretien annuel", is_private=True)
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{private['id']}/ws-ticket", headers=colleague
+    )
+
+    assert response.status_code == 404
+
+
+async def test_an_administrator_still_sees_a_private_meeting(api: Harness) -> None:
+    """Section 17.2 gives it to the author *and* the administrators."""
+    owner = await _owner(api.client)
+    member = await _colleague(api.client, api.mailbox, owner)
+    private = await _declare(api.client, member, title="Note perso", is_private=True)
+
+    seen = await api.client.get(f"{PREFIX}/meetings/{private['id']}", headers=owner)
+    listed = await api.client.get(f"{PREFIX}/meetings", headers=owner)
+
+    assert seen.status_code == 200
+    assert private["id"] in {row["id"] for row in listed.json()}
+
+
+async def test_the_author_still_sees_their_own_private_meeting(api: Harness) -> None:
+    owner = await _owner(api.client)
+    private = await _declare(api.client, owner, title="Entretien annuel", is_private=True)
+
+    seen = await api.client.get(f"{PREFIX}/meetings/{private['id']}", headers=owner)
+    listed = await api.client.get(f"{PREFIX}/meetings", headers=owner)
+
+    assert seen.status_code == 200
+    assert private["id"] in {row["id"] for row in listed.json()}
+
+
+async def test_making_a_meeting_private_hides_it_from_a_colleague(api: Harness) -> None:
+    """The flag has to bite on an existing meeting, not only at declaration."""
+    owner = await _owner(api.client)
+    colleague = await _colleague(api.client, api.mailbox, owner)
+    meeting = await _declare(api.client, owner, title="Comite du lundi")
+
+    visible = await api.client.get(f"{PREFIX}/meetings/{meeting['id']}", headers=colleague)
+    assert visible.status_code == 200
+
+    await api.client.patch(
+        f"{PREFIX}/meetings/{meeting['id']}", json={"is_private": True}, headers=owner
+    )
+
+    hidden = await api.client.get(f"{PREFIX}/meetings/{meeting['id']}", headers=colleague)
+    assert hidden.status_code == 404
+
+
+async def test_a_private_meeting_does_not_consume_a_page_slot(api: Harness) -> None:
+    """The rule is applied in SQL, not after the LIMIT.
+
+    Filtering in Python would return a short page: the database would hand back
+    two rows, one would be dropped, and the caller would see one meeting while
+    believing there were no more.
+    """
+    owner = await _owner(api.client)
+    colleague = await _colleague(api.client, api.mailbox, owner)
+
+    await _declare(api.client, owner, title="Prive", is_private=True)
+    visible = await _declare(api.client, owner, title="Partage")
+
+    page = await api.client.get(f"{PREFIX}/meetings?limit=1", headers=colleague)
+
+    assert page.status_code == 200
+    assert [row["id"] for row in page.json()] == [visible["id"]]
