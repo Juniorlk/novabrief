@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.db import create_engine, create_session_factory
 from app.logging import configure_logging, get_logger
 from app.services.organizations import purge_due_organizations
+from app.storage import S3StorageProvider
 
 logger = get_logger(__name__)
 
@@ -35,7 +36,9 @@ async def run() -> int:
         # itself to each one before deleting. One transaction, so a failure
         # halfway leaves nothing half-erased.
         async with factory() as session, session.begin():
-            purged = await purge_due_organizations(session)
+            purged = await purge_due_organizations(
+                session, storage=S3StorageProvider(get_settings())
+            )
     finally:
         await engine.dispose()
 

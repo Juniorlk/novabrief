@@ -82,6 +82,17 @@ def audio_key(*, organization_id: uuid.UUID, meeting_id: uuid.UUID) -> str:
     return f"org/{organization_id}/meetings/{meeting_id}/audio.ogg"
 
 
+def organization_prefix(organization_id: uuid.UUID) -> str:
+    """Everything belonging to one organization.
+
+    The reason the identifier is in the path at all. When an organization is
+    erased its rows cascade away, and with them the only record of which keys
+    were hers — so the objects have to be removable by name alone, before the
+    rows go.
+    """
+    return f"org/{organization_id}/"
+
+
 def part_count_for(size_bytes: int, *, part_size_bytes: int) -> int:
     """How many parts an upload of this size needs."""
     if size_bytes <= 0:
@@ -123,6 +134,10 @@ class StorageProvider(Protocol):
 
     async def delete(self, *, key: str) -> None:
         """Remove one object. Idempotent."""
+        ...
+
+    async def delete_prefix(self, *, prefix: str) -> int:
+        """Remove every object under this prefix, and say how many. Idempotent."""
         ...
 
 
@@ -268,6 +283,49 @@ class S3StorageProvider:
             raise StorageError(_describe(exc)) from exc
         logger.info("object_deleted", key=key)
 
+    async def delete_prefix(self, *, prefix: str) -> int:
+        """Erase a whole prefix, page by page.
+
+        Listed and deleted in batches rather than one call per key: an
+        organization with a thousand meetings would otherwise be a thousand
+        round trips, and a purge that takes minutes is a purge that gets
+        interrupted half-done.
+
+        Anything the store refuses raises, so the caller can stop before
+        removing the rows that name these objects. A partial deletion that
+        reports success is the failure mode this whole function exists to
+        avoid: once the rows are gone, nothing can find the leftovers again.
+        """
+        if not prefix:
+            message = "refusing to delete an empty prefix"
+            raise StorageError(message)
+
+        removed = 0
+        try:
+            async with self._client() as client:
+                paginator = client.get_paginator("list_objects_v2")
+                async for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
+                    keys = [{"Key": item["Key"]} for item in page.get("Contents", [])]
+                    if not keys:
+                        continue
+                    # S3 caps a batch delete at 1000, and the paginator already
+                    # respects it, so a page is always a legal batch.
+                    answer = await client.delete_objects(
+                        Bucket=self._bucket, Delete={"Objects": keys, "Quiet": True}
+                    )
+                    refused = answer.get("Errors", [])
+                    if refused:
+                        message = f"object storage refused {len(refused)} deletion(s)"
+                        raise StorageError(message)
+                    removed += len(keys)
+        except ClientError as exc:
+            raise StorageError(_describe(exc)) from exc
+
+        # The prefix, not the keys: a prefix names an organization, a key names
+        # a meeting as well.
+        logger.info("prefix_deleted", objects=removed)
+        return removed
+
 
 def _is_missing(error: ClientError) -> bool:
     """Whether the store answered "no such object"."""
@@ -353,3 +411,12 @@ class InMemoryStorageProvider:
 
     async def delete(self, *, key: str) -> None:
         self.objects.pop(key, None)
+
+    async def delete_prefix(self, *, prefix: str) -> int:
+        if not prefix:
+            message = "refusing to delete an empty prefix"
+            raise StorageError(message)
+        doomed = [key for key in self.objects if key.startswith(prefix)]
+        for key in doomed:
+            del self.objects[key]
+        return len(doomed)

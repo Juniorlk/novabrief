@@ -149,7 +149,9 @@ async def _declare(client: AsyncClient, headers: dict[str, str]) -> str:
 # The only columns a test may set directly. A closed list rather than whatever
 # the caller passed: this builds a statement by hand, and the names are the one
 # part that cannot be bound as a parameter.
-_FORCEABLE = frozenset({"audio_key", "purge_at", "failed_reason", "duration_seconds"})
+_FORCEABLE = frozenset(
+    {"audio_key", "audio_upload_id", "purge_at", "failed_reason", "duration_seconds"}
+)
 
 
 async def _force_status(
@@ -553,3 +555,183 @@ async def test_another_tenant_cannot_read_the_report(api: Harness) -> None:
     response = await api.client.get(f"{PREFIX}/meetings/{meeting_id}/report", headers=second)
 
     assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------
+# ADR-06 applies to the meetings that never make it
+#
+# The sweep looked at PUBLISHED and nothing else, so a recording that failed,
+# was cancelled or was deleted stayed in the bucket for ever - the meetings
+# least likely to be looked at again, and most likely to be forgotten.
+# --------------------------------------------------------------------------
+
+
+async def test_a_failed_meeting_loses_its_audio_once_the_retention_runs_out(
+    api: Harness,
+) -> None:
+    """The retention window doubles as the retry window.
+
+    Past it a retry could not work anyway, so keeping the recording would only
+    keep the cost and the exposure.
+    """
+    organization_id, headers = await _owner(api.client)
+    meeting_id = await _declare(api.client, headers)
+    key = f"org/{organization_id}/meetings/{meeting_id}/audio.ogg"
+    api.storage.objects[key] = 1024
+    await _force_status(
+        api,
+        organization_id,
+        meeting_id,
+        MeetingStatus.FAILED.value,
+        audio_key=key,
+        purge_at=datetime.now(UTC) - timedelta(days=1),
+    )
+
+    factory = create_session_factory(api.engine)
+    async with factory() as session, session.begin():
+        await set_current_organization(session, uuid.UUID(organization_id))
+        purged = await meetings_service.purge_due_audio(session, storage=api.storage)
+
+    assert [str(identifier) for identifier in purged] == [meeting_id]
+    assert key not in api.storage.objects
+
+    # Still FAILED: nothing about the failure changed, only the recording went.
+    detail = await api.client.get(f"{PREFIX}/meetings/{meeting_id}", headers=headers)
+    assert detail.json()["status"] == "FAILED"
+
+
+async def test_a_failed_meeting_keeps_its_audio_inside_the_retention(api: Harness) -> None:
+    """Otherwise the Retry button would be a button that cannot work."""
+    organization_id, headers = await _owner(api.client)
+    meeting_id = await _declare(api.client, headers)
+    key = f"org/{organization_id}/meetings/{meeting_id}/audio.ogg"
+    api.storage.objects[key] = 1024
+    await _force_status(
+        api,
+        organization_id,
+        meeting_id,
+        MeetingStatus.FAILED.value,
+        audio_key=key,
+        purge_at=datetime.now(UTC) + timedelta(days=10),
+    )
+
+    factory = create_session_factory(api.engine)
+    async with factory() as session, session.begin():
+        await set_current_organization(session, uuid.UUID(organization_id))
+        purged = await meetings_service.purge_due_audio(session, storage=api.storage)
+
+    assert purged == []
+    assert key in api.storage.objects
+
+
+async def test_a_cancelled_meeting_loses_its_audio_without_waiting(api: Harness) -> None:
+    """Nothing can be done with it, so there is nothing to wait for."""
+    organization_id, headers = await _owner(api.client)
+    meeting_id = await _declare(api.client, headers)
+    key = f"org/{organization_id}/meetings/{meeting_id}/audio.ogg"
+    api.storage.objects[key] = 1024
+    await _force_status(
+        api, organization_id, meeting_id, MeetingStatus.CANCELLED.value, audio_key=key
+    )
+
+    factory = create_session_factory(api.engine)
+    async with factory() as session, session.begin():
+        await set_current_organization(session, uuid.UUID(organization_id))
+        purged = await meetings_service.purge_due_audio(session, storage=api.storage)
+
+    assert [str(identifier) for identifier in purged] == [meeting_id]
+    assert key not in api.storage.objects
+
+
+async def test_a_deleted_meeting_loses_its_audio(api: Harness) -> None:
+    """The customer asked for it to be gone, which is the strongest case there is."""
+    organization_id, headers = await _owner(api.client)
+    meeting_id = await _declare(api.client, headers)
+    key = f"org/{organization_id}/meetings/{meeting_id}/audio.ogg"
+    api.storage.objects[key] = 1024
+    await _force_status(
+        api, organization_id, meeting_id, MeetingStatus.DELETED.value, audio_key=key
+    )
+
+    factory = create_session_factory(api.engine)
+    async with factory() as session, session.begin():
+        await set_current_organization(session, uuid.UUID(organization_id))
+        purged = await meetings_service.purge_due_audio(session, storage=api.storage)
+
+    assert [str(identifier) for identifier in purged] == [meeting_id]
+    assert key not in api.storage.objects
+
+
+async def test_the_sweep_aborts_an_upload_nobody_ever_finished(api: Harness) -> None:
+    """Parts with no object.
+
+    A recording abandoned between finalize-local and finalize has no object to
+    delete - only parts, which the store bills for and which nothing lists back
+    to us. This is the last net under the best-effort abort in cancel.
+    """
+    organization_id, headers = await _owner(api.client)
+    meeting_id = await _declare(api.client, headers)
+    key = f"org/{organization_id}/meetings/{meeting_id}/audio.ogg"
+    upload = await api.storage.start_multipart(key=key, size_bytes=8 * 1024 * 1024)
+    assert upload.upload_id in api.storage.uploads
+
+    await _force_status(
+        api,
+        organization_id,
+        meeting_id,
+        MeetingStatus.CANCELLED.value,
+        audio_key=key,
+        audio_upload_id=upload.upload_id,
+    )
+
+    factory = create_session_factory(api.engine)
+    async with factory() as session, session.begin():
+        await set_current_organization(session, uuid.UUID(organization_id))
+        purged = await meetings_service.purge_due_audio(session, storage=api.storage)
+
+    assert [str(identifier) for identifier in purged] == [meeting_id]
+    assert upload.upload_id not in api.storage.uploads
+
+
+async def test_the_sweep_ignores_meetings_that_hold_nothing(api: Harness) -> None:
+    """A cancelled meeting with no recording is not work."""
+    organization_id, headers = await _owner(api.client)
+    meeting_id = await _declare(api.client, headers)
+    await _force_status(api, organization_id, meeting_id, MeetingStatus.CANCELLED.value)
+
+    factory = create_session_factory(api.engine)
+    async with factory() as session, session.begin():
+        await set_current_organization(session, uuid.UUID(organization_id))
+        purged = await meetings_service.purge_due_audio(session, storage=api.storage)
+
+    assert purged == []
+
+
+async def test_cancelling_a_recording_aborts_its_upload(api: Harness) -> None:
+    """cancel took a storage provider for a long time and never used it.
+
+    An abandoned multipart upload is billed until somebody aborts it, and the
+    store will not name the open ones for us later.
+    """
+    _, headers = await _owner(api.client)
+    meeting_id = await _declare(api.client, headers)
+
+    slots = await api.client.post(
+        f"{PREFIX}/meetings/{meeting_id}/finalize-local",
+        json={
+            "size_bytes": 8 * 1024 * 1024,
+            "sha256": "0" * 64,
+            "duration_seconds": 600,
+            "paused_seconds": 0,
+        },
+        headers=headers,
+    )
+    assert slots.status_code == 200, slots.text
+    upload_id = slots.json()["upload_id"]
+    assert upload_id in api.storage.uploads
+
+    cancelled = await api.client.post(f"{PREFIX}/meetings/{meeting_id}/cancel", headers=headers)
+
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "CANCELLED"
+    assert upload_id not in api.storage.uploads, "the parts are still open in the store"

@@ -44,7 +44,7 @@ def purge_organizations(self: object) -> int:
     """
 
     async def work(session: AsyncSession) -> int:
-        purged = await purge_due_organizations(session)
+        purged = await purge_due_organizations(session, storage=S3StorageProvider(get_settings()))
         return len(purged)
 
     try:
