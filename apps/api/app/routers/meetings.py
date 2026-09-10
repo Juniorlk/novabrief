@@ -147,9 +147,15 @@ async def index(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[MeetingSummary]:
-    """Newest first. RLS scopes this; no tenant filter is written here."""
+    """Newest first.
+
+    RLS scopes this to the organization; no tenant filter is written here. The
+    caller is passed for the one thing RLS cannot express — a colleague's
+    private meeting is inside the same tenant and still must not appear.
+    """
     rows = await meetings.listing(
         session,
+        caller=caller.user,
         status=MeetingStatus(meeting_status) if meeting_status else None,
         limit=limit,
         offset=offset,
@@ -171,7 +177,7 @@ async def show(
     confirming that an identifier exists somewhere else.
     """
     try:
-        meeting = await meetings.get(session, meeting_id=meeting_id)
+        meeting = await meetings.get(session, meeting_id=meeting_id, caller=caller.user)
     except meetings.MeetingError as error:
         raise _as_problem(error) from error
     return meeting_summary(meeting)
@@ -190,7 +196,7 @@ async def edit(
 ) -> MeetingSummary:
     """Author or administrator. Title and privacy only."""
     try:
-        meeting = await meetings.get(session, meeting_id=meeting_id)
+        meeting = await meetings.get(session, meeting_id=meeting_id, caller=caller.user)
         updated = await meetings.update(
             session,
             meeting=meeting,
@@ -214,7 +220,7 @@ async def destroy(meeting_id: uuid.UUID, caller: CurrentCaller, session: ScopedS
     to point at (section 19.2).
     """
     try:
-        meeting = await meetings.get(session, meeting_id=meeting_id)
+        meeting = await meetings.get(session, meeting_id=meeting_id, caller=caller.user)
         await meetings.remove(session, meeting=meeting, caller=caller.user)
     except meetings.MeetingError as error:
         raise _as_problem(error) from error
@@ -240,7 +246,7 @@ async def finalize_local(
     becoming a file proxy for hundreds of megabytes.
     """
     try:
-        meeting = await meetings.get(session, meeting_id=meeting_id)
+        meeting = await meetings.get(session, meeting_id=meeting_id, caller=caller.user)
         upload = await meetings.start_upload(
             session,
             storage=storage,
@@ -283,7 +289,7 @@ async def finalize(
     into a confident, incomplete report.
     """
     try:
-        meeting = await meetings.get(session, meeting_id=meeting_id)
+        meeting = await meetings.get(session, meeting_id=meeting_id, caller=caller.user)
         queued = await meetings.finalize(
             session,
             storage=storage,
@@ -313,7 +319,7 @@ async def cancel(
 ) -> MeetingSummary:
     """The author changed their mind, or the recording was a mistake."""
     try:
-        meeting = await meetings.get(session, meeting_id=meeting_id)
+        meeting = await meetings.get(session, meeting_id=meeting_id, caller=caller.user)
         cancelled = await meetings.abandon(
             session, storage=storage, meeting=meeting, caller=caller.user
         )
@@ -339,7 +345,7 @@ async def detail(
     has been purged (ADR-06) — a null there is a normal answer, not an error.
     """
     try:
-        meeting = await meetings.get(session, meeting_id=meeting_id)
+        meeting = await meetings.get(session, meeting_id=meeting_id, caller=caller.user)
     except meetings.MeetingError as error:
         raise _as_problem(error) from error
 
@@ -402,7 +408,7 @@ async def retry(
 ) -> MeetingSummary:
     """EF-45's Retry button. Author or administrator, and only from FAILED."""
     try:
-        meeting = await meetings.get(session, meeting_id=meeting_id)
+        meeting = await meetings.get(session, meeting_id=meeting_id, caller=caller.user)
         requeued = await meetings.retry(session, meeting=meeting, caller=caller.user)
     except meetings.MeetingError as error:
         raise _as_problem(error) from error
@@ -429,7 +435,7 @@ async def issue_ticket(
     for sixty seconds: watching this meeting's status.
     """
     try:
-        meeting = await meetings.get(session, meeting_id=meeting_id)
+        meeting = await meetings.get(session, meeting_id=meeting_id, caller=caller.user)
     except meetings.MeetingError as error:
         raise _as_problem(error) from error
 
