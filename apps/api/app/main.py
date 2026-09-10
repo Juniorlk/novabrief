@@ -10,10 +10,14 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import sentry_sdk
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from redis.asyncio import Redis
 
 from app.config import Settings, get_settings
@@ -128,6 +132,47 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("api_stopped")
 
 
+# Vendored into the image by infra/api.Dockerfile, absent on a laptop.
+_STATIC_DIR = Path("/srv/static")
+_SWAGGER_CDN = "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14"
+
+
+def _install_docs(app: FastAPI) -> None:
+    """Serve the interactive documentation from our own origin when we can.
+
+    FastAPI's default page pulls Swagger from a public CDN. That page sits on
+    the same host as the authentication API and is where a person pastes an
+    access token, so a third-party script there runs in the worst possible
+    place — and it is why the Content-Security-Policy of `infra/Caddyfile` was
+    blocking it, correctly, leaving a blank page.
+
+    In the image the files are vendored and checksummed, so the policy can stay
+    at 'self'. On a laptop they are absent and the CDN is used instead: there
+    is no production traffic and no reverse proxy imposing a policy, so the
+    trade does not apply.
+    """
+    vendored = _STATIC_DIR.is_dir()
+    if vendored:
+        app.mount(f"{API_PREFIX}/static", StaticFiles(directory=_STATIC_DIR), name="static")
+        js_url = f"{API_PREFIX}/static/swagger-ui-bundle.js"
+        css_url = f"{API_PREFIX}/static/swagger-ui.css"
+    else:
+        logger.info("swagger_assets_from_cdn", reason="no vendored copy in /srv/static")
+        js_url = f"{_SWAGGER_CDN}/swagger-ui-bundle.js"
+        css_url = f"{_SWAGGER_CDN}/swagger-ui.css"
+
+    @app.get(f"{API_PREFIX}/docs", include_in_schema=False)
+    async def swagger_ui() -> HTMLResponse:
+        return get_swagger_ui_html(
+            openapi_url=f"{API_PREFIX}/openapi.json",
+            title="NovaBrief API",
+            swagger_js_url=js_url,
+            swagger_css_url=css_url,
+            # The default favicon is another third-party fetch, for an icon.
+            swagger_favicon_url=f"{API_PREFIX}/static/favicon.png" if vendored else "/favicon.ico",
+        )
+
+
 def create_app(
     *,
     limiter: RateLimiter | None = None,
@@ -154,10 +199,12 @@ def create_app(
         version=VERSION,
         summary="Meeting capture, transcription and structured reports.",
         openapi_url=f"{API_PREFIX}/openapi.json",
-        docs_url=f"{API_PREFIX}/docs",
+        # Replaced below by a page that serves Swagger from this origin.
+        docs_url=None,
         redoc_url=None,
         lifespan=lifespan,
     )
+    _install_docs(app)
 
     # Middleware is applied bottom-up, so this reads in reverse: rate limiting
     # runs first, then the request context. Refusing an over-limit request
