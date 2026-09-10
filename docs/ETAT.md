@@ -5,7 +5,8 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-10** (lot L2 terminé et **déployé en production**).
+> Dernière mise à jour : **2026-09-10** (lot L2 déployé, puis **audit de
+> cohérence** : sept défauts trouvés et corrigés, PR #22 à #24).
 
 ---
 
@@ -21,6 +22,7 @@
 | Lot L1 — comptes & organisations | **terminé** (EF-01 a EF-06) | PR #2, #4, #6, #7, #8, #9, #10 |
 | Lot L2 — réunions & pipeline | **terminé** (L2.1 à L2.8) | `docs/tasks/05_L2_reunions_pipeline.md` ; PR #11 à #17 |
 | Lots L3 à L7 | non commencés | `docs/tasks/04_APRES_LES_POC_lots_MVP.md` |
+| Audit de cohérence L1+L2 | **fait** | §2 bis ci-dessous ; PR #22, #23, #24 |
 
 ### Lot L1 en détail
 
@@ -76,6 +78,46 @@ comptes rendus, pas l'audio qui vit chez R2. C'est le prix assumé du choix
 
 ---
 
+## 2 bis. L'audit de cohérence du 2026-09-10
+
+Demandé par Novafrik après le déploiement : *« assure-toi que les
+fonctionnalités sont okay d'un point de vue technique et aussi logique »*.
+
+Les 313 tests passaient, `ruff` et `mypy --strict` étaient propres, et
+**sept défauts réels** dormaient dessous. Aucun n'était visible en relecture :
+dans chaque cas le code *disait* faire la bonne chose.
+
+| | Défaut | Ce que ça coûtait |
+|---|---|---|
+| A | `is_private` appliqué nulle part | tout membre lisait les réunions privées de ses collègues, audio compris |
+| B | `retry` retranscrivait puis violait `transcripts_meeting_unique` | le bouton Réessayer échouait à coup sûr, après trois transcriptions payées |
+| C | la tâche partait **avant le commit** | le worker lisait l'ancien état, refusait, la réunion restait en `QUEUED` à vie |
+| D | supprimer une organisation gardait ses audios | EF-06 promet l'effacement définitif ; les clés n'étaient plus référencées nulle part |
+| E | `cancel` recevait un `storage` inutilisé | upload multipart facturé indéfiniment |
+| F | la purge ne visait que `PUBLISHED` | un enregistrement `FAILED`, `CANCELLED` ou supprimé restait pour toujours |
+| G | quota dépassé à la publication | réunion figée en `ANALYZING`, LLM repayé, hors d'atteinte du bouton Réessayer |
+
+**Le motif commun** : B, C et G étaient déjà décrits — et évités — dans les
+commentaires de `app/tasks/pipeline.py`. C'est l'API et le service qui ne
+suivaient pas la règle que les workers énoncent. Un commentaire juste ne
+protège que le fichier où il est écrit.
+
+Deuxième motif, pour D, E et F : une docstring qui promet un effacement, et
+aucun code dessous. Rien n'échouait, rien n'était journalisé, et la facture
+montait.
+
+**Ce qu'il faut retenir pour la suite** : la suite de tests ne prouvait rien de
+tout ça parce qu'elle vérifiait *ce que le code fait*, jamais *ce que le code
+promet*. Les tests ajoutés sont écrits dans l'autre sens — le plus utile ne
+demande pas « la tâche a-t-elle été postée » mais **« qu'aurait vu un worker
+démarrant à cet instant »**, et il répond `UPLOADING` dès qu'on retire le
+correctif.
+
+**Vérifié** : 339 tests, dont chaque correctif prouvé en retirant le correctif
+et en constatant l'échec.
+
+---
+
 ## 3. Ce qui bloque, et sur qui
 
 | Bloqué | Ce qu'il faut | Pour |
@@ -83,6 +125,15 @@ comptes rendus, pas l'audio qui vit chez R2. C'est le prix assumé du choix
 | Second fournisseur de transcription | une **vraie clé Deepgram** : celle fournie le 2026-09-08 était en fait la clé AssemblyAI (Deepgram la rejette en 401). AssemblyAI et OpenAI sont vérifiées et en place. | L2.5 |
 | Stockage des audios en production | un **Account API token** R2 (Object Read & Write, portée `novabrief-audio`) — MinIO tient le rôle en local et les tests passent contre lui | déploiement |
 | Paiement | clés sandbox Flutterwave | L5 |
+
+**Question ouverte (audit du 2026-09-10)** : faut-il **exiger un email vérifié**
+avant de laisser un compte enregistrer une réunion ? Aujourd'hui non : la
+vérification existe, elle est envoyée, elle fonctionne, et elle n'ouvre aucune
+porte. EF-02 ne demande explicitement que le lien à usage unique, donc rien
+n'est en défaut — mais c'est un arbitrage produit, pas un oubli technique, et
+il revient à Novafrik. Bloquer protège d'une inscription à une adresse qu'on ne
+possède pas ; ne pas bloquer évite d'arrêter net un client pilote dont l'email
+est tombé en spam.
 
 **Débloqué le 2026-09-09** : domaine `novabrief.cloud` (DNS chez OVH,
 `novabrief.cloud`, `www`, `api` et `app` pointent sur le VPS), domaine vérifié
@@ -181,6 +232,32 @@ service, qui ne voit que ce que le client a réellement envoyé. Un `null`
 explicite n'est accepté que sur `legal_id`, seule colonne nullable ; ailleurs
 c'est un 422. Sans ça, un formulaire web qui renvoie tout son état écraserait
 avec des valeurs vides ce que l'utilisateur n'a pas touché.
+
+### Une tâche postée avant le commit disparaît sans bruit
+
+Le message part vers Redis immédiatement ; un worker peut le consommer en
+quelques millisecondes et lire une ligne qui porte encore l'**ancien** état. Il
+fait alors la bonne chose — il refuse d'agir sur une réunion qui n'est pas là
+où il l'attend — et **plus rien ne traite cette réunion**. Aucune exception,
+aucun journal d'erreur, aucun réessai, et l'API a répondu 202.
+
+Les envois passent par `deps.after_commit`. Le test ne vérifie pas qu'une tâche
+a été postée : il lit la ligne **depuis une autre connexion, dans un autre
+fil**, au moment exact de l'envoi.
+
+### Un `.env` de développement peut contenir de vraies clés de production
+
+Un test de la tâche de purge appelait `delete_prefix` sur le **vrai bucket
+Cloudflare**, parce que `.env` contenait les clés R2 réelles. Il passait en
+local et échouait en CI — l'inverse du signal utile.
+
+Rien n'a été perdu (les préfixes appartenaient à des organisations inventées),
+mais ce mode de panne **n'a aucun témoin** : un préfixe qui aurait
+correspondu serait parti, et rien n'aurait permis de s'en apercevoir.
+
+Le stockage vient donc de `maintenance.storage_provider()`, qu'un test
+remplace. Corollaire : la suite se vérifie en **déplaçant `.env`**, ce qui est
+la seule configuration fidèle à la CI.
 
 ### `session.delete()` detache les enfants au lieu de les supprimer
 
@@ -304,6 +381,15 @@ cd apps/api && DATABASE_ADMIN_URL=... python -m alembic upgrade head
 Un test qui *skippe* n'est pas un test qui passe : la CI échoue si la suite
 base de données rapporte un skip.
 
+**Et déplace `.env` le temps de la vérification.** La CI n'en a pas ; une
+machine de développement en a un qui contient de vraies clés fournisseurs. Un
+test de purge est ainsi passé en local **en effaçant un préfixe du vrai bucket
+Cloudflare**, et n'a échoué qu'en CI — l'inverse du signal utile.
+
+```bash
+mv .env .env.hidden && python -m pytest -q ; mv .env.hidden .env
+```
+
 ---
 
 ## 7. Dette assumée
@@ -328,5 +414,19 @@ base de données rapporte un skip.
 - **Les emails transactionnels sont en français codé en dur.** `CLAUDE.md` §6
   demande que toute chaîne visible passe par i18n, et `users.locale` existe
   déjà. À reprendre quand le lot L4 apportera l'i18n côté serveur.
+- **Une réunion en `QUOTA_HOLD` n'a aucune sortie.** Seul le webhook de
+  paiement du lot L5 peut la relancer, et il n'existe pas. Sans effet
+  aujourd'hui — aucun quota n'est assigné avant L5, donc rien n'y entre — mais
+  ça devient un blocage le jour où les plans arrivent.
+- **La vérification d'email n'est exigée nulle part.** Un compte non vérifié
+  utilise toute l'API. EF-02 ne demande explicitement que le lien à usage
+  unique, donc ce n'est pas un manquement au cahier des charges — c'est un
+  arbitrage produit à trancher (question ouverte, §3).
+- **L'URL présignée remise au fournisseur de transcription est celle qui a
+  servi à vérifier l'empreinte.** Sur un enregistrement de deux heures, la
+  vérification peut consommer une bonne part des 15 minutes de validité. Une
+  seconde signature juste avant l'appel coûterait presque rien.
+- **Aucun outil ne retrouve un objet orphelin dans R2.** Si un préfixe survivait
+  à une purge d'organisation, plus rien en base ne le nomme.
 - `nb-testsignal` et `measure_drift.py` restent des squelettes : la dérive est
   mesurée par horodatage QPC, ce qui s'écarte du brief du POC #1.
