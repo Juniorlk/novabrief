@@ -18,10 +18,22 @@ from app.db import set_current_organization
 from app.logging import get_logger
 from app.services.meetings import purge_due_audio
 from app.services.organizations import purge_due_organizations
-from app.storage import S3StorageProvider
+from app.storage import S3StorageProvider, StorageProvider
 from app.worker import celery_app, run_async, task_failure
 
 logger = get_logger(__name__)
+
+
+def storage_provider() -> StorageProvider:
+    """The object store these purges write to.
+
+    A function rather than a constructor call inlined at each site, so a test
+    can replace it. These two tasks are the only scheduled jobs that destroy
+    customer data, and a test run that picked up real R2 credentials from a
+    developer's .env would destroy it in the real bucket - a failure that
+    leaves nothing behind to notice.
+    """
+    return S3StorageProvider(get_settings())
 
 
 @celery_app.task(
@@ -44,7 +56,7 @@ def purge_organizations(self: object) -> int:
     """
 
     async def work(session: AsyncSession) -> int:
-        purged = await purge_due_organizations(session, storage=S3StorageProvider(get_settings()))
+        purged = await purge_due_organizations(session, storage=storage_provider())
         return len(purged)
 
     try:
@@ -79,8 +91,7 @@ def purge_audio(self: object) -> int:
     """
 
     async def work(session: AsyncSession) -> int:
-        settings = get_settings()
-        storage = S3StorageProvider(settings)
+        storage = storage_provider()
 
         organizations = (
             await session.execute(

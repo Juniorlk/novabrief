@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
+from app.storage import InMemoryStorageProvider
 from app.tasks import maintenance
 from app.worker import build_celery, run_async
 
@@ -152,6 +153,10 @@ async def test_run_async_opens_and_closes_its_own_transaction(
     from app.config import get_settings
 
     get_settings.cache_clear()
+    # Never the real store. These tasks delete an organization's recordings by
+    # prefix, and a .env holding production R2 credentials would have them do
+    # so for real - silently, with nothing left afterwards to notice.
+    monkeypatch.setattr(maintenance, "storage_provider", InMemoryStorageProvider)
 
     engine = create_async_engine(APP_DATABASE_URL, poolclass=NullPool)
     try:
@@ -186,6 +191,10 @@ async def test_the_purge_task_erases_what_is_due(monkeypatch: pytest.MonkeyPatch
     from app.config import get_settings
 
     get_settings.cache_clear()
+    # Never the real store. These tasks delete an organization's recordings by
+    # prefix, and a .env holding production R2 credentials would have them do
+    # so for real - silently, with nothing left afterwards to notice.
+    monkeypatch.setattr(maintenance, "storage_provider", InMemoryStorageProvider)
 
     admin_url = os.environ.get(
         "TEST_DATABASE_ADMIN_URL",
@@ -236,6 +245,10 @@ async def test_the_purge_task_spares_a_live_organization(
     from app.config import get_settings
 
     get_settings.cache_clear()
+    # Never the real store. These tasks delete an organization's recordings by
+    # prefix, and a .env holding production R2 credentials would have them do
+    # so for real - silently, with nothing left afterwards to notice.
+    monkeypatch.setattr(maintenance, "storage_provider", InMemoryStorageProvider)
 
     admin_url = os.environ.get(
         "TEST_DATABASE_ADMIN_URL",
