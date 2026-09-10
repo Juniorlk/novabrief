@@ -16,7 +16,7 @@ accidental.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Annotated
 
@@ -27,8 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import Settings, get_settings
 from app.db import set_current_organization
 from app.errors import ProblemError
+from app.logging import get_logger
 from app.models import Organization, Role, User
 from app.security import AccessClaims, TokenError, decode_access_token
+
+logger = get_logger(__name__)
 
 
 def _session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
@@ -95,6 +98,25 @@ def access_claims(
         ) from exc
 
 
+def after_commit(request: Request, callback: Callable[[], None]) -> None:
+    """Do this once the request's transaction has actually committed.
+
+    Queueing a background task from inside an open transaction is a race the
+    workers already guard against and the API did not: the message reaches
+    Redis immediately, a worker can pick it up in single-digit milliseconds,
+    and it reads a row that still holds the *previous* state. The worker then
+    does the right thing — it declines to act on a meeting that is not where it
+    expects — and the meeting is never processed at all. No error anywhere; it
+    simply sits in QUEUED for ever.
+
+    So the dispatch waits here, and the session dependency below runs it after
+    the commit.
+    """
+    pending: list[Callable[[], None]] = getattr(request.state, "after_commit", [])
+    pending.append(callback)
+    request.state.after_commit = pending
+
+
 async def scoped_session(
     request: Request,
     claims: Annotated[AccessClaims, Depends(access_claims)],
@@ -104,11 +126,28 @@ async def scoped_session(
     The scope comes from the token's signed `org` claim, never from a path or
     body parameter: anything the client can choose per request would let a
     caller ask for another tenant's rows.
+
+    Whatever :func:`after_commit` queued runs once this transaction has
+    committed, and only then. If the handler raised, the `async with` rolls
+    back and re-raises before reaching that line, so nothing queued by a failed
+    request is ever dispatched.
     """
     factory = _session_factory(request)
+    request.state.after_commit = []
     async with factory() as session, session.begin():
         await set_current_organization(session, claims.organization_id)
         yield session
+
+    for callback in request.state.after_commit:
+        try:
+            callback()
+        except Exception:
+            # The response has already been decided and the database already
+            # says the work is queued, so failing the request now would be a
+            # lie in the other direction. Loud in the logs instead: a meeting
+            # whose message never reached the broker stays in QUEUED and needs
+            # a human or the retry button.
+            logger.error("after_commit_failed", exc_info=True)
 
 
 @dataclass(frozen=True)

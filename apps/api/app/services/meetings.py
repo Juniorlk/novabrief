@@ -18,7 +18,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from sqlalchemy import and_, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,7 +26,16 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from app.debug_id import new_debug_id
 from app.logging import get_logger
-from app.models import ActorType, AuditLog, Meeting, MeetingStatus, Organization, Role, User
+from app.models import (
+    ActorType,
+    AuditLog,
+    Meeting,
+    MeetingStatus,
+    Organization,
+    Role,
+    Transcript,
+    User,
+)
 from app.services import usage
 from app.storage import MultipartUpload, StorageError, StorageProvider, audio_key
 from app.uuid7 import uuid7
@@ -34,15 +43,25 @@ from app.uuid7 import uuid7
 logger = get_logger(__name__)
 
 
+# Which half of the pipeline a meeting needs. Transcription is the expensive
+# one, and the whole reason the two are separate tasks.
+Stage = Literal["transcribe", "analyse"]
+
+
 class Dispatch(Protocol):
-    """Hands a queued meeting to the workers.
+    """Hands a meeting to the workers, at a named stage.
 
     A callable rather than an import of the Celery task: the service must not
     depend on the queue, so tests can watch what would have been dispatched
     without a broker anywhere in sight.
+
+    The stage is part of the call because a retry does not always start from
+    the beginning - see :func:`retry`.
     """
 
-    def __call__(self, *, organization_id: uuid.UUID, meeting_id: uuid.UUID) -> None: ...
+    def __call__(
+        self, *, organization_id: uuid.UUID, meeting_id: uuid.UUID, stage: Stage
+    ) -> None: ...
 
 
 _S = MeetingStatus
@@ -65,8 +84,11 @@ TRANSITIONS: Mapping[MeetingStatus, frozenset[MeetingStatus]] = {
     # Only here is the quota decremented and the cost recorded (section 11).
     _S.PUBLISHED: frozenset({_S.AUDIO_PURGED, _S.DELETED}),
     _S.AUDIO_PURGED: frozenset({_S.DELETED}),
-    # EF-45 gives a "Retry" button, which sends the meeting back to the queue.
-    _S.FAILED: frozenset({_S.QUEUED, _S.DELETED}),
+    # EF-45 gives a "Retry" button. Back to the queue when there is nothing to
+    # reuse, straight to analysis when the transcript survived - re-running
+    # transcription would pay the supplier a second time for bytes we already
+    # have (see `retry`).
+    _S.FAILED: frozenset({_S.QUEUED, _S.ANALYZING, _S.DELETED}),
     # Terminal.
     _S.CANCELLED: frozenset(),
     _S.DELETED: frozenset(),
@@ -423,7 +445,6 @@ async def finalize(
     upload_id: str,
     parts: Sequence[tuple[int, str]],
     client_version: str | None = None,
-    dispatch: Dispatch | None = None,
 ) -> Meeting:
     """`finalize`: assemble the parts and queue the work.
 
@@ -440,6 +461,12 @@ async def finalize(
 
     Answers by advancing to QUEUED, or to QUOTA_HOLD when the organization has
     no seconds left; the caller replies 202 either way (EF-40).
+
+    **Nothing is dispatched here.** The transaction is still open, and a worker
+    that picks the message up before it commits reads the previous state and
+    correctly declines to act - leaving the meeting in QUEUED with nobody
+    coming for it. The router queues the dispatch for after the commit; the
+    status this returns says whether there is anything to queue.
     """
     if meeting.created_by != caller.id:
         raise MeetingError("FORBIDDEN", "only the author may finalize a meeting")
@@ -495,11 +522,8 @@ async def finalize(
         metadata=entry or None,
     )
 
-    if destination is MeetingStatus.QUEUED and dispatch is not None:
-        # Handed off, not run here: EF-40 promises a 202 in under 500 ms, and
-        # the user never waits on a request. A meeting held for quota is not
-        # dispatched — the webhook that lifts the hold will do it (section 11).
-        dispatch(organization_id=meeting.organization_id, meeting_id=meeting.id)
+    # A meeting held for quota is never dispatched - the webhook that lifts the
+    # hold will do it (section 11).
     logger.info("meeting_finalized", meeting_id=str(meeting.id), size_bytes=stored.size_bytes)
     return meeting
 
@@ -538,21 +562,53 @@ async def abandon(
 # --------------------------------------------------------------------------
 
 
-async def retry(session: AsyncSession, *, meeting: Meeting, caller: User) -> Meeting:
-    """EF-45: put a failed meeting back in the queue.
+async def retry(session: AsyncSession, *, meeting: Meeting, caller: User) -> tuple[Meeting, Stage]:
+    """EF-45: put a failed meeting back to work, at the stage that failed.
 
     Only from FAILED. Re-running a meeting that succeeded would pay for a
     second transcription and overwrite a report somebody may already have read
     and corrected.
+
+    **Which stage matters, and for a long time this did not ask.** Every retry
+    went to QUEUED, so a meeting that failed during analysis - the common case,
+    since the LLM is the flakier half - was transcribed again from scratch. It
+    then hit `transcripts_meeting_unique` and could not have succeeded: the
+    Retry button was guaranteed to fail on the most likely failure, after
+    paying the supplier a second time. Celery's two automatic retries made that
+    three transcriptions per click.
+
+    So: a transcript that survived is reused, and the meeting goes straight
+    back to analysis. That is what makes the two-task split in `app.tasks`
+    worth having; the docstring there described this behaviour before anything
+    implemented it.
+
+    Answers with the stage, because the caller has to dispatch the matching
+    task and the status alone does not say it unambiguously.
     """
     if not _may_administer(meeting, caller):
         raise MeetingError("FORBIDDEN", "only the author or an administrator may retry a meeting")
     if meeting.status != MeetingStatus.FAILED.value:
         raise MeetingError("NOT_FAILED", "only a failed meeting can be retried")
 
+    transcribed = await session.scalar(
+        select(Transcript.id).where(Transcript.meeting_id == meeting.id)
+    )
+    if transcribed is not None:
+        stage: Stage = "analyse"
+        destination = MeetingStatus.ANALYZING
+    elif meeting.audio_key is None:
+        # The retention sweep has taken the recording. Nothing can be rebuilt
+        # from nothing, and sending it round the pipeline would fail on
+        # NO_AUDIO several minutes later instead of here.
+        raise MeetingError("AUDIO_GONE", "this meeting's recording has passed its retention")
+    else:
+        stage = "transcribe"
+        destination = MeetingStatus.QUEUED
+
     # Cleared so the next failure is not confused with the last one.
     meeting.failed_reason = None
-    return await advance(session, meeting=meeting, to=MeetingStatus.QUEUED, actor=caller)
+    await advance(session, meeting=meeting, to=destination, actor=caller)
+    return meeting, stage
 
 
 def retention_deadline(organization: Organization, *, now: datetime | None = None) -> datetime:

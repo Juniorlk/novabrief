@@ -20,7 +20,7 @@ import pytest_asyncio
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text, update
+from sqlalchemy import insert, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -28,11 +28,12 @@ from app.config import get_settings
 from app.db import create_session_factory, set_current_organization
 from app.email import RecordingProvider
 from app.main import create_app
-from app.models import Meeting, MeetingStatus, Organization
+from app.models import Meeting, MeetingStatus, Organization, Transcript
 from app.ratelimit import InMemoryRateLimiter
 from app.services import meetings as meetings_service
 from app.storage import InMemoryStorageProvider
 from app.tickets import InMemoryTicketStore, TicketClaims, new_ticket
+from app.uuid7 import uuid7
 
 pytestmark = pytest.mark.asyncio
 
@@ -51,7 +52,7 @@ class Harness:
     engine: AsyncEngine
     storage: InMemoryStorageProvider
     tickets: InMemoryTicketStore
-    dispatched: list[tuple[uuid.UUID, uuid.UUID]]
+    dispatched: list[tuple[uuid.UUID, uuid.UUID, str]]
 
 
 @pytest_asyncio.fixture
@@ -87,10 +88,10 @@ async def api(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Harness]:
 
     storage = InMemoryStorageProvider()
     tickets = InMemoryTicketStore()
-    dispatched: list[tuple[uuid.UUID, uuid.UUID]] = []
+    dispatched: list[tuple[uuid.UUID, uuid.UUID, str]] = []
 
-    def record(*, organization_id: uuid.UUID, meeting_id: uuid.UUID) -> None:
-        dispatched.append((organization_id, meeting_id))
+    def record(*, organization_id: uuid.UUID, meeting_id: uuid.UUID, stage: str) -> None:
+        dispatched.append((organization_id, meeting_id, stage))
 
     app = create_app(
         limiter=InMemoryRateLimiter(),
@@ -172,6 +173,26 @@ async def _force_status(
             update(Meeting)
             .where(Meeting.id == uuid.UUID(meeting_id))
             .values(status=status, **columns)
+        )
+        await connection.commit()
+
+
+async def _write_transcript(api: Harness, organization_id: str, meeting_id: str) -> None:
+    """Give a meeting the transcript a mid-pipeline failure would have left."""
+    async with api.engine.connect() as connection:
+        await connection.execute(
+            text("SELECT set_config('app.current_org_id', :org, false)"),
+            {"org": organization_id},
+        )
+        await connection.execute(
+            insert(Transcript).values(
+                id=uuid7(),
+                organization_id=uuid.UUID(organization_id),
+                meeting_id=uuid.UUID(meeting_id),
+                language="fr",
+                raw_text="bonjour",
+                provider_metadata={"provider": "test"},
+            )
         )
         await connection.commit()
 
@@ -342,10 +363,16 @@ async def test_a_failed_meeting_says_why_on_the_socket(api: Harness) -> None:
 
 
 async def test_a_failed_meeting_can_be_retried(api: Harness) -> None:
+    """A meeting that failed before it was ever transcribed starts over."""
     organization_id, headers = await _owner(api.client)
     meeting_id = await _declare(api.client, headers)
     await _force_status(
-        api, organization_id, meeting_id, MeetingStatus.FAILED.value, failed_reason="LLM_REFUSED"
+        api,
+        organization_id,
+        meeting_id,
+        MeetingStatus.FAILED.value,
+        failed_reason="STT_UNAVAILABLE",
+        audio_key=f"org/{organization_id}/meetings/{meeting_id}/audio.ogg",
     )
 
     response = await api.client.post(f"{PREFIX}/meetings/{meeting_id}/retry", headers=headers)
@@ -354,7 +381,54 @@ async def test_a_failed_meeting_can_be_retried(api: Harness) -> None:
     assert response.json()["status"] == "QUEUED"
     # Cleared, so the next failure is not confused with the last one.
     assert response.json()["failed_reason"] is None
-    assert [str(pair[1]) for pair in api.dispatched] == [meeting_id]
+    assert [(str(pair[1]), pair[2]) for pair in api.dispatched] == [(meeting_id, "transcribe")]
+
+
+async def test_retrying_an_analysis_failure_does_not_transcribe_again(api: Harness) -> None:
+    """The expensive half is not re-run for a failure in the cheap one.
+
+    This was guaranteed to fail before: every retry went back to QUEUED, the
+    transcription ran a second time, and the insert then hit
+    `transcripts_meeting_unique`. Celery's two automatic retries made that
+    three paid transcriptions per click, all of them doomed.
+    """
+    organization_id, headers = await _owner(api.client)
+    meeting_id = await _declare(api.client, headers)
+    await _force_status(
+        api,
+        organization_id,
+        meeting_id,
+        MeetingStatus.FAILED.value,
+        failed_reason="LLM_REFUSED",
+        audio_key=f"org/{organization_id}/meetings/{meeting_id}/audio.ogg",
+    )
+    await _write_transcript(api, organization_id, meeting_id)
+
+    response = await api.client.post(f"{PREFIX}/meetings/{meeting_id}/retry", headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "ANALYZING"
+    assert [(str(pair[1]), pair[2]) for pair in api.dispatched] == [(meeting_id, "analyse")]
+
+
+async def test_a_meeting_whose_audio_is_gone_cannot_be_retried(api: Harness) -> None:
+    """Refused here rather than several minutes later, inside a worker.
+
+    The retention sweep takes the recording of a failed meeting once its window
+    runs out. Sending it round the pipeline would fail on NO_AUDIO after a
+    queue wait, and the customer would read that as a second, different fault.
+    """
+    organization_id, headers = await _owner(api.client)
+    meeting_id = await _declare(api.client, headers)
+    await _force_status(
+        api, organization_id, meeting_id, MeetingStatus.FAILED.value, failed_reason="LLM_REFUSED"
+    )
+
+    response = await api.client.post(f"{PREFIX}/meetings/{meeting_id}/retry", headers=headers)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "AUDIO_GONE"
+    assert api.dispatched == []
 
 
 async def test_a_healthy_meeting_cannot_be_retried(api: Harness) -> None:
