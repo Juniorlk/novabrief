@@ -98,7 +98,15 @@ def analyse_meeting(self: object, organization_id: str, meeting_id: str) -> str:
         # would bill for meetings that never produced anything.
         meeting.provider_llm = extracted.usage.model
         billed = meeting.duration_seconds
-        await usage.consume(session, organization_id=organization_uuid, seconds=billed)
+        # The gate was `can_afford` at finalisation. By the time we get here the
+        # suppliers have been paid and the report exists, so the charge is
+        # allowed to exceed the quota rather than refuse: refusing would roll
+        # the whole transaction back, re-run the LLM on every Celery retry, and
+        # leave the meeting stuck in ANALYZING, which the Retry button cannot
+        # reach. An overshoot is logged as a warning.
+        await usage.consume(
+            session, organization_id=organization_uuid, seconds=billed, allow_overshoot=True
+        )
         await usage.record(
             session,
             organization=organization,

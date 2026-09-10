@@ -13,9 +13,9 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy import select
 
 from app.config import Settings, get_settings
-from app.deps import CurrentCaller, ScopedSession
+from app.deps import CurrentCaller, ScopedSession, after_commit
 from app.errors import ProblemError
-from app.models import Decision, MeetingStatus, Report, Task, TranscriptSegment
+from app.models import Decision, Meeting, MeetingStatus, Report, Task, TranscriptSegment
 from app.presenters import meeting_summary, report, transcript_segment
 from app.services import meetings, transcription
 from app.storage import StorageProvider
@@ -49,21 +49,32 @@ _STATUS_FOR_CODE = {
     "UPLOAD_INCOMPLETE": 409,
     "SIZE_MISMATCH": 422,
     "STORAGE_UNAVAILABLE": 503,
+    "AUDIO_GONE": 409,
 }
 
 
 def dispatch_pipeline(request: Request) -> meetings.Dispatch:
-    """How a queued meeting reaches the workers.
+    """How a meeting reaches the workers.
 
     Resolved through the app so a test can replace it with a recorder. Imported
     inside the function on purpose: importing the Celery task at module scope
     would make every API process build a broker connection it never uses.
+
+    Two stages, because a retry does not always start from the beginning
+    (`meetings.retry`). Sending an already-transcribed meeting back through
+    transcription pays the supplier twice for bytes we already hold.
     """
     override: meetings.Dispatch | None = getattr(request.app.state, "dispatch", None)
     if override is not None:
         return override
 
-    def send(*, organization_id: uuid.UUID, meeting_id: uuid.UUID) -> None:
+    def send(*, organization_id: uuid.UUID, meeting_id: uuid.UUID, stage: meetings.Stage) -> None:
+        if stage == "analyse":
+            from app.tasks.analysis import analyse_meeting
+
+            analyse_meeting.delay(str(organization_id), str(meeting_id))
+            return
+
         from app.tasks.pipeline import transcribe_meeting
 
         transcribe_meeting.delay(str(organization_id), str(meeting_id))
@@ -109,6 +120,28 @@ def _as_problem(error: meetings.MeetingError) -> ProblemError:
         status_code=_STATUS_FOR_CODE.get(error.code, 400),
         code=error.code,
         title=str(error),
+    )
+
+
+def _queue(
+    request: Request,
+    dispatch: meetings.Dispatch,
+    *,
+    meeting: Meeting,
+    stage: meetings.Stage,
+) -> None:
+    """Hand the meeting to the workers once this transaction has committed.
+
+    Handed off rather than run inline: EF-40 promises a 202 in under 500 ms and
+    the user never waits on a request. Deferred rather than sent immediately
+    because the row the worker needs does not exist outside this transaction
+    yet - see `app.deps.after_commit`.
+    """
+    organization_id = meeting.organization_id
+    identifier = meeting.id
+    after_commit(
+        request,
+        lambda: dispatch(organization_id=organization_id, meeting_id=identifier, stage=stage),
     )
 
 
@@ -275,6 +308,7 @@ async def finalize_local(
     summary="Close the upload and queue the processing",
 )
 async def finalize(
+    request: Request,
     meeting_id: uuid.UUID,
     payload: FinalizeRequest,
     caller: CurrentCaller,
@@ -299,10 +333,15 @@ async def finalize(
             upload_id=payload.upload_id,
             parts=[(part.part_number, part.etag) for part in payload.parts],
             client_version=payload.client_version,
-            dispatch=dispatch,
         )
     except meetings.MeetingError as error:
         raise _as_problem(error) from error
+
+    if queued.status == MeetingStatus.QUEUED.value:
+        # After the commit, never before: a worker reading this row while the
+        # transaction is still open sees UPLOADING, declines to act, and the
+        # meeting waits in QUEUED for a message that has already been consumed.
+        _queue(request, dispatch, meeting=queued, stage="transcribe")
     return meeting_summary(queued)
 
 
@@ -401,19 +440,24 @@ async def detail(
     summary="Retry a failed meeting",
 )
 async def retry(
+    request: Request,
     meeting_id: uuid.UUID,
     caller: CurrentCaller,
     session: ScopedSession,
     dispatch: Dispatcher,
 ) -> MeetingSummary:
-    """EF-45's Retry button. Author or administrator, and only from FAILED."""
+    """EF-45's Retry button. Author or administrator, and only from FAILED.
+
+    Resumes at the stage that failed rather than from the top: a meeting whose
+    transcript survived goes straight back to analysis.
+    """
     try:
         meeting = await meetings.get(session, meeting_id=meeting_id, caller=caller.user)
-        requeued = await meetings.retry(session, meeting=meeting, caller=caller.user)
+        requeued, stage = await meetings.retry(session, meeting=meeting, caller=caller.user)
     except meetings.MeetingError as error:
         raise _as_problem(error) from error
 
-    dispatch(organization_id=requeued.organization_id, meeting_id=requeued.id)
+    _queue(request, dispatch, meeting=requeued, stage=stage)
     return meeting_summary(requeued)
 
 

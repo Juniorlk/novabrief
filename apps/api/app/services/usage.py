@@ -60,7 +60,13 @@ def can_afford(organization: Organization, seconds: int) -> bool:
     return left is None or seconds <= left
 
 
-async def consume(session: AsyncSession, *, organization_id: uuid.UUID, seconds: int) -> int:
+async def consume(
+    session: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+    seconds: int,
+    allow_overshoot: bool = False,
+) -> int:
     """Charge the quota, atomically, and return the new total.
 
     One statement with the guard in its `WHERE`. Two workers publishing at the
@@ -71,22 +77,32 @@ async def consume(session: AsyncSession, *, organization_id: uuid.UUID, seconds:
 
     Raises :class:`QuotaExceededError` rather than clamping: a silent clamp
     would bill for less than was delivered, and nobody would ever notice.
+
+    **`allow_overshoot` is for the publication step, and it is not a loophole.**
+    The gate is `can_afford` at finalisation; between that check and this charge
+    sit the transcription and the analysis, both already paid for to the
+    suppliers. If concurrent meetings ate the remaining seconds in between,
+    refusing here would strand a finished report in ANALYZING — the transaction
+    rolls back, Celery retries, the LLM is billed again, and after the last
+    attempt the meeting sits in a state EF-45's Retry button cannot even reach.
+    A report that was produced is a report that gets recorded and billed. The
+    overshoot is logged so it is a fact somebody can see, not an accident.
     """
     if seconds < 0:
         message = "consumption cannot be negative"
         raise ValueError(message)
 
-    statement = (
-        update(Organization)
-        .where(
-            Organization.id == organization_id,
+    statement = update(Organization).where(Organization.id == organization_id)
+    if not allow_overshoot:
+        statement = statement.where(
             # A null quota is not a limit, so the guard passes.
             (Organization.quota_seconds.is_(None))
-            | (Organization.consumed_seconds + seconds <= Organization.quota_seconds),
+            | (Organization.consumed_seconds + seconds <= Organization.quota_seconds)
         )
-        .values(consumed_seconds=Organization.consumed_seconds + seconds)
-        .returning(Organization.consumed_seconds)
-    )
+    statement = statement.values(
+        consumed_seconds=Organization.consumed_seconds + seconds
+    ).returning(Organization.consumed_seconds, Organization.quota_seconds)
+
     result = cast("CursorResult[Any]", await session.execute(statement))
     row = result.first()
 
@@ -97,7 +113,14 @@ async def consume(session: AsyncSession, *, organization_id: uuid.UUID, seconds:
         left = remaining_seconds(organization) if organization else 0
         raise QuotaExceededError(requested=seconds, remaining=left or 0)
 
-    consumed = int(row[0])
+    consumed, quota = int(row[0]), row[1]
+    if quota is not None and consumed > quota:
+        logger.warning(
+            "quota_overshot",
+            seconds=seconds,
+            consumed_total=consumed,
+            quota_seconds=int(quota),
+        )
     logger.info("quota_consumed", seconds=seconds, consumed_total=consumed)
     return consumed
 

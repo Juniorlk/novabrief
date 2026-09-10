@@ -8,10 +8,12 @@ one that never existed.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import uuid
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -20,7 +22,7 @@ import pytest_asyncio
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -52,7 +54,10 @@ class Harness:
     mailbox: RecordingProvider
     engine: AsyncEngine
     storage: InMemoryStorageProvider
-    dispatched: list[tuple[uuid.UUID, uuid.UUID]]
+    # (organization, meeting, stage). The stage is recorded because a retry
+    # does not always start from the beginning, and dispatching the wrong half
+    # of the pipeline is invisible from the status alone.
+    dispatched: list[tuple[uuid.UUID, uuid.UUID, str]]
 
 
 @pytest_asyncio.fixture
@@ -94,10 +99,10 @@ async def api(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Harness]:
     storage = InMemoryStorageProvider()
     # A recorder, not the real queue: a unit test must not need a broker, and
     # this is also how a test can see what would have been dispatched.
-    dispatched: list[tuple[uuid.UUID, uuid.UUID]] = []
+    dispatched: list[tuple[uuid.UUID, uuid.UUID, str]] = []
 
-    def record(*, organization_id: uuid.UUID, meeting_id: uuid.UUID) -> None:
-        dispatched.append((organization_id, meeting_id))
+    def record(*, organization_id: uuid.UUID, meeting_id: uuid.UUID, stage: str) -> None:
+        dispatched.append((organization_id, meeting_id, stage))
 
     app = create_app(
         limiter=InMemoryRateLimiter(),
@@ -700,6 +705,91 @@ async def test_finalizing_hands_the_meeting_to_the_workers(api: Harness) -> None
     )
 
     assert [str(pair[1]) for pair in api.dispatched] == [meeting["id"]]
+
+
+async def test_the_workers_are_told_only_once_the_row_is_committed(api: Harness) -> None:
+    """The race that leaves a meeting in QUEUED with nobody coming for it.
+
+    Dispatching from inside the request transaction puts the message in Redis
+    immediately; a worker can pick it up within milliseconds and read a row
+    that still says UPLOADING. It then does the correct thing - it declines to
+    act on a meeting that is not where it expects - and nothing ever processes
+    that meeting. No exception, no error log, no retry.
+
+    So the check is not "was it dispatched" but "what could a worker see at the
+    moment it was dispatched". The peek runs on its own connection, in its own
+    thread: a session on this event loop would sit inside the same transaction
+    and see uncommitted work, which is precisely what a worker cannot do.
+    """
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+    ticket = await _ticket(api, headers, meeting["id"])
+
+    visible: list[str | None] = []
+
+    def peek(organization_id: uuid.UUID, meeting_id: uuid.UUID) -> str | None:
+        async def read() -> str | None:
+            engine = create_async_engine(APP_DATABASE_URL, poolclass=NullPool)
+            try:
+                async with engine.connect() as connection:
+                    await connection.execute(
+                        text("SELECT set_config('app.current_org_id', :org, false)"),
+                        {"org": str(organization_id)},
+                    )
+                    found = await connection.execute(
+                        select(Meeting.status).where(Meeting.id == meeting_id)
+                    )
+                    row = found.first()
+                    return str(row[0]) if row else None
+            finally:
+                await engine.dispose()
+
+        return asyncio.run(read())
+
+    def watching(*, organization_id: uuid.UUID, meeting_id: uuid.UUID, stage: str) -> None:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            visible.append(pool.submit(peek, organization_id, meeting_id).result(timeout=30))
+
+    # The seam the router resolves through, replaced for this test only.
+    api.client._transport.app.state.dispatch = watching  # type: ignore[attr-defined]
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize",
+        json={
+            "upload_id": ticket["upload_id"],
+            "parts": [
+                {"part_number": part["part_number"], "etag": "e"}  # type: ignore[index]
+                for part in ticket["parts"]  # type: ignore[union-attr]
+            ],
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 202, response.text
+    assert visible == ["QUEUED"], (
+        f"a worker starting at that instant would have seen {visible}, "
+        "and would have declined to process the meeting"
+    )
+
+
+async def test_nothing_is_dispatched_when_the_request_fails(api: Harness) -> None:
+    """A rolled-back transaction must not leave a message behind.
+
+    The queued callback is only reached after a clean commit, so a handler that
+    raised cannot hand the workers a meeting the database never accepted.
+    """
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+    ticket = await _ticket(api, headers, meeting["id"])
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize",
+        json={"upload_id": ticket["upload_id"], "parts": [{"part_number": 1, "etag": "e"}]},
+        headers=headers,
+    )
+
+    assert response.status_code >= 400, response.text
+    assert api.dispatched == []
 
 
 async def test_a_meeting_held_for_quota_is_not_dispatched(api: Harness) -> None:

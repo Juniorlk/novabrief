@@ -241,6 +241,72 @@ async def test_two_publications_cannot_both_take_the_last_hour(api: Harness) -> 
     assert consumed == 3600
 
 
+async def test_the_publication_charge_may_exceed_the_quota(api: Harness) -> None:
+    """A finished report is always recorded and always billed.
+
+    The gate is `can_afford` at finalisation. Between that check and this
+    charge sit the transcription and the analysis, both already paid for to the
+    suppliers, and concurrent meetings can have eaten the remaining seconds in
+    between. Refusing here would roll the whole publication back, re-run the
+    LLM on every Celery retry, and leave the meeting stuck in ANALYZING - a
+    state EF-45's Retry button cannot even reach.
+    """
+    organization_id, _ = await _owner(api.client)
+    await _set_quota(api, organization_id, seconds=1000)
+
+    factory = create_session_factory(api.engine)
+    async with factory() as session, session.begin():
+        await set_current_organization(session, uuid.UUID(organization_id))
+        consumed = await usage.consume(
+            session,
+            organization_id=uuid.UUID(organization_id),
+            seconds=1500,
+            allow_overshoot=True,
+        )
+
+    assert consumed == 1500
+
+
+async def test_the_overshoot_is_not_the_default(api: Harness) -> None:
+    """It exists for one call site. Everywhere else the quota is a limit."""
+    organization_id, _ = await _owner(api.client)
+    await _set_quota(api, organization_id, seconds=1000)
+
+    factory = create_session_factory(api.engine)
+    async with factory() as session, session.begin():
+        await set_current_organization(session, uuid.UUID(organization_id))
+        with pytest.raises(usage.QuotaExceededError):
+            await usage.consume(session, organization_id=uuid.UUID(organization_id), seconds=1500)
+
+
+async def test_an_overshoot_still_records_the_real_total(api: Harness) -> None:
+    """No clamping. Billing has to be able to see what actually happened."""
+    organization_id, _ = await _owner(api.client)
+    await _set_quota(api, organization_id, seconds=600)
+
+    factory = create_session_factory(api.engine)
+    async with factory() as session, session.begin():
+        await set_current_organization(session, uuid.UUID(organization_id))
+        await usage.consume(
+            session,
+            organization_id=uuid.UUID(organization_id),
+            seconds=900,
+            allow_overshoot=True,
+        )
+
+    async with api.engine.connect() as connection:
+        await connection.execute(
+            text("SELECT set_config('app.current_org_id', :org, false)"),
+            {"org": organization_id},
+        )
+        consumed = await connection.scalar(
+            text("SELECT consumed_seconds FROM organizations WHERE id = CAST(:org AS uuid)"),
+            {"org": organization_id},
+        )
+
+    assert consumed == 900
+
+
 async def test_a_null_quota_lets_consumption_through(api: Harness) -> None:
     """Consumption is still counted; it is simply not capped."""
     organization_id, _ = await _owner(api.client)
