@@ -5,7 +5,7 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-10** (lot L2 terminé ; prochaine étape : le déploiement sur le VPS).
+> Dernière mise à jour : **2026-09-10** (lot L2 terminé et **déployé en production**).
 
 ---
 
@@ -17,7 +17,7 @@
 | POC #1 — capture audio | **livré, No-Go en l'état** | résultats C1-C9 dans `docs/tasks/01_POC1_capture_audio.md` |
 | POC #2 — benchmark transcription | **sauté** (décision Novafrik 2026-09-08) | §5 ci-dessous |
 | POC #3 — extraction structurée | **sauté** (décision Novafrik 2026-09-08) | §5 ci-dessous |
-| Lot L0 — socle backend | **fait sauf staging** | PR #2 ; `docker compose up` répond sur `/health` |
+| Lot L0 — socle backend | **fait**, staging inclus | PR #2 ; `https://api.novabrief.cloud/health` répond |
 | Lot L1 — comptes & organisations | **terminé** (EF-01 a EF-06) | PR #2, #4, #6, #7, #8, #9, #10 |
 | Lot L2 — réunions & pipeline | **terminé** (L2.1 à L2.8) | `docs/tasks/05_L2_reunions_pipeline.md` ; PR #11 à #17 |
 | Lots L3 à L7 | non commencés | `docs/tasks/04_APRES_LES_POC_lots_MVP.md` |
@@ -45,39 +45,34 @@
 
 ## 2. Prochaine étape
 
-**Le déploiement sur le VPS OVHcloud**, décidé par Novafrik pour la fin du lot
-L2. Les accès SSH ne sont pas dans le dépôt. Le DNS est prêt : `api.` et
-`app.` pointent déjà dessus.
+**Lot L3 — application desktop Windows.** C'est elle qui produit l'audio que
+tout le reste attend.
 
-Marche à suivre : une reconnaissance **en lecture seule** d'abord (version
-d'Ubuntu, disque, Docker présent ou non, ports ouverts), puis un compte rendu à
-Novafrik, puis le déploiement seulement après validation.
+**À faire avant de la mettre entre les mains d'une PME pilote** : les
+correctifs de capture longue durée
+(`docs/tasks/02_correctifs_capture_longue_duree.md`), différés le 2026-09-07.
+Sur 60 minutes, 10,25 % de l'audio disparaît et la perte est **invisible** —
+le fichier a la bonne durée, le compte rendu est simplement incomplet, et le
+client ne comprend jamais pourquoi.
 
-Ce qu'il faudra décider avant : où tournent PostgreSQL et Redis (conteneurs sur
-le VPS ou service managé), et comment les secrets arrivent sur la machine — le
-`.env` de production ne doit pas être construit à la main dans un terminal.
+### En production depuis le 2026-09-10
 
-### Lot L2 en détail
-
-| Sous-tâche | État |
+| | |
 |---|---|
-| L2.1 modèle `meetings` + machine à états §11 | fait — PR #11 |
-| L2.2 stockage objet, URL présignées, finalisation | fait — PR #12 |
-| L2.3 quota atomique + `usage_ledger` | fait — PR #13 |
-| L2.4 Celery, beat, purge planifiée | fait — PR #14 |
-| L2.5 transcription, fallback, disjoncteur | fait — PR #15 |
-| L2.6 LLM, extraction structurée, jeu d'évaluation | fait — PR #16 |
-| L2.7 statut temps réel par WebSocket | fait — PR #17 |
-| L2.8 relance et purge audio | fait — PR #17 |
+| `https://api.novabrief.cloud` | répond, certificat Let's Encrypt |
+| `https://app.novabrief.cloud` | certificat obtenu ; répond 503 « pas encore déployée » jusqu'au lot L4 |
+| Conteneurs | api, worker, beat, caddy, postgres, redis — tous sains |
+| Migrations | les 10 appliquées |
+| Consommation | ~374 Mo de RAM sur 3,7 Gio ; 6,4 Go de disque sur 38 |
 
-**Non prononcés, et il faut le savoir** : le critère « 200 réunions en
-COMPLETED » et le test T-11 (campagne annulée), **EF-41** (taux d'erreur de
-transcription ≤ 15 %) et **EF-42** (zéro hallucination) — aucun appel réel n'a
-été fait à AssemblyAI, Deepgram ou OpenAI. T-06 est prononcé *en simulation*.
+Éprouvé de bout en bout par l'API publique : inscription, jeton signé,
+isolation RLS, et **un email de vérification réellement envoyé** (Resend a
+répondu 200). La donnée d'essai a été supprimée.
 
-Le jeu d'évaluation anti-hallucination est écrit et exécutable :
-`python -m ai.evaluation.hallucination` le lance contre OpenAI le jour où tu
-veux le chiffre. C'est la mesure du risque n°2 du cahier des charges.
+**Ce qui n'existe pas encore et qui compte** : les sauvegardes (lot L6). Tant
+qu'elles ne tournent pas, une perte du VPS est une perte de la base — les
+comptes rendus, pas l'audio qui vit chez R2. C'est le prix assumé du choix
+« PostgreSQL en conteneur » plutôt que managé.
 
 ---
 
@@ -228,6 +223,31 @@ qu'une URL présignée est correctement signée, ce qu'aucun double ne peut
 vérifier — **sautaient depuis le lot L2.2** en affichant du vert. Le garde-fou
 anti-skip couvre maintenant `test_storage.py` en plus de la suite RLS.
 
+### L'analyseur `env_file` de Docker Compose n'est pas celui de python-dotenv
+
+Il **ne retire pas** un commentaire de fin de ligne : un `.env` recopié depuis
+`.env.example` livre `LLM_TIMEOUT_SECONDS=  # 120` à l'application comme la
+chaîne « # 120 ». Et il transmet une valeur vide comme une chaîne vide, qui
+**écrase la valeur par défaut** au lieu de s'y rabattre.
+
+Règle : une clé sans valeur est **absente**, pas vide.
+`infra/deploy/generate-secrets.sh` normalise le fichier à chaque passage.
+
+### `awk '{printf "%s\n", $0}'` n'échappe pas ce qu'on croit
+
+awk traite l'échappement **deux fois** — à la lecture de la chaîne, puis dans
+printf. La sortie contient de vraies nouvelles lignes, pas des `
+` littéraux.
+Le script annonçait « JWT_PRIVATE_KEY generated » en écrivant une valeur que le
+fichier ne pouvait pas porter.
+
+### `docker compose -f infra/...` lit son `.env` à côté du fichier compose
+
+Pas à la racine du dépôt. Chaque `${VAR:?}` échoue en accusant la variable
+plutôt que le chemin — pendant que les entrées `env_file:` *à l'intérieur* du
+même fichier, qui sont un autre mécanisme, fonctionnent. Passer toujours par
+`infra/deploy/compose.sh`.
+
 ### La perte audio est invisible
 
 Sur 60 min, 10,25 % de l'audio a disparu pendant que Windows ne signalait que
@@ -252,6 +272,8 @@ Elles ne sont pas dans le cahier des charges et priment sur lui.
 | 2026-09-08 | Déploiement sur le VPS OVHcloud **après** la fin du lot L2 |
 | 2026-09-08 | **EF-06** : export **JSON + audio** maintenant, **PDF reporté au lot L4** ; suppression définitive avec **7 jours de rétractation** |
 | 2026-09-08 | Clés `RESEND_API_KEY` et `DEEPGRAM_API_KEY` fournies |
+| 2026-09-10 | Dépôt GitHub passé en **public** ; historique vérifié, aucune clé n'y figure |
+| 2026-09-10 | Clés de développement réutilisées en production, à remplacer plus tard (décision Novafrik) |
 | 2026-09-09 | **Cloudflare R2 retenu** plutôt que MinIO sur le VPS : à ce volume R2 coûte quelques centimes par mois, et sortir l'audio du disque qui porte PostgreSQL vaut plus que l'économie |
 | 2026-09-09 | Domaine **`novabrief.cloud`** (OVH) ; DNS Resend configure ; redirection `contact@` vers l'adresse personnelle faute de boite OVH disponible |
 
