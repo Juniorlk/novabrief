@@ -24,13 +24,24 @@ bash infra/deploy/generate-secrets.sh
 nano .env
 
 # 5. Démarrer.
-docker compose -f infra/docker-compose.prod.yml up -d --build
+bash infra/deploy/compose.sh up -d --build
 
 # 6. Appliquer les migrations. Alembic lit DATABASE_ADMIN_URL tout seul :
 #    le role applicatif n'a deliberement pas le DDL.
 docker compose -f infra/docker-compose.prod.yml run --rm \
     --workdir /srv/apps/api api python -m alembic upgrade head
 ```
+
+## Toujours passer par `compose.sh`
+
+`docker compose` cherche le `.env` dont il tire `${VAR}` **à côté du fichier
+compose**, donc dans `infra/`, pas à la racine où il se trouve. Sans
+`--env-file .env`, chaque `${POSTGRES_PASSWORD:?}` échoue et le message accuse
+la variable plutôt que le chemin. Les entrées `env_file:` *à l'intérieur* du
+compose sont un autre mécanisme et fonctionnent dans les deux cas — c'est
+précisément ce qui rend la panne déroutante.
+
+`infra/deploy/compose.sh` passe les bons drapeaux et se place au bon endroit.
 
 ## Ce que `generate-secrets.sh` fait, et ne fait pas
 
@@ -45,6 +56,15 @@ que PostgreSQL soit d'accord. Un script qui régénérerait à chaque passage
 rendrait un redéploiement dangereux.
 
 Il ne génère pas les clés fournisseurs. Personne ne peut les inventer.
+
+Il **normalise aussi le fichier** à chaque passage, et c'est nécessaire :
+l'analyseur `env_file` de Docker Compose n'est pas celui de python-dotenv. Il
+ne retire pas un commentaire de fin de ligne, donc `LLM_TIMEOUT_SECONDS=  # 120`
+arrive à l'application comme la chaîne `« # 120 »` ; et il transmet une valeur
+vide comme une chaîne vide, qui écrase la valeur par défaut au lieu de s'y
+rabattre. La règle est donc : **une clé sans valeur est absente, pas vide.**
+Un `.env` recopié à la main depuis `.env.example` est réparé plutôt que
+refusé.
 
 ## Ce qu'il faut remplir à la main dans `.env`
 
@@ -74,7 +94,7 @@ lignes fonctionne aussi : les deux formes sont acceptées et testées.
 ```bash
 cd /srv/novabrief
 git pull
-docker compose -f infra/docker-compose.prod.yml up -d --build
+bash infra/deploy/compose.sh up -d --build
 docker compose -f infra/docker-compose.prod.yml run --rm \
     --workdir /srv/apps/api api python -m alembic upgrade head
 ```
@@ -85,9 +105,9 @@ Les migrations sont réversibles et appliquées une par une. Une migration qui
 ## Vérifier
 
 ```bash
-docker compose -f infra/docker-compose.prod.yml ps
+bash infra/deploy/compose.sh ps
 curl -fsS https://api.novabrief.cloud/health
-docker compose -f infra/docker-compose.prod.yml logs --tail=50 worker
+bash infra/deploy/compose.sh logs --tail=50 worker
 ```
 
 Le worker doit lister ses quatre tâches (`transcribe_meeting`,
