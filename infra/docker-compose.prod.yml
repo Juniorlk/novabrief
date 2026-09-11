@@ -74,7 +74,13 @@ services:
     expose:
       - "8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)",
+        ]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -85,7 +91,8 @@ services:
     # Two, on two vCPUs. The tasks spend their time waiting on providers rather
     # than computing, so this is about how many meetings can be in flight, not
     # about cores.
-    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+    command:
+      ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "--concurrency=2"]
 
   beat:
     <<: *api-image

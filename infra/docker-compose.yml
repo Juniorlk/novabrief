@@ -44,7 +44,7 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-novabrief}
@@ -62,7 +62,7 @@ services:
 
   # Creates the buckets once and exits; the API expects them to exist.
   minio-init:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:
       minio:
         condition: service_healthy
@@ -115,7 +115,13 @@ services:
     ports:
       - "8000:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -147,7 +153,17 @@ services:
       R2_BUCKET_AUDIO: novabrief-audio
     command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
     healthcheck:
-      test: ["CMD", "celery", "-A", "app.worker.celery_app", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      test:
+        [
+          "CMD",
+          "celery",
+          "-A",
+          "app.worker.celery_app",
+          "inspect",
+          "ping",
+          "-d",
+          "celery@$$HOSTNAME",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3

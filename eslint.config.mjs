@@ -36,6 +36,23 @@ export default tseslint.config(
     },
   },
   {
+    // The desktop and web front ends run in a browser engine - WebView2 for
+    // the desktop - so `document`, `window` and `navigator` exist. Declared
+    // rather than switched off: `no-undef` is what catches a typo in a global,
+    // and disabling it everywhere to silence three lines would cost that.
+    files: ["apps/desktop/src/**/*.{ts,vue}", "apps/web/**/*.{ts,vue}"],
+    languageOptions: {
+      globals: {
+        document: "readonly",
+        navigator: "readonly",
+        window: "readonly",
+        localStorage: "readonly",
+        HTMLSelectElement: "readonly",
+        HTMLInputElement: "readonly",
+      },
+    },
+  },
+  {
     files: ["**/*.vue"],
     extends: [...vue.configs["flat/recommended"]],
     languageOptions: {
@@ -46,6 +63,13 @@ export default tseslint.config(
       "vue/multi-word-component-names": "error",
       // Every user-visible string goes through i18n (CLAUDE.md section 6).
       "vue/no-bare-strings-in-template": "warn",
+      // Formatting belongs to Prettier, and only to Prettier. These two rules
+      // rewrite templates in a way Prettier then rewrites back, so `lint:fix`
+      // and `format` undo each other and the build never settles.
+      "vue/max-attributes-per-line": "off",
+      "vue/singleline-html-element-content-newline": "off",
+      "vue/html-closing-bracket-newline": "off",
+      "vue/html-indent": "off",
     },
   },
 );

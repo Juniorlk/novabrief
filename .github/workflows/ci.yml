@@ -108,9 +108,15 @@ jobs:
         # Started as a step rather than a service because the image needs a
         # command, and service containers cannot be given one. The same image
         # the compose stack uses, so the two cannot drift.
+        #
+        # quay.io, and pinned. This is the second time a supplier's decision
+        # about a floating tag has broken the build for reasons unrelated to
+        # any change: bitnami/minio was withdrawn, and then minio/minio on
+        # Docker Hub started answering "repository does not exist". A pinned
+        # digest cannot disappear under a green branch overnight.
         run: |
           set -euo pipefail
-          docker run -d --name minio -p 9000:9000             -e MINIO_ROOT_USER=novabrief             -e MINIO_ROOT_PASSWORD=novabrief-dev-secret             minio/minio:latest server /data
+          docker run -d --name minio -p 9000:9000             -e MINIO_ROOT_USER=novabrief             -e MINIO_ROOT_PASSWORD=novabrief-dev-secret             quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
           for _ in $(seq 1 30); do
             if curl -sf http://localhost:9000/minio/health/live > /dev/null; then
               break
@@ -118,7 +124,7 @@ jobs:
             sleep 2
           done
           curl -sf http://localhost:9000/minio/health/live > /dev/null
-          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+          docker run --rm --network host --entrypoint sh quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z -c "
             mc alias set local http://localhost:9000 novabrief novabrief-dev-secret &&
             mc mb --ignore-existing local/novabrief-audio"
 
@@ -169,6 +175,13 @@ jobs:
 
       - name: ESLint
         run: pnpm run lint
+
+      # Never ran until now, which is why infra/ had drifted: CLAUDE.md section
+      # 6 asks for Prettier to pass, and a check nobody runs is a check that is
+      # not enforced. `make fmt-check` covers it locally, but only for whoever
+      # remembers.
+      - name: Prettier
+        run: pnpm run format:check
 
       - name: TypeScript
         run: pnpm run typecheck
