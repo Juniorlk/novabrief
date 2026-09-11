@@ -65,6 +65,19 @@ pub enum CaptureError {
         #[source]
         source: windows::core::Error,
     },
+
+    /// The replacement device negotiated a different format.
+    ///
+    /// Refused rather than accepted. Everything downstream - the resampler, the
+    /// mixer, the stereo layout of EF-31 - was built for the original format,
+    /// and feeding it 44 100 Hz where it expects 48 000 would not fail: it
+    /// would quietly change the pitch of the second half of the meeting.
+    #[error("the {endpoint} device came back as {now:?}, not {was:?}")]
+    FormatChanged {
+        endpoint: Endpoint,
+        was: crate::format::StreamFormat,
+        now: crate::format::StreamFormat,
+    },
 }
 
 /// Result alias used throughout the crate.

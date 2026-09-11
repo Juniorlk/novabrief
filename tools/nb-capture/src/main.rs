@@ -1013,6 +1013,12 @@ fn report(out: &Path, frames: u64, outcomes: &[Option<ThreadOutcome>]) {
             "  MMCSS Pro Audio : {}",
             if outcome.mmcss { "granted" } else { "DENIED" }
         );
+        if stats.device_reopens > 0 {
+            println!(
+                "  DEVICE REOPENED : {} time(s) - Windows retired the device mid-recording",
+                stats.device_reopens
+            );
+        }
         if outcome.overflow.happened() {
             println!(
                 "  QUEUE OVERFLOW  : {} chunks / {} frames dropped - the writer could not keep up",

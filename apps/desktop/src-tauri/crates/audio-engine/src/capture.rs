@@ -92,6 +92,15 @@ pub struct CaptureStats {
     pub silent_packets: u64,
     /// Frames of silence we synthesised because no packet arrived (C4).
     pub padded_frames: u64,
+    /// Times the device was invalidated and reopened mid-recording.
+    ///
+    /// Not a curiosity. A 60-minute validation capture on 2026-09-11 died on
+    /// the first one: Windows put the machine into modern standby, the render
+    /// endpoint was invalidated, and the loopback thread returned an error that
+    /// nothing saw until the meeting was over. Every reopen is a gap in one
+    /// channel, so the count belongs next to the loss figures rather than in a
+    /// log nobody reads.
+    pub device_reopens: u64,
     /// Timestamp of the very first frame this endpoint delivered.
     ///
     /// Two endpoints never start at the same instant — opening a device takes a
@@ -110,6 +119,30 @@ impl CaptureStats {
         }
         Duration::from_secs_f64(self.frames as f64 / f64::from(sample_rate))
     }
+}
+
+/// `AUDCLNT_E_DEVICE_INVALIDATED`.
+///
+/// Windows retires an endpoint for ordinary reasons: the machine suspends, the
+/// default device changes, a headset is unplugged, a driver updates. The stream
+/// cannot be resumed - the client object is dead - but the *recording* can, by
+/// opening the endpoint again.
+const DEVICE_INVALIDATED: i32 = 0x8889_0004_u32 as i32;
+
+/// How many times one recording may reopen an endpoint before giving up.
+///
+/// Generous, because each reopen costs only the silence that covers it, and a
+/// meeting is worth more than a tidy failure. Bounded, because a device that
+/// invalidates immediately on every open would otherwise spin for the length of
+/// the meeting, and the recording would be silence with a clean bill of health.
+const MAX_DEVICE_REOPENS: u64 = 20;
+
+/// Whether this error is Windows retiring the device under us.
+fn is_device_invalidated(error: &CaptureError) -> bool {
+    matches!(
+        error,
+        CaptureError::StreamFailure { source, .. } if source.code().0 == DEVICE_INVALIDATED
+    )
 }
 
 /// Raises the calling thread to the MMCSS "Pro Audio" class for the duration of
@@ -169,6 +202,13 @@ pub struct EndpointCapture {
     format: StreamFormat,
     endpoint: Endpoint,
     device_name: String,
+    /// The substring the caller selected this device with, if any.
+    ///
+    /// Kept so a reopen can make the same choice again. `None` means "whatever
+    /// Windows calls the default", which is deliberately re-resolved rather
+    /// than pinned: when somebody plugs in a headset mid-meeting the default
+    /// moves, and following it is what EF-15 asks for.
+    wanted: Option<String>,
     mmcss_active: bool,
 }
 
@@ -273,8 +313,39 @@ impl EndpointCapture {
             format,
             endpoint,
             device_name,
+            wanted: wanted.map(str::to_owned),
             mmcss_active: false,
         })
+    }
+
+    /// Open the endpoint again after Windows retired the device.
+    ///
+    /// The same selector is used, so a named device is looked for again and a
+    /// default one is re-resolved - which is the behaviour EF-15 wants when a
+    /// headset arrives mid-meeting and the default moves with it.
+    ///
+    /// # Errors
+    ///
+    /// [`CaptureError::FormatChanged`] when the replacement negotiates a
+    /// different rate or channel count. That is refused rather than accepted
+    /// because everything downstream - the resampler, the mixer, the stereo
+    /// layout of EF-31 - was built for the original format, and feeding it
+    /// 44 100 Hz where it expects 48 000 would not fail, it would quietly
+    /// change the pitch of the second half of the meeting.
+    fn reopen(&mut self) -> Result<()> {
+        let replacement = Self::open_named(self.endpoint, self.wanted.as_deref())?;
+        if replacement.format != self.format {
+            return Err(CaptureError::FormatChanged {
+                endpoint: self.endpoint,
+                was: self.format,
+                now: replacement.format,
+            });
+        }
+
+        self.client = replacement.client;
+        self.capture = replacement.capture;
+        self.device_name = replacement.device_name;
+        Ok(())
     }
 
     /// The format Windows negotiated for this endpoint.
@@ -319,32 +390,62 @@ impl EndpointCapture {
         let priority = ProAudioPriority::acquire();
         self.mmcss_active = priority.is_active();
 
-        // SAFETY: the client is initialised and owned by self.
-        unsafe { self.client.Start() }.map_err(|source| CaptureError::StreamFailure {
-            endpoint: self.endpoint,
-            source,
-        })?;
+        // One clock and one set of statistics for the whole recording, not one
+        // per attempt. It is what makes a reopen invisible in the output: the
+        // silence synthesis measures against this `started`, so the gap while
+        // the device was away is filled and the timeline keeps matching the
+        // meeting (EF-15 allows at most 500 ms of silence, never a cut).
+        let started = Instant::now();
+        let deadline = max_duration.map(|limit| started + limit);
+        let mut stats = CaptureStats::default();
 
-        let result = self.pump(stop, max_duration, &mut on_frames);
+        let result = loop {
+            // SAFETY: the client is initialised and owned by self.
+            if let Err(source) = unsafe { self.client.Start() } {
+                break Err(CaptureError::StreamFailure {
+                    endpoint: self.endpoint,
+                    source,
+                });
+            }
 
-        // Stop the stream even if the pump failed, so the endpoint is released.
-        // SAFETY: pairs with the Start above.
-        let _ = unsafe { self.client.Stop() };
+            let outcome = self.pump(stop, deadline, started, &mut stats, &mut on_frames);
+
+            // Stop the stream even if the pump failed, so the endpoint is
+            // released before anything tries to open it again.
+            // SAFETY: pairs with the Start above.
+            let _ = unsafe { self.client.Stop() };
+
+            match outcome {
+                Ok(()) => break Ok(()),
+                Err(error) if is_device_invalidated(&error) => {
+                    stats.device_reopens += 1;
+                    if stats.device_reopens > MAX_DEVICE_REOPENS {
+                        break Err(error);
+                    }
+                    if let Err(failed) = self.reopen() {
+                        break Err(failed);
+                    }
+                }
+                Err(error) => break Err(error),
+            }
+        };
+
         drop(priority);
-        result
+        result.map(|()| stats)
     }
 
     fn pump<F>(
         &self,
         stop: &AtomicBool,
-        max_duration: Option<Duration>,
+        deadline: Option<Instant>,
+        started: Instant,
+        stats: &mut CaptureStats,
         on_frames: &mut F,
-    ) -> Result<CaptureStats>
+    ) -> Result<()>
     where
         F: FnMut(Packet<'_>),
     {
         let endpoint = self.endpoint;
-        let mut stats = CaptureStats::default();
         let mut decoded: Vec<f32> = Vec::new();
         let mut silence: Vec<f32> = Vec::new();
         // WASAPI always flags the first packet after Start as discontinuous:
@@ -355,10 +456,9 @@ impl EndpointCapture {
         let channels = self.format.channels as usize;
         let rate = f64::from(self.format.sample_rate);
         let rate_hz = self.format.sample_rate.max(1);
-        let started = Instant::now();
 
         while !stop.load(Ordering::Relaxed) {
-            if max_duration.is_some_and(|limit| started.elapsed() >= limit) {
+            if deadline.is_some_and(|limit| Instant::now() >= limit) {
                 break;
             }
 
@@ -470,7 +570,7 @@ impl EndpointCapture {
             }
         }
 
-        Ok(stats)
+        Ok(())
     }
 }
 
@@ -645,7 +745,54 @@ unsafe fn friendly_name(device: &windows::Win32::Media::Audio::IMMDevice) -> Str
 
 #[cfg(test)]
 mod tests {
-    use super::{stream_start_from, CaptureStats};
+
+    /// The exact code the 2026-09-11 validation capture died on.
+    ///
+    /// Named as a constant rather than matched on a message, because the
+    /// message is localised: the run reported `0x88890004` on a French Windows
+    /// and would have said something else on another.
+    #[test]
+    fn the_invalidated_device_code_is_the_one_windows_returns() {
+        let error = CaptureError::StreamFailure {
+            endpoint: Endpoint::SystemLoopback,
+            source: windows::core::Error::from_hresult(windows::core::HRESULT(DEVICE_INVALIDATED)),
+        };
+        assert!(is_device_invalidated(&error));
+    }
+
+    /// Every other stream failure is a real failure. Reopening on all of them
+    /// would turn a broken driver into an infinite loop that records silence
+    /// and reports success.
+    #[test]
+    fn another_stream_failure_is_not_treated_as_an_invalidation() {
+        // AUDCLNT_E_BUFFER_TOO_LARGE: a real bug on our side, not a device
+        // going away.
+        let error = CaptureError::StreamFailure {
+            endpoint: Endpoint::Microphone,
+            source: windows::core::Error::from_hresult(windows::core::HRESULT(
+                0x8889_0006_u32 as i32,
+            )),
+        };
+        assert!(!is_device_invalidated(&error));
+
+        let other = CaptureError::DeviceNotFound {
+            endpoint: Endpoint::Microphone,
+            wanted: "a headset".to_owned(),
+        };
+        assert!(!is_device_invalidated(&other));
+    }
+
+    /// Reopens start at zero, so the report never claims a recovery that did
+    /// not happen.
+    #[test]
+    fn a_fresh_recording_has_not_reopened_anything() {
+        assert_eq!(CaptureStats::default().device_reopens, 0);
+    }
+
+    use super::{
+        is_device_invalidated, stream_start_from, CaptureError, CaptureStats, DEVICE_INVALIDATED,
+    };
+    use crate::error::Endpoint;
     use std::time::Duration;
 
     /// One second expressed in the 100 ns units WASAPI reports.
