@@ -5,8 +5,8 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-12** (lot L3.1 livré, PR #29 ; un cinquième
-> défaut de capture trouvé par la validation 60 min et corrigé, PR #30).
+> Dernière mise à jour : **2026-09-12** (L3.1 et L3.2 livrés ; récupération de
+> périphérique ; PR #29, #30, #32, #33).
 
 ---
 
@@ -25,7 +25,9 @@
 | Audit de cohérence L1+L2 | **fait** | §2 bis ci-dessous ; PR #22, #23, #24 |
 | Correctifs capture longue durée | **codés**, validation 60 min en attente | PR #27 ; `docs/tasks/02_…` |
 | Lot L3.1 — coquille Tauri + i18n | **fait** | PR #29 |
-| Lot L3.2 à L3.9 | pas commencés | `docs/tasks/06_L3_application_desktop.md` |
+| Lot L3.2 — coffre local chiffré | **fait** | PR #32 |
+| L3.3 — récupération de périphérique (EF-15 / C5) | **partiel** | PR #33 ; le reste du pilotage reste à faire |
+| Lot L3.4 à L3.9 | pas commencés | `docs/tasks/06_L3_application_desktop.md` |
 
 ### Lot L1 en détail
 
@@ -99,6 +101,31 @@ de même établi : la mémoire est restée **plate à 12,7 Mo pendant 28 minutes
 contre 668 Mo auparavant — D1 et D2 tiennent.
 
 Ça **bloque la mise en main d'une PME pilote**, pas le développement de L3.
+
+### Ce qui a été livré depuis (2026-09-12)
+
+**L3.2, le coffre local chiffré (PR #32).** Trois clés empilées — clé de
+réunion aléatoire, clé de compte dérivée du refresh token, DPAPI — chacune
+contre une menace différente. Le nonce GCM est **l'index du segment**, pas une
+valeur aléatoire : un compteur est prouvablement unique là où 96 bits aléatoires
+ne le sont que probablement, et une répétition en GCM divulgue la clé
+d'authentification. Le store refuse un index qui n'est pas le suivant.
+
+L'essentiel d'EF-17 tient dans **l'ordre des écritures**, pas dans le
+chiffrement : segment synchronisé sur le plateau d'abord, manifeste ensuite,
+par fichier temporaire + `rename`. Un manifeste tronqué coûterait toute la
+réunion au lieu des cinq secondes autorisées.
+
+**La récupération de périphérique (PR #33).** `AUDCLNT_E_DEVICE_INVALIDATED` ne
+tue plus la capture : l'endpoint est rouvert, le sélecteur d'origine réutilisé,
+et le défaut Windows **re-résolu** — ce qui est le comportement qu'EF-15 décrit
+quand un casque arrive en cours de réunion. Le trou est comblé par la synthèse
+de silence existante, à qui il a suffi de donner l'horloge globale plutôt qu'une
+horloge par tentative.
+
+Un format différent au retour est **refusé** (`CaptureError::FormatChanged`) :
+l'accepter changerait discrètement la hauteur de la seconde moitié de la
+réunion, ce qui n'échouerait nulle part.
 
 ### En production depuis le 2026-09-10
 
@@ -504,10 +531,15 @@ mv .env .env.hidden && python -m pytest -q ; mv .env.hidden .env
   coupée par une mise en veille de la machine. Critères 1, 2 et 5 de
   `02_correctifs_capture_longue_duree.md` non prononcés. Bloque la mise en main
   d'une PME pilote.
-- **`AUDCLNT_E_DEVICE_INVALIDATED` n'est pas géré.** Un endpoint invalidé en
-  cours de capture meurt et le reste de la réunion est enregistré en mono sans
-  que l'utilisateur en soit averti autrement que par un message en console.
-  C'est EF-15 / C5, prévu au lot L3.3.
+- **Le chemin de réouverture de périphérique n'a jamais été exécuté.** La
+  détection est testée (PR #33), la réouverture elle-même exige que Windows
+  invalide réellement un périphérique. La preuve viendra d'une capture longue
+  durée pendant laquelle la machine dort.
+- **Un changement de format au retour d'un périphérique fait échouer la
+  capture** plutôt que de reconstruire le pipeline. `FormatChanged` nomme le
+  cas ; le traiter est du ressort du reste de L3.3.
+- **Le coffre n'est branché à rien.** L3.2 est complet et testé seul ; c'est
+  L3.3 qui lui enverra de vrais segments de 5 s.
 - **Une réunion en `QUOTA_HOLD` n'a aucune sortie.** Seul le webhook de
   paiement du lot L5 peut la relancer, et il n'existe pas. Sans effet
   aujourd'hui — aucun quota n'est assigné avant L5, donc rien n'y entre — mais
