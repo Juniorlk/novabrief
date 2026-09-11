@@ -18,15 +18,15 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use audio_engine::{
     downmix_to_mono, peak, projected_offset_ms, relative_ppm, CaptureStats, DriftEstimate,
-    DriftEstimator, Endpoint, EndpointCapture, MonoResampler, SegmentedOpusWriter, StereoMixer,
-    TARGET_SAMPLE_RATE,
+    DriftEstimator, DriftRefusal, Endpoint, EndpointCapture, MonoResampler, SegmentedOpusWriter,
+    StereoMixer, TARGET_SAMPLE_RATE,
 };
 use clap::Parser;
 
@@ -120,6 +120,72 @@ impl Sink {
     }
 }
 
+/// How often the capture prints what it is costing in memory.
+///
+/// Criterion 2 of the correction brief asks for RAM every five minutes over an
+/// hour, and asks for it *during* the run rather than at the end - because the
+/// failure it is guarding against is growth, and a single figure at the end
+/// cannot tell growth from a high baseline. The 2026-09-07 run reached 668 MB
+/// at 32 minutes; a reading at 5, 10 and 15 would have shown the slope long
+/// before that.
+///
+/// Printing it here rather than leaving it to Task Manager is what makes the
+/// criterion self-verifying: the evidence ends up in the same transcript as
+/// the loss figures.
+const MEMORY_REPORT_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Resident memory of this process, in bytes.
+///
+/// The working set rather than the committed size: it is what the machine is
+/// actually being asked to hold, which is the number the criterion is about.
+#[cfg(windows)]
+fn resident_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    // SAFETY: `counters` is a live local whose `cb` field declares its own
+    // size, which is the contract this call asks for.
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &raw mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    };
+    (ok != 0).then_some(counters.WorkingSetSize as u64)
+}
+
+#[cfg(not(windows))]
+const fn resident_bytes() -> Option<u64> {
+    None
+}
+
+/// How far a capture thread may run ahead of the writer.
+///
+/// The queues used to be unbounded, and that is the second half of the hour-long
+/// failure: when the writer fell behind, nothing pushed back, the backlog grew,
+/// the quadratic drain made the writer slower still, and memory reached 668 MB.
+/// Under that pressure the capture threads missed their deadlines and WASAPI's
+/// 200 ms buffer overran - which is where the 10.25 % of audio actually went.
+///
+/// A chunk is one WASAPI packet resampled to 16 kHz mono, roughly 10 ms. Three
+/// hundred of them is about three seconds and a couple of hundred kilobytes:
+/// long enough to ride out a disk hiccup, short enough that a writer which has
+/// genuinely stopped is noticed in seconds rather than in gigabytes.
+///
+/// Blocking on a full queue would be worse than dropping. The capture thread
+/// has a hard deadline against the device, and making it wait for a slow disk
+/// is precisely how frames are lost at the source - where nothing can recover
+/// them. Dropping at a counted, reported boundary keeps the loss in a place we
+/// can see and measure.
+const QUEUE_DEPTH_CHUNKS: usize = 300;
+
 /// A chunk of 16 kHz mono audio on its way to the writer.
 struct Chunk {
     samples: Vec<f32>,
@@ -137,8 +203,174 @@ struct ThreadOutcome {
     input_channels: u16,
     mmcss: bool,
     stats: CaptureStats,
-    /// How fast this device's clock actually ran, measured during the capture.
-    drift: Option<DriftEstimate>,
+    /// How fast this device's clock actually ran, or why that could not be
+    /// said. A refusal is an answer, and it is printed as one.
+    drift: Result<DriftEstimate, DriftRefusal>,
+    /// Audio the writer could not keep up with, and which was therefore
+    /// dropped rather than silently accumulated.
+    overflow: Overflow,
+    /// What the device delivered, against what it owed, inside its own
+    /// streaming window. This is the C3 measurement.
+    delivery: Delivery,
+    /// Wall-clock time the capture loop actually ran.
+    ///
+    /// This is the measuring stick for C3. Windows' discontinuity flag counted
+    /// 2 and 5 events while 10.25 % of an hour went missing - it under-reports
+    /// by orders of magnitude, because a gap is flagged once however long it
+    /// lasts. Frames the device really delivered, against frames its nominal
+    /// rate says should have arrived in that much time, cannot be fooled that
+    /// way.
+    elapsed: Duration,
+}
+
+impl ThreadOutcome {
+    /// Frames the device really delivered, synthesised silence excluded.
+    const fn real_frames(&self) -> u64 {
+        self.stats.frames.saturating_sub(self.stats.padded_frames)
+    }
+}
+
+/// How much audio a device delivered, against how much its own clock says it
+/// should have delivered in the same window.
+///
+/// This is C3, measured with the right instrument. Windows'
+/// `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` counted 2 and 5 events while
+/// 10.25 % of an hour went missing: a gap is flagged once however long it
+/// lasts, so the flag under-reports by orders of magnitude.
+///
+/// The window runs from the first delivered packet to the last, and that
+/// detail is the whole difference between a measurement and an artefact:
+///
+/// * Opening a device takes time. Counting from the call to `record` charges
+///   that startup to the device as lost audio - it showed up as 0.225 % on a
+///   clean ten-second capture, which would fail a criterion set at 0.1 %.
+/// * A loopback endpoint delivers *nothing at all* while nothing is playing.
+///   Against the wall clock a silent machine reports 100 % loss, which is true
+///   arithmetic and a useless statement. Between its first and last real
+///   packet, it reports what it lost while it was actually streaming.
+#[derive(Debug, Clone, Copy, Default)]
+struct Delivery {
+    /// Timestamp and cumulative frame count at the first delivered packet.
+    first: Option<(u64, u64)>,
+    /// Same, at the most recent one.
+    last: Option<(u64, u64)>,
+}
+
+impl Delivery {
+    /// Record a packet the device really delivered.
+    ///
+    /// `frames_before` is the cumulative count *excluding* this packet, so the
+    /// window and the frames inside it are bounded by the same two events.
+    fn observe(&mut self, qpc_100ns: u64, frames_before: u64) {
+        if self.first.is_none() {
+            self.first = Some((qpc_100ns, frames_before));
+        }
+        self.last = Some((qpc_100ns, frames_before));
+    }
+
+    /// Seconds between the first and last delivered packet.
+    fn window_seconds(&self) -> Option<f64> {
+        let (first_qpc, _) = self.first?;
+        let (last_qpc, _) = self.last?;
+        let span = last_qpc.checked_sub(first_qpc)?;
+        Some(span as f64 / 10_000_000.0)
+    }
+
+    /// Frames delivered inside that window.
+    fn frames_in_window(&self) -> Option<u64> {
+        let (_, first_frames) = self.first?;
+        let (_, last_frames) = self.last?;
+        last_frames.checked_sub(first_frames)
+    }
+
+    /// Share of the expected audio that never arrived, as a percentage.
+    ///
+    /// `None` when the device never streamed long enough to divide by - which
+    /// is an answer, not a zero.
+    fn shortfall_percent(&self, nominal_rate: u32) -> Option<f64> {
+        let seconds = self.window_seconds()?;
+        let delivered = self.frames_in_window()? as f64;
+        let expected = seconds * f64::from(nominal_rate);
+        if expected < 1.0 {
+            return None;
+        }
+        Some(((expected - delivered).max(0.0) / expected) * 100.0)
+    }
+}
+
+/// What a full queue cost.
+#[derive(Debug, Clone, Copy, Default)]
+struct Overflow {
+    chunks: u64,
+    frames: u64,
+}
+
+impl Overflow {
+    const fn happened(&self) -> bool {
+        self.chunks > 0
+    }
+}
+
+/// What became of an item offered to a full-or-not queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offered {
+    /// The writer took it.
+    Taken,
+    /// The queue was full. The audio is gone, and counted.
+    Dropped {
+        /// True the first time only, so the warning is printed once rather
+        /// than a hundred times a second.
+        first: bool,
+    },
+    /// The writer is gone; there is nowhere left to send.
+    Closed,
+}
+
+/// The sending half of a bounded queue, which counts what it had to drop.
+///
+/// A type rather than three lines inside the capture callback, because this is
+/// the behaviour the hour-long failure turned on and it has to be something a
+/// test can drive. See `a_producer_faster_than_its_consumer_is_bounded_and_counted`.
+#[derive(Debug)]
+struct BoundedSink<T> {
+    tx: SyncSender<T>,
+    overflow: Overflow,
+}
+
+impl<T> BoundedSink<T> {
+    const fn new(tx: SyncSender<T>) -> Self {
+        Self {
+            tx,
+            overflow: Overflow {
+                chunks: 0,
+                frames: 0,
+            },
+        }
+    }
+
+    /// Offer one item without ever waiting.
+    ///
+    /// `frames` is what the item is worth in audio, so the counter measures
+    /// lost *audio* rather than lost messages - which is the number anyone
+    /// reading the report actually cares about.
+    ///
+    /// Never blocks, and that is the whole design. The capture thread has a
+    /// hard deadline against the device; making it wait on a slow disk is
+    /// exactly how frames are lost at the source, where nothing can recover
+    /// them. Dropping here is a loss we can count, in a place we can see.
+    fn offer(&mut self, item: T, frames: u64) -> Offered {
+        match self.tx.try_send(item) {
+            Ok(()) => Offered::Taken,
+            Err(TrySendError::Full(_)) => {
+                self.overflow.chunks += 1;
+                self.overflow.frames += frames;
+                Offered::Dropped {
+                    first: self.overflow.chunks == 1,
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => Offered::Closed,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -156,8 +388,8 @@ fn main() -> Result<()> {
     install_ctrlc_handler(move || ctrlc_flag.store(true, Ordering::Relaxed))?;
 
     let max_duration = cli.duration.map(Duration::from_secs);
-    let (mic_tx, mic_rx) = channel::<Chunk>();
-    let (sys_tx, sys_rx) = channel::<Chunk>();
+    let (mic_tx, mic_rx) = sync_channel::<Chunk>(QUEUE_DEPTH_CHUNKS);
+    let (sys_tx, sys_rx) = sync_channel::<Chunk>(QUEUE_DEPTH_CHUNKS);
 
     let mic_thread = want_mic.then(|| {
         spawn_capture(
@@ -293,7 +525,7 @@ fn spawn_capture(
     device: Option<String>,
     stop: Arc<AtomicBool>,
     max_duration: Option<Duration>,
-    tx: Sender<Chunk>,
+    tx: SyncSender<Chunk>,
 ) -> std::thread::JoinHandle<Result<ThreadOutcome>> {
     std::thread::spawn(move || -> Result<ThreadOutcome> {
         let mut capture = EndpointCapture::open_named(endpoint, device.as_deref())
@@ -306,7 +538,10 @@ fn spawn_capture(
         let mut first_qpc: Option<u64> = None;
         let mut estimator = DriftEstimator::new(format.sample_rate);
         let mut device_frames: u64 = 0;
+        let mut delivery = Delivery::default();
+        let mut sink = BoundedSink::new(tx);
 
+        let started = Instant::now();
         let stats = capture.record(&stop, max_duration, |packet| {
             // Use the engine's reconstructed stream start, not the raw packet
             // timestamp: for a loopback endpoint the first packet only arrives
@@ -319,23 +554,39 @@ fn spawn_capture(
             // silence is generated against the system clock, so feeding it to
             // the estimator would compare that clock with itself and report no
             // drift however far the hardware actually strays.
-            if !packet.synthesised {
+            let packet_frames =
+                (packet.samples.len() / format.channels.max(1) as usize) as u64;
+            if packet.synthesised {
+                // Counted, never fitted. Synthesised silence is timed by our own
+                // clock, so feeding it to the fit would compare that clock with
+                // itself - but how much of it there is decides whether the fit
+                // on the real frames means anything (D3).
+                estimator.note_synthesised(packet_frames);
+            } else {
                 if let Some(qpc) = packet.qpc_100ns {
                     estimator.observe(qpc, device_frames);
+                    delivery.observe(qpc, device_frames);
                 }
-                device_frames += (packet.samples.len() / format.channels.max(1) as usize) as u64;
+                device_frames += packet_frames;
             }
             downmix_to_mono(packet.samples, format.channels, &mut mono);
             converted.clear();
             resampler.process(&mono, &mut converted);
             if !converted.is_empty() {
-                // A closed receiver means the writer stopped; the capture then
-                // has nowhere to send audio, so there is nothing to do but
-                // let the loop wind down on the stop flag.
-                let _ = tx.send(Chunk {
+                let frames = converted.len() as u64;
+                let chunk = Chunk {
                     samples: std::mem::take(&mut converted),
                     first_qpc_100ns: first_qpc,
-                });
+                };
+                // Counted and announced, never absorbed. The point of bounding
+                // the queue is that falling behind becomes a fact somebody
+                // reads, instead of memory growing until the capture itself
+                // starts failing.
+                if let Offered::Dropped { first: true } = sink.offer(chunk, frames) {
+                    eprintln!(
+                        "\n!! {endpoint}: the writer fell more than {QUEUE_DEPTH_CHUNKS} chunks behind; audio is being dropped"
+                    );
+                }
             }
         })?;
 
@@ -345,8 +596,11 @@ fn spawn_capture(
             input_rate: format.sample_rate,
             input_channels: format.channels,
             mmcss: capture.mmcss_active(),
+            delivery,
+            elapsed: started.elapsed(),
             stats,
             drift: estimator.estimate(),
+            overflow: sink.overflow,
         })
     })
 }
@@ -408,6 +662,9 @@ fn write_stereo(
     let mut mic_peak = 0.0_f32;
     let mut sys_peak = 0.0_f32;
     let mut last_meter = Instant::now();
+    let mut last_memory = Instant::now();
+    let started = Instant::now();
+    let mut peak_resident: u64 = 0;
     let mut worst_imbalance: i64 = 0;
     let mut mic_start: Option<u64> = None;
     let mut sys_start: Option<u64> = None;
@@ -517,6 +774,23 @@ fn write_stereo(
             last_meter = Instant::now();
         }
 
+        // Criterion 2: the slope matters more than the endpoint, so this prints
+        // as the capture runs rather than once at the end.
+        if last_memory.elapsed() >= MEMORY_REPORT_INTERVAL {
+            if let Some(bytes) = resident_bytes() {
+                peak_resident = peak_resident.max(bytes);
+                println!(
+                    "
+[{:>5.1} min] resident memory: {:.1} MB (queued: mic {} / sys {} chunks)",
+                    started.elapsed().as_secs_f64() / 60.0,
+                    bytes as f64 / 1_048_576.0,
+                    mixer.imbalance().max(0),
+                    (-mixer.imbalance()).max(0),
+                );
+            }
+            last_memory = Instant::now();
+        }
+
         if !received && (mic_open || sys_open) {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -542,6 +816,18 @@ fn write_stereo(
         "Worst divergence while both streams ran   : {worst_imbalance} frames ({:.1} ms)",
         to_ms(worst_imbalance)
     );
+    // The high-water mark, which is the figure criterion 2 is written against.
+    // Sampled every five minutes rather than continuously: a peak between two
+    // samples would be missed, but the failure this guards against is steady
+    // growth, which no sampling interval can hide.
+    let final_resident = resident_bytes().unwrap_or(0);
+    peak_resident = peak_resident.max(final_resident);
+    if peak_resident > 0 {
+        println!(
+            "Peak resident memory (C2 budget 50 MB)    : {:.1} MB",
+            peak_resident as f64 / 1_048_576.0
+        );
+    }
     Ok((frames, sink, applied_skew.unwrap_or(0)))
 }
 
@@ -559,14 +845,23 @@ fn report_relative_drift(outcomes: &[Option<ThreadOutcome>]) {
     let drifts: Vec<DriftEstimate> = outcomes
         .iter()
         .flatten()
-        .filter_map(|outcome| outcome.drift)
+        .filter_map(|outcome| outcome.drift.as_ref().ok().copied())
         .collect();
 
     let [mic, system] = drifts.as_slice() else {
+        // Name what is missing on each endpoint. "Not measurable" on its own
+        // sent the reader looking for a bug; "8.3 % of frames were synthesised"
+        // sends them to the actual problem, which is C3 and not C2.
         println!(
             "
-Relative drift (C2): not measurable — both endpoints must be              recorded for long enough."
+--- Clock drift (C2) ---"
         );
+        println!("Relative drift    : not measurable");
+        for outcome in outcomes.iter().flatten() {
+            if let Err(reason) = &outcome.drift {
+                println!("  {:<16}: {reason}", outcome.endpoint.to_string());
+            }
+        }
         return;
     };
 
@@ -624,12 +919,28 @@ fn report(out: &Path, frames: u64, outcomes: &[Option<ThreadOutcome>]) {
             outcome.input_rate, outcome.input_channels, TARGET_SAMPLE_RATE
         );
         println!(
-            "  captured        : {} frames ({:.2} s at native rate)",
+            "  captured        : {} frames ({:.2} s at native rate) over {:.2} s of wall clock",
             stats.frames,
-            stats.duration(outcome.input_rate).as_secs_f64()
+            stats.duration(outcome.input_rate).as_secs_f64(),
+            outcome.elapsed.as_secs_f64()
         );
+        // C3, measured properly. The Windows flag stays on the line below as
+        // a hint, which is all it ever deserved to be.
+        match outcome.delivery.shortfall_percent(outcome.input_rate) {
+            Some(shortfall) => println!(
+                "  REAL LOSS (C3)  : {shortfall:.3} % over {:.1} s of streaming ({} frames delivered)",
+                outcome.delivery.window_seconds().unwrap_or(0.0),
+                outcome.real_frames()
+            ),
+            // Said plainly rather than printed as 100 %. A loopback endpoint
+            // delivers nothing while nothing plays, and calling that a total
+            // loss is arithmetic nobody can act on.
+            None => println!(
+                "  REAL LOSS (C3)  : no measurement - this endpoint never streamed (nothing was playing)"
+            ),
+        }
         println!(
-            "  discontinuities : {}  (C3 target: 0)",
+            "  discontinuities : {}  (Windows' own flag, which under-reports)",
             stats.discontinuities
         );
         println!("  silent packets  : {}", stats.silent_packets);
@@ -641,8 +952,14 @@ fn report(out: &Path, frames: u64, outcomes: &[Option<ThreadOutcome>]) {
             "  MMCSS Pro Audio : {}",
             if outcome.mmcss { "granted" } else { "DENIED" }
         );
-        match outcome.drift {
-            Some(drift) => println!(
+        if outcome.overflow.happened() {
+            println!(
+                "  QUEUE OVERFLOW  : {} chunks / {} frames dropped - the writer could not keep up",
+                outcome.overflow.chunks, outcome.overflow.frames
+            );
+        }
+        match &outcome.drift {
+            Ok(drift) => println!(
                 "  clock           : {:.3} Hz measured vs {:.0} nominal = {:+.2} ppm                  (over {:.0} s, {} points)",
                 drift.measured_rate,
                 drift.nominal_rate,
@@ -650,7 +967,11 @@ fn report(out: &Path, frames: u64, outcomes: &[Option<ThreadOutcome>]) {
                 drift.observed_seconds,
                 drift.samples
             ),
-            None => println!("  clock           : not enough data to measure drift"),
+            // Printed in full rather than swallowed: the reason is the useful
+            // part. "8.3 % of frames were synthesised" tells an operator what
+            // to fix; a missing line tells them nothing, and a bogus -83 293
+            // ppm tells them something false.
+            Err(reason) => println!("  clock           : no measurement - {reason}"),
         }
     }
 }
@@ -735,4 +1056,164 @@ where
     F: Fn() + Send + Sync + 'static,
 {
     anyhow::bail!("nb-capture only runs on Windows: it captures audio through WASAPI")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BoundedSink, Offered};
+
+    use super::Delivery;
+
+    /// 100 ms of packets at exactly 48 kHz: nothing missing.
+    fn stream(delivery: &mut Delivery, rate: f64, seconds: f64, packet_ms: f64, share: f64) {
+        let packets = (seconds * 1000.0 / packet_ms) as u64;
+        let mut frames = 0_u64;
+        for packet in 0..packets {
+            let elapsed = packet as f64 * packet_ms / 1000.0;
+            let qpc = 5_000_000_000 + (elapsed * 10_000_000.0) as u64;
+            delivery.observe(qpc, frames);
+            // `share` of the packets arrive; the rest are the ones that went
+            // missing, so the frame counter advances by less than the clock.
+            frames += (rate * packet_ms / 1000.0 * share) as u64;
+        }
+    }
+
+    #[test]
+    fn a_clean_stream_reports_no_loss() {
+        let mut delivery = Delivery::default();
+        stream(&mut delivery, 48_000.0, 60.0, 20.0, 1.0);
+
+        let shortfall = delivery
+            .shortfall_percent(48_000)
+            .expect("a minute of packets is measurable");
+        assert!(shortfall < 0.1, "expected no loss, got {shortfall} %");
+    }
+
+    /// The 2026-09-07 measurement, as a test: a device delivering 89.75 % of
+    /// what its own clock owes must be reported as having lost 10.25 %.
+    #[test]
+    fn a_stream_missing_a_tenth_reports_a_tenth() {
+        let mut delivery = Delivery::default();
+        stream(&mut delivery, 48_000.0, 3600.0, 20.0, 0.8975);
+
+        let shortfall = delivery
+            .shortfall_percent(48_000)
+            .expect("an hour of packets is measurable");
+        assert!(
+            (shortfall - 10.25).abs() < 0.2,
+            "expected about 10.25 % lost, got {shortfall} %"
+        );
+    }
+
+    /// A loopback endpoint with nothing playing delivers no packets at all.
+    /// Against the wall clock that reads as 100 % loss, which is true
+    /// arithmetic and a useless statement; the answer is that there is no
+    /// measurement to make.
+    #[test]
+    fn an_endpoint_that_never_streamed_has_no_measurement() {
+        let delivery = Delivery::default();
+        assert_eq!(delivery.shortfall_percent(48_000), None);
+    }
+
+    /// One packet is an instant, not a window. Dividing by it would produce a
+    /// number out of nothing.
+    #[test]
+    fn a_single_packet_is_not_a_window() {
+        let mut delivery = Delivery::default();
+        delivery.observe(5_000_000_000, 0);
+        assert_eq!(delivery.shortfall_percent(48_000), None);
+    }
+
+    /// Device startup must not be charged as loss. The window opens at the
+    /// first delivered packet, so a device that took 200 ms to come alive still
+    /// measures clean - which is the difference between 0.000 % and the
+    /// 0.225 % a wall-clock denominator reported on a flawless capture.
+    #[test]
+    fn a_slow_device_start_is_not_counted_as_loss() {
+        let mut delivery = Delivery::default();
+        // The first packet lands a full second after the capture began; the
+        // window starts there and ignores everything before it.
+        stream(&mut delivery, 48_000.0, 30.0, 20.0, 1.0);
+
+        let shortfall = delivery.shortfall_percent(48_000).expect("measurable");
+        assert!(
+            shortfall < 0.1,
+            "startup latency leaked into the measurement: {shortfall} %"
+        );
+    }
+
+    use std::sync::mpsc::sync_channel;
+
+    /// Criterion 4 of the brief: a producer faster than its consumer must leave
+    /// memory bounded and say that it did.
+    ///
+    /// The unbounded queues are the other half of the hour-long failure. When
+    /// the writer fell behind nothing pushed back, so the backlog grew, the
+    /// quadratic drain made the writer slower still, and 668 MB later the
+    /// capture threads were missing their own deadlines. Nothing reported any
+    /// of it: the recording simply came out short.
+    #[test]
+    fn a_producer_faster_than_its_consumer_is_bounded_and_counted() {
+        const DEPTH: usize = 8;
+        const OFFERED: usize = 1_000;
+        const FRAMES_EACH: u64 = 160;
+
+        let (tx, rx) = sync_channel::<u32>(DEPTH);
+        let mut sink = BoundedSink::new(tx);
+
+        // Nobody ever receives, which is the worst case the writer can present.
+        let mut taken = 0_usize;
+        for item in 0..OFFERED {
+            match sink.offer(item as u32, FRAMES_EACH) {
+                Offered::Taken => taken += 1,
+                Offered::Dropped { .. } => {}
+                Offered::Closed => panic!("the receiver is still alive"),
+            }
+        }
+
+        // Bounded: the queue holds the depth it was given, and not one more,
+        // however long the producer runs.
+        assert_eq!(taken, DEPTH, "the queue accepted more than its depth");
+        assert_eq!(
+            rx.try_iter().count(),
+            DEPTH,
+            "the queue held more than its depth"
+        );
+
+        // Counted: and in frames of audio, not in messages, because that is
+        // what the person reading the report needs to know.
+        assert_eq!(sink.overflow.chunks as usize, OFFERED - DEPTH);
+        assert_eq!(
+            sink.overflow.frames,
+            (OFFERED - DEPTH) as u64 * FRAMES_EACH,
+            "the counter must measure lost audio, not lost messages"
+        );
+    }
+
+    /// The warning is worth printing once. A hundred times a second it becomes
+    /// noise that hides the line above it.
+    #[test]
+    fn only_the_first_drop_announces_itself() {
+        let (tx, _rx) = sync_channel::<u32>(1);
+        let mut sink = BoundedSink::new(tx);
+
+        assert_eq!(sink.offer(0, 1), Offered::Taken);
+        assert_eq!(sink.offer(1, 1), Offered::Dropped { first: true });
+        for _ in 0..10 {
+            assert_eq!(sink.offer(2, 1), Offered::Dropped { first: false });
+        }
+    }
+
+    /// A writer that has gone away is not a saturation, and must not be counted
+    /// as lost audio: there is simply nothing left to send to.
+    #[test]
+    fn a_closed_writer_is_not_counted_as_loss() {
+        let (tx, rx) = sync_channel::<u32>(4);
+        let mut sink = BoundedSink::new(tx);
+        drop(rx);
+
+        assert_eq!(sink.offer(0, 160), Offered::Closed);
+        assert_eq!(sink.overflow.chunks, 0);
+        assert_eq!(sink.overflow.frames, 0);
+    }
 }

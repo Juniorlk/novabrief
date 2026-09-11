@@ -23,6 +23,53 @@ struct Observation {
     frames: u64,
 }
 
+/// Share of synthesised frames above which no drift figure is trustworthy.
+///
+/// The fit reads frames against elapsed time. It cannot distinguish "this
+/// crystal runs slow" from "these frames never arrived", so when audio is
+/// missing it measures the loss and reports it as drift. That is how the
+/// hour-long run produced -83 293 ppm: 8.3 %, for a quartz whose real error is
+/// a few tens of ppm. The number was not merely wrong, it was physically
+/// impossible, and nothing in the output said so.
+///
+/// Half a percent is far above any credible drift and far below the loss that
+/// would distort one, so it separates the two cases cleanly.
+const MAX_SYNTHESISED_SHARE: f64 = 0.005;
+
+/// Why a drift measurement was refused.
+///
+/// A refusal rather than `None`: "we cannot tell you" and "we have not looked
+/// yet" are different answers, and the caller has something to print for each.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DriftRefusal {
+    /// Fewer observations than a straight line deserves.
+    TooFewObservations,
+    /// Too short a span for a few ppm to show above buffer jitter.
+    TooShortASpan,
+    /// Every observation landed at the same instant; there is no line to fit.
+    Degenerate,
+    /// Frames went missing, so the fit would measure the loss and call it drift.
+    TooMuchLoss {
+        /// Share of frames that were synthesised rather than delivered.
+        synthesised_share: f64,
+    },
+}
+
+impl std::fmt::Display for DriftRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooFewObservations => write!(f, "not enough observations yet"),
+            Self::TooShortASpan => write!(f, "not enough elapsed time yet"),
+            Self::Degenerate => write!(f, "the observations carry no time span"),
+            Self::TooMuchLoss { synthesised_share } => write!(
+                f,
+                "{:.2} % of frames were synthesised, so any drift figure would be measuring the loss",
+                synthesised_share * 100.0
+            ),
+        }
+    }
+}
+
 /// Estimates a device's true sample rate, and hence its drift.
 #[derive(Debug, Clone)]
 pub struct DriftEstimator {
@@ -30,6 +77,8 @@ pub struct DriftEstimator {
     origin_qpc_100ns: Option<u64>,
     observations: Vec<Observation>,
     max_observations: usize,
+    delivered_frames: u64,
+    synthesised_frames: u64,
 }
 
 /// The outcome of a drift measurement.
@@ -69,6 +118,8 @@ impl DriftEstimator {
             // memory on a client machine. Beyond the cap, observations are
             // thinned by half, which keeps the span while halving the density.
             max_observations: 4096,
+            delivered_frames: 0,
+            synthesised_frames: 0,
         }
     }
 
@@ -78,6 +129,7 @@ impl DriftEstimator {
     /// we synthesised is timed by our own clock, so feeding it back in would
     /// measure the system clock against itself and always report zero drift.
     pub fn observe(&mut self, qpc_100ns: u64, frames: u64) {
+        self.delivered_frames = self.delivered_frames.max(frames);
         let origin = *self.origin_qpc_100ns.get_or_insert(qpc_100ns);
         let Some(elapsed) = qpc_100ns.checked_sub(origin) else {
             // A timestamp before the origin means the counter moved backwards;
@@ -101,6 +153,27 @@ impl DriftEstimator {
         }
     }
 
+    /// Record frames we invented because the device delivered none.
+    ///
+    /// These must never reach [`observe`]: silence we synthesised is timed by
+    /// our own clock, so fitting it would compare the system clock with itself
+    /// and report no drift however far the hardware strays. They are counted
+    /// here instead, because their *quantity* is what decides whether the fit
+    /// on the real frames means anything at all.
+    pub fn note_synthesised(&mut self, frames: u64) {
+        self.synthesised_frames = self.synthesised_frames.saturating_add(frames);
+    }
+
+    /// Share of frames that were synthesised rather than delivered.
+    #[must_use]
+    pub fn synthesised_share(&self) -> f64 {
+        let total = self.delivered_frames + self.synthesised_frames;
+        if total == 0 {
+            return 0.0;
+        }
+        self.synthesised_frames as f64 / total as f64
+    }
+
     /// Number of observations currently held.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -113,26 +186,39 @@ impl DriftEstimator {
         self.observations.is_empty()
     }
 
-    /// Fit the observations and report the measured rate.
+    /// Fit the observations and report the measured rate, or say why not.
     ///
-    /// Returns `None` until there is enough of a time span to say anything: a
-    /// drift of a few ppm is invisible over a second of buffer jitter, and
-    /// reporting a number from too little data would be worse than reporting
-    /// nothing.
-    #[must_use]
-    pub fn estimate(&self) -> Option<DriftEstimate> {
+    /// Refuses until there is enough of a time span to say anything: a drift of
+    /// a few ppm is invisible over a second of buffer jitter, and a number
+    /// built on too little data is worse than no number.
+    ///
+    /// Refuses too when frames have gone missing. The fit cannot tell a slow
+    /// crystal from audio that never arrived, so past
+    /// [`MAX_SYNTHESISED_SHARE`] it declines instead of reporting the loss as
+    /// drift. A measurement without a guard is worse than no measurement: it
+    /// looks like evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriftRefusal`] describing what is missing.
+    pub fn estimate(&self) -> Result<DriftEstimate, DriftRefusal> {
         const MIN_SAMPLES: usize = 16;
         const MIN_SPAN_SECONDS: f64 = 5.0;
 
+        let synthesised_share = self.synthesised_share();
+        if synthesised_share > MAX_SYNTHESISED_SHARE {
+            return Err(DriftRefusal::TooMuchLoss { synthesised_share });
+        }
+
         if self.observations.len() < MIN_SAMPLES {
-            return None;
+            return Err(DriftRefusal::TooFewObservations);
         }
         let span_seconds = self
             .observations
             .last()
             .map_or(0.0, |o| o.elapsed_100ns as f64 / 10_000_000.0);
         if span_seconds < MIN_SPAN_SECONDS {
-            return None;
+            return Err(DriftRefusal::TooShortASpan);
         }
 
         // Least squares fit of frames = slope * seconds + intercept.
@@ -154,16 +240,16 @@ impl DriftEstimator {
             variance += dt * dt;
         }
         if variance <= f64::EPSILON {
-            return None;
+            return Err(DriftRefusal::Degenerate);
         }
 
         let measured_rate = covariance / variance;
         let nominal = f64::from(self.nominal_rate);
         if nominal <= 0.0 || !measured_rate.is_finite() || measured_rate <= 0.0 {
-            return None;
+            return Err(DriftRefusal::Degenerate);
         }
 
-        Some(DriftEstimate {
+        Ok(DriftEstimate {
             nominal_rate: nominal,
             measured_rate,
             ppm: (measured_rate - nominal) / nominal * 1_000_000.0,
@@ -193,7 +279,7 @@ pub fn projected_offset_ms(ppm: f64, seconds: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{projected_offset_ms, relative_ppm, DriftEstimator};
+    use super::{projected_offset_ms, relative_ppm, DriftEstimator, DriftRefusal};
 
     /// Feed an estimator a device running at exactly `real_rate` Hz.
     fn feed(estimator: &mut DriftEstimator, real_rate: f64, seconds: f64, packet_ms: f64) {
@@ -204,6 +290,98 @@ mod tests {
             let frames = (elapsed_seconds * real_rate) as u64;
             estimator.observe(qpc, frames);
         }
+    }
+
+    /// The measurement the hour-long run actually produced, and why it is a lie.
+    ///
+    /// 10.25 % of frames never arrived. The fit sees a device that delivered
+    /// 43 078 frames per second where 48 000 were expected and concludes the
+    /// crystal runs 83 293 ppm slow - 8.3 %, for a component whose real error
+    /// is tens of ppm. No quartz on earth is that bad. The figure was not just
+    /// wrong, it was impossible, and it was printed as a measurement.
+    ///
+    /// What makes it dangerous is that it is *plausible-looking*: a number with
+    /// a sign and a unit, sitting where a number belongs.
+    #[test]
+    fn a_capture_that_lost_ten_percent_refuses_to_report_drift() {
+        let mut estimator = DriftEstimator::new(48_000);
+
+        // A device delivering 89.75 % of its nominal rate, because the rest was
+        // dropped downstream - exactly the 2026-09-07 measurement.
+        feed(&mut estimator, 43_077.7, 3600.0, 20.0);
+        estimator.note_synthesised((3600.0 * 48_000.0 * 0.1025) as u64);
+
+        match estimator.estimate() {
+            Err(DriftRefusal::TooMuchLoss { synthesised_share }) => {
+                assert!(
+                    (synthesised_share - 0.1025).abs() < 0.01,
+                    "the refusal should name the share it saw, got {synthesised_share}"
+                );
+            }
+            other => panic!("expected a refusal naming the loss, got {other:?}"),
+        }
+    }
+
+    /// And the refusal says which share it saw, because that is the number that
+    /// sends an operator to the real problem - the loss, not the clock.
+    #[test]
+    fn the_refusal_explains_itself() {
+        let mut estimator = DriftEstimator::new(48_000);
+        feed(&mut estimator, 48_000.0, 60.0, 20.0);
+        estimator.note_synthesised(48_000 * 60 / 10);
+
+        let message = estimator.estimate().expect_err("should refuse").to_string();
+        assert!(
+            message.contains("synthesised"),
+            "the reason should name the cause, got {message:?}"
+        );
+        assert!(
+            message.contains('%'),
+            "the reason should quantify it, got {message:?}"
+        );
+    }
+
+    /// A trickle of synthesised silence is normal - a packet missed here and
+    /// there - and must not cost us the measurement. The guard exists to
+    /// separate "a few frames" from "a tenth of the recording", not to refuse
+    /// whenever anything at all was padded.
+    #[test]
+    fn a_little_synthesised_silence_still_allows_a_measurement() {
+        let mut estimator = DriftEstimator::new(48_000);
+        feed(&mut estimator, 48_000.0 * (1.0 + 30.0 / 1e6), 600.0, 20.0);
+        // One frame in a thousand: well inside the half-percent guard.
+        estimator.note_synthesised(48_000 * 600 / 1000);
+
+        let estimate = estimator.estimate().expect("this should still measure");
+        assert!(
+            (estimate.ppm - 30.0).abs() < 2.0,
+            "expected about +30 ppm, got {}",
+            estimate.ppm
+        );
+    }
+
+    /// The guard has to bite before the other refusals, otherwise a capture
+    /// that is both short and lossy blames the wrong thing.
+    #[test]
+    fn loss_is_reported_ahead_of_a_short_span() {
+        let mut estimator = DriftEstimator::new(48_000);
+        feed(&mut estimator, 40_000.0, 1.0, 20.0);
+        estimator.note_synthesised(48_000);
+
+        assert!(
+            matches!(estimator.estimate(), Err(DriftRefusal::TooMuchLoss { .. })),
+            "a lossy capture must be told about the loss, not about its length"
+        );
+    }
+
+    /// Nothing synthesised, nothing to refuse.
+    #[test]
+    fn a_clean_capture_reports_no_synthesised_share() {
+        let mut estimator = DriftEstimator::new(48_000);
+        feed(&mut estimator, 48_000.0, 60.0, 20.0);
+
+        assert_eq!(estimator.synthesised_share(), 0.0);
+        assert!(estimator.estimate().is_ok());
     }
 
     #[test]
@@ -249,8 +427,9 @@ mod tests {
     fn no_estimate_before_there_is_enough_span_to_justify_one() {
         let mut estimator = DriftEstimator::new(48_000);
         feed(&mut estimator, 48_000.0, 1.0, 20.0);
-        assert!(
-            estimator.estimate().is_none(),
+        assert_eq!(
+            estimator.estimate(),
+            Err(DriftRefusal::TooShortASpan),
             "one second cannot resolve a few ppm"
         );
     }
