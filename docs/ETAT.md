@@ -5,8 +5,8 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-10** (lot L2 déployé, puis **audit de
-> cohérence** : sept défauts trouvés et corrigés, PR #22 à #24).
+> Dernière mise à jour : **2026-09-11** (correctifs de capture longue durée,
+> PR #27 ; brief du lot L3 écrit).
 
 ---
 
@@ -23,6 +23,8 @@
 | Lot L2 — réunions & pipeline | **terminé** (L2.1 à L2.8) | `docs/tasks/05_L2_reunions_pipeline.md` ; PR #11 à #17 |
 | Lots L3 à L7 | non commencés | `docs/tasks/04_APRES_LES_POC_lots_MVP.md` |
 | Audit de cohérence L1+L2 | **fait** | §2 bis ci-dessous ; PR #22, #23, #24 |
+| Correctifs capture longue durée | **codés**, validation 60 min en attente | PR #27 ; `docs/tasks/02_…` |
+| Lot L3 — desktop Windows | brief écrit, pas commencé | `docs/tasks/06_L3_application_desktop.md` |
 
 ### Lot L1 en détail
 
@@ -47,15 +49,28 @@
 
 ## 2. Prochaine étape
 
-**Lot L3 — application desktop Windows.** C'est elle qui produit l'audio que
-tout le reste attend.
+**Lot L3 — application desktop Windows**, dont le brief est écrit
+(`docs/tasks/06_L3_application_desktop.md`). C'est elle qui produit l'audio que
+tout le reste attend : sans elle, l'API déployée n'a rien à traiter.
 
-**À faire avant de la mettre entre les mains d'une PME pilote** : les
-correctifs de capture longue durée
-(`docs/tasks/02_correctifs_capture_longue_duree.md`), différés le 2026-09-07.
-Sur 60 minutes, 10,25 % de l'audio disparaît et la perte est **invisible** —
-le fichier a la bonne durée, le compte rendu est simplement incomplet, et le
-client ne comprend jamais pourquoi.
+### Les correctifs de capture sont codés (2026-09-11, PR #27)
+
+Les quatre défauts de `02_correctifs_capture_longue_duree.md` sont corrigés :
+
+| | Avant | Maintenant |
+|---|---|---|
+| Perte réelle | 10,25 % sur 60 min | 0,000 % sur 12 s |
+| RAM | 668 Mo à 32 min | 10,9 Mo |
+| Dérive rapportée | −83 293 ppm (impossible) | +12,72 ppm, ou refus motivé |
+| Mesure de C3 | drapeau Windows (sous-estime ×1000) | trames livrées / trames dues |
+
+**Ce qui n'est pas prononcé** : la capture réelle de 60 minutes, sur deux
+configurations (intégré, puis Bluetooth). Les critères 1, 2 et 5 du brief
+attendent. Une mesure de douze secondes ne dit rien d'une dérive lente ni
+d'une croissance mémoire — c'est exactement ce que les tests courts ne voient
+pas, et c'est ce qui avait laissé passer les 10,25 %.
+
+Elle **bloque la mise en main d'une PME pilote**, pas le développement de L3.
 
 ### En production depuis le 2026-09-10
 
@@ -232,6 +247,27 @@ service, qui ne voit que ce que le client a réellement envoyé. Un `null`
 explicite n'est accepté que sur `legal_id`, seule colonne nullable ; ailleurs
 c'est un 422. Sans ça, un formulaire web qui renvoie tout son état écraserait
 avec des valeurs vides ce que l'utilisateur n'a pas touché.
+
+### Un test de performance doit compter, pas chronométrer
+
+Le `drain` quadratique ne se voyait ni en relecture ni au chronomètre : sur un
+test court il est instantané. Ce qui le rend visible est de **compter les
+échantillons réellement déplacés** et de le comparer à ce qui est entré. Avec
+l'ancien comportement : 255 millions déplacés pour 2,5 millions fournis, sur un
+test de quelques secondes. Un chronomètre aurait été instable en CI et n'aurait
+rien prouvé.
+
+### Un compteur d'événements n'est pas une mesure de perte
+
+`AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` a signalé 2 et 5 événements pendant que
+10,25 % de l'audio disparaissait : une lacune est signalée **une fois**, quelle
+que soit sa durée. Un compteur d'occurrences ne mesure jamais un volume.
+
+Corollaire trouvé en lisant notre propre rapport : le dénominateur compte
+autant que le numérateur. Compter depuis l'ouverture du périphérique impute sa
+latence de démarrage à de la perte (0,225 % sur une capture parfaite), et face
+au temps mural un loopback silencieux affiche 100 % — arithmétiquement vrai,
+inexploitable. La fenêtre va du premier au dernier paquet réel.
 
 ### Une tâche postée avant le commit disparaît sans bruit
 
@@ -414,6 +450,9 @@ mv .env .env.hidden && python -m pytest -q ; mv .env.hidden .env
 - **Les emails transactionnels sont en français codé en dur.** `CLAUDE.md` §6
   demande que toute chaîne visible passe par i18n, et `users.locale` existe
   déjà. À reprendre quand le lot L4 apportera l'i18n côté serveur.
+- **La validation 60 min des correctifs de capture n'a pas tourné.** Critères
+  1, 2 et 5 de `02_correctifs_capture_longue_duree.md` non prononcés. Bloque
+  la mise en main d'une PME pilote.
 - **Une réunion en `QUOTA_HOLD` n'a aucune sortie.** Seul le webhook de
   paiement du lot L5 peut la relancer, et il n'existe pas. Sans effet
   aujourd'hui — aucun quota n'est assigné avant L5, donc rien n'y entre — mais
