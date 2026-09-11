@@ -311,6 +311,45 @@ impl Overflow {
     }
 }
 
+/// How much silence each channel needs so neither can run away from the other.
+///
+/// Returns `(left, right)` frames of silence to push.
+///
+/// The mixer only emits frames while **both** sides have data, which is what
+/// keeps the two voices aligned. The corollary is that a side which stops
+/// delivering pins the other one in memory, and that is not a theory: a
+/// 60-minute validation capture had the system loopback stop at minute 28 and
+/// the microphone backlog then grew by one second of audio per second of
+/// meeting - 6 003 681 frames and 34.8 MB by minute 35, on its way past a
+/// gigabyte over a four-hour meeting (EF-34 allows four hours).
+///
+/// Nothing reported it. The recording carried on, the file kept its duration,
+/// and the right channel was simply empty from minute 28 onwards - the same
+/// silent, plausible-looking failure as the 10.25 % loss.
+///
+/// `live` is about the thread, not the configuration. The original code padded
+/// a side nobody had asked to record, which is a different condition: it never
+/// covered a side that was being recorded and then ended.
+#[must_use]
+fn silence_needed(imbalance: i64, left_live: bool, right_live: bool) -> (usize, usize) {
+    // Both still running: the mixer holds the surplus on purpose, because the
+    // counterpart is on its way. That backlog is bounded by the clock
+    // difference between two devices, which is milliseconds.
+    if left_live && right_live {
+        return (0, 0);
+    }
+    match imbalance.cmp(&0) {
+        // Left leads: the right-hand side has stopped, so it is padded.
+        std::cmp::Ordering::Greater if !right_live => {
+            (0, usize::try_from(imbalance).unwrap_or(usize::MAX))
+        }
+        std::cmp::Ordering::Less if !left_live => {
+            (usize::try_from(-imbalance).unwrap_or(usize::MAX), 0)
+        }
+        _ => (0, 0),
+    }
+}
+
 /// What became of an item offered to a full-or-not queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Offered {
@@ -663,6 +702,8 @@ fn write_stereo(
     let mut sys_peak = 0.0_f32;
     let mut last_meter = Instant::now();
     let mut last_memory = Instant::now();
+    let mut mic_ended_reported = false;
+    let mut sys_ended_reported = false;
     let started = Instant::now();
     let mut peak_resident: u64 = 0;
     let mut worst_imbalance: i64 = 0;
@@ -733,20 +774,37 @@ fn write_stereo(
             }
         }
 
-        // A side that is not being recorded never produces samples, so it is fed
-        // silence to match the side that is: without it no stereo frame would
-        // ever be complete and the file would stay empty.
-        if !mic_recorded {
-            let deficit = usize::try_from(-mixer.imbalance()).unwrap_or(0);
-            if deficit > 0 {
-                mixer.push_left(&vec![0.0; deficit]);
-            }
+        // A side that is not producing - never asked for, or stopped part way
+        // through - is fed silence to match the one that is. Without it no
+        // stereo frame is ever complete: the file stays empty in the first
+        // case, and in the second the live side accumulates in memory for the
+        // rest of the meeting.
+        let (pad_left, pad_right) = silence_needed(
+            mixer.imbalance(),
+            mic_recorded && mic_open,
+            sys_recorded && sys_open,
+        );
+        if pad_left > 0 {
+            mixer.push_left(&vec![0.0; pad_left]);
         }
-        if !sys_recorded {
-            let deficit = usize::try_from(mixer.imbalance()).unwrap_or(0);
-            if deficit > 0 {
-                mixer.push_right(&vec![0.0; deficit]);
-            }
+        if pad_right > 0 {
+            mixer.push_right(&vec![0.0; pad_right]);
+        }
+
+        // An endpoint that was being recorded and has stopped is a partial
+        // recording, and the person who ran the capture has to be told at the
+        // moment it happens rather than at the end.
+        if mic_recorded && !mic_open && !mic_ended_reported {
+            eprintln!(
+                "\n!! the microphone stopped delivering; the rest is silence on the left channel"
+            );
+            mic_ended_reported = true;
+        }
+        if sys_recorded && !sys_open && !sys_ended_reported {
+            eprintln!(
+                "\n!! system audio stopped delivering; the rest is silence on the right channel"
+            );
+            sys_ended_reported = true;
         }
 
         // Measure the imbalance only while both endpoints are still running and
@@ -1064,6 +1122,55 @@ where
 #[cfg(test)]
 mod tests {
     use super::{BoundedSink, Offered};
+
+    use super::silence_needed;
+
+    /// D5, found by the 60-minute validation capture rather than by review.
+    ///
+    /// The loopback endpoint stopped at minute 28. Nothing padded the right
+    /// channel, the mixer held every microphone frame waiting for a
+    /// counterpart that never came, and the backlog grew one second per second:
+    /// 6 003 681 frames and 34.8 MB by minute 35, heading past a gigabyte over
+    /// the four hours EF-34 allows.
+    #[test]
+    fn a_side_that_stops_is_padded_rather_than_waited_for() {
+        // The microphone leads by ten seconds at 16 kHz and the system side is
+        // gone: the whole lead has to be covered with silence.
+        let (left, right) = silence_needed(160_000, true, false);
+        assert_eq!(left, 0);
+        assert_eq!(right, 160_000);
+    }
+
+    #[test]
+    fn the_same_holds_when_it_is_the_microphone_that_stops() {
+        let (left, right) = silence_needed(-160_000, false, true);
+        assert_eq!(left, 160_000);
+        assert_eq!(right, 0);
+    }
+
+    /// While both are running the mixer holds the surplus on purpose - that is
+    /// what keeps the two voices aligned, and the backlog is bounded by the
+    /// difference between two device clocks, which is milliseconds.
+    #[test]
+    fn a_healthy_lead_is_left_alone() {
+        assert_eq!(silence_needed(4_000, true, true), (0, 0));
+        assert_eq!(silence_needed(-4_000, true, true), (0, 0));
+    }
+
+    /// An endpoint nobody asked to record: the original condition, still
+    /// covered.
+    #[test]
+    fn an_endpoint_that_was_never_recorded_is_padded_too() {
+        assert_eq!(silence_needed(48_000, true, false).1, 48_000);
+        assert_eq!(silence_needed(48_000, false, false), (0, 48_000));
+    }
+
+    /// Nothing to pad when the side that stopped is the one already behind.
+    #[test]
+    fn a_stopped_side_that_is_ahead_needs_nothing() {
+        assert_eq!(silence_needed(-5_000, true, false), (0, 0));
+        assert_eq!(silence_needed(0, true, false), (0, 0));
+    }
 
     use super::Delivery;
 
