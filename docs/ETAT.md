@@ -5,8 +5,8 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-11** (correctifs de capture longue durée,
-> PR #27 ; brief du lot L3 écrit).
+> Dernière mise à jour : **2026-09-12** (lot L3.1 livré, PR #29 ; un cinquième
+> défaut de capture trouvé par la validation 60 min et corrigé, PR #30).
 
 ---
 
@@ -24,7 +24,8 @@
 | Lots L3 à L7 | non commencés | `docs/tasks/04_APRES_LES_POC_lots_MVP.md` |
 | Audit de cohérence L1+L2 | **fait** | §2 bis ci-dessous ; PR #22, #23, #24 |
 | Correctifs capture longue durée | **codés**, validation 60 min en attente | PR #27 ; `docs/tasks/02_…` |
-| Lot L3 — desktop Windows | brief écrit, pas commencé | `docs/tasks/06_L3_application_desktop.md` |
+| Lot L3.1 — coquille Tauri + i18n | **fait** | PR #29 |
+| Lot L3.2 à L3.9 | pas commencés | `docs/tasks/06_L3_application_desktop.md` |
 
 ### Lot L1 en détail
 
@@ -64,13 +65,40 @@ Les quatre défauts de `02_correctifs_capture_longue_duree.md` sont corrigés :
 | Dérive rapportée | −83 293 ppm (impossible) | +12,72 ppm, ou refus motivé |
 | Mesure de C3 | drapeau Windows (sous-estime ×1000) | trames livrées / trames dues |
 
-**Ce qui n'est pas prononcé** : la capture réelle de 60 minutes, sur deux
-configurations (intégré, puis Bluetooth). Les critères 1, 2 et 5 du brief
-attendent. Une mesure de douze secondes ne dit rien d'une dérive lente ni
-d'une croissance mémoire — c'est exactement ce que les tests courts ne voient
-pas, et c'est ce qui avait laissé passer les 10,25 %.
+### La validation 60 min a tourné le 2026-09-11, et elle ne compte pas
 
-Elle **bloque la mise en main d'une PME pilote**, pas le développement de L3.
+Elle a fait exactement ce qu'on attendait d'elle : **trouver ce qu'aucun test
+court ne voit**. Deux découvertes, et aucune n'était dans D1–D4.
+
+**D5 — un endpoint qui s'arrête retient l'autre en mémoire.** Le loopback
+système a cessé de livrer à la 28ᵉ minute. Le mixeur n'émet que tant que les
+deux côtés ont des données, donc chaque trame micro suivante a été retenue :
+
+| Minute | Mémoire | Écart du mixeur |
+|---|---|---|
+| 25 | 12,7 Mo | 30 trames |
+| 30 | 17,0 Mo | 1 203 169 |
+| 40 | 53,1 Mo | 10 803 169 |
+| **pic** | **363,8 Mo** | — |
+
+Une seconde d'audio retenue par seconde de réunion, en silence : le fichier
+gardait sa durée et le canal droit était vide. **Corrigé (PR #30)** — un côté
+qui s'arrête est comblé par du silence, et l'arrêt est annoncé sur le moment.
+
+**La cause de l'arrêt : `0x88890004`, `AUDCLNT_E_DEVICE_INVALIDATED`.** Le
+périphérique de rendu a été invalidé en cours de capture. Les journaux Windows
+(Kernel-Power 506 à 22:56:56) montrent que la machine est entrée en **veille
+moderne** pendant le test. Ce n'est pas un artefact de laboratoire : une réunion
+de 90 minutes sur un portable qui met son écran en veille rencontrera la même
+chose. Sa gestion est **EF-15 / C5**, dans le lot L3.3.
+
+**Pourquoi la passe ne compte pas** : la machine a dormi, donc ce n'est pas une
+heure de capture continue. Les critères 1, 2 et 5 restent **non prononcés**, et
+il faut refaire la passe avec la mise en veille désactivée. Ce qu'elle a tout
+de même établi : la mémoire est restée **plate à 12,7 Mo pendant 28 minutes**,
+contre 668 Mo auparavant — D1 et D2 tiennent.
+
+Ça **bloque la mise en main d'une PME pilote**, pas le développement de L3.
 
 ### En production depuis le 2026-09-10
 
@@ -247,6 +275,28 @@ service, qui ne voit que ce que le client a réellement envoyé. Un `null`
 explicite n'est accepté que sur `legal_id`, seule colonne nullable ; ailleurs
 c'est un 422. Sans ça, un formulaire web qui renvoie tout son état écraserait
 avec des valeurs vides ce que l'utilisateur n'a pas touché.
+
+### Une machine qui dort invalide le périphérique audio
+
+Une validation de longue durée doit se faire **mise en veille désactivée**,
+sinon on mesure le sommeil de la machine. Le journal Windows
+(`Kernel-Power`, identifiants 506 / 507) dit à la seconde près si ça s'est
+produit — à consulter avant de croire une mesure longue.
+
+Et c'est aussi un fait produit, pas seulement un fait de test : la veille lève
+`AUDCLNT_E_DEVICE_INVALIDATED` sur le flux en cours, et NovaBrief doit y
+survivre (EF-15, C5).
+
+### Mes scripts Python réécrivent les fichiers en CRLF
+
+`Path.write_text()` traduit `\n` en `\r\n` sous Windows. Les fichiers
+paraissent alors modifiés pour Git, échouent à `prettier --check` et à
+`cargo fmt --check` **localement**, alors que le contenu commité est propre —
+`.gitattributes` normalise à l'entrée. Deuxième fois que les fins de ligne
+produisent une fausse alerte sur ce dépôt.
+
+Mesurer avec `git cat-file blob <sha> | python -c "...count(b'\r\n')"`, jamais
+avec `od | grep`, qui avait déjà donné un faux positif.
 
 ### Un test de performance doit compter, pas chronométrer
 
@@ -450,9 +500,14 @@ mv .env .env.hidden && python -m pytest -q ; mv .env.hidden .env
 - **Les emails transactionnels sont en français codé en dur.** `CLAUDE.md` §6
   demande que toute chaîne visible passe par i18n, et `users.locale` existe
   déjà. À reprendre quand le lot L4 apportera l'i18n côté serveur.
-- **La validation 60 min des correctifs de capture n'a pas tourné.** Critères
-  1, 2 et 5 de `02_correctifs_capture_longue_duree.md` non prononcés. Bloque
-  la mise en main d'une PME pilote.
+- **La validation 60 min n'a pas de passe valide.** Celle du 2026-09-11 a été
+  coupée par une mise en veille de la machine. Critères 1, 2 et 5 de
+  `02_correctifs_capture_longue_duree.md` non prononcés. Bloque la mise en main
+  d'une PME pilote.
+- **`AUDCLNT_E_DEVICE_INVALIDATED` n'est pas géré.** Un endpoint invalidé en
+  cours de capture meurt et le reste de la réunion est enregistré en mono sans
+  que l'utilisateur en soit averti autrement que par un message en console.
+  C'est EF-15 / C5, prévu au lot L3.3.
 - **Une réunion en `QUOTA_HOLD` n'a aucune sortie.** Seul le webhook de
   paiement du lot L5 peut la relancer, et il n'existe pas. Sans effet
   aujourd'hui — aucun quota n'est assigné avant L5, donc rien n'y entre — mais
