@@ -30,6 +30,12 @@ const FRAME_SAMPLES: usize = TARGET_SAMPLE_RATE as usize * FRAME_MS / 1000;
 /// Interleaved stereo samples in one frame.
 const FRAME_INTERLEAVED: usize = FRAME_SAMPLES * 2;
 
+/// Dead prefix tolerated before the pending buffer is compacted.
+///
+/// Small enough that an idle encoder does not sit on stale samples, large
+/// enough that the steady state - a few frames in flight - never copies at all.
+const COMPACT_THRESHOLD: usize = FRAME_INTERLEAVED * 8;
+
 /// Upper bound for one encoded packet. Opus never exceeds this at our bitrate.
 const MAX_PACKET: usize = 4000;
 
@@ -119,6 +125,26 @@ pub struct SegmentedOpusWriter {
     segment_samples: u64,
 
     pending: Vec<f32>,
+    /// How much of `pending` has already been encoded.
+    ///
+    /// Consuming the front of a `Vec` with `drain(..n)` shifts everything after
+    /// it, so a buffer that is behind costs O(n) *per frame* and O(n squared)
+    /// over a backlog. That is a feedback loop rather than a constant penalty:
+    /// the further behind the encoder falls, the more each frame costs, and the
+    /// further behind it falls. Over an hour it took memory to 668 MB and cost
+    /// 10.25 % of the audio.
+    ///
+    /// A cursor instead. Nothing moves while frames are consumed; the tail is
+    /// compacted only once the dead prefix is worth more than the copy, which
+    /// makes the amortised cost per sample constant.
+    head: usize,
+    /// Samples physically copied by compaction.
+    ///
+    /// Kept because this is the quantity that regressed: with `drain` it grew
+    /// with the square of the backlog, and nothing in the output would have
+    /// shown it. A counter makes the invariant testable instead of a matter of
+    /// trust - see `compaction_stays_linear_under_backlog`.
+    moved: u64,
     packet: Vec<u8>,
     /// Encoder lookahead in 48 kHz samples, written as the Ogg Opus pre-skip.
     pre_skip: u16,
@@ -191,6 +217,8 @@ impl SegmentedOpusWriter {
             bitrate,
             segment_samples: (seconds * f64::from(TARGET_SAMPLE_RATE)) as u64,
             pending: Vec::with_capacity(FRAME_INTERLEAVED * 4),
+            head: 0,
+            moved: 0,
             packet: vec![0_u8; MAX_PACKET],
             current: None,
             segments: Vec::new(),
@@ -214,18 +242,18 @@ impl SegmentedOpusWriter {
     pub fn write(&mut self, interleaved: &[f32]) -> Result<(), EncodeError> {
         self.pending.extend_from_slice(interleaved);
 
-        while self.pending.len() >= FRAME_INTERLEAVED {
+        while self.buffered() >= FRAME_INTERLEAVED {
             if self.current.is_none() {
                 self.open_segment()?;
             }
 
             let encoded = {
-                let frame = &self.pending[..FRAME_INTERLEAVED];
+                let frame = &self.pending[self.head..self.head + FRAME_INTERLEAVED];
                 self.encoder
                     .encode_float(frame, &mut self.packet)
                     .map_err(EncodeError::Encode)?
             };
-            self.pending.drain(..FRAME_INTERLEAVED);
+            self.head += FRAME_INTERLEAVED;
 
             let packet = self.packet[..encoded].to_vec();
             if let Some(previous) = self.held.replace(packet) {
@@ -246,7 +274,42 @@ impl SegmentedOpusWriter {
                 self.close_segment()?;
             }
         }
+        self.compact();
         Ok(())
+    }
+
+    /// Samples still waiting to be encoded.
+    ///
+    /// Public because criterion 2 of the brief is about memory, and a bound
+    /// nobody can read is a bound nobody checks.
+    #[must_use]
+    pub fn buffered(&self) -> usize {
+        self.pending.len() - self.head
+    }
+
+    /// Drop the encoded prefix, but only when it has grown worth the copy.
+    ///
+    /// Compacting on every call would restore exactly the per-frame O(n) this
+    /// cursor exists to avoid. Waiting until the dead prefix is at least half
+    /// the buffer means each sample is moved at most once per doubling, so the
+    /// amortised cost is constant however far behind the encoder gets.
+    fn compact(&mut self) {
+        if self.head == 0 {
+            return;
+        }
+        if self.head < self.pending.len() - self.head && self.head < COMPACT_THRESHOLD {
+            return;
+        }
+        self.moved += (self.pending.len() - self.head) as u64;
+        self.pending.copy_within(self.head.., 0);
+        self.pending.truncate(self.pending.len() - self.head);
+        self.head = 0;
+    }
+
+    /// Samples moved by compaction so far.
+    #[must_use]
+    pub const fn samples_moved(&self) -> u64 {
+        self.moved
     }
 
     /// Flush the tail and write the manifest.
@@ -260,7 +323,14 @@ impl SegmentedOpusWriter {
         output_device: &str,
         start_skew_ms: i64,
     ) -> Result<Manifest, EncodeError> {
-        if !self.pending.is_empty() {
+        if self.buffered() > 0 {
+            // The cursor is dropped first: what is left to flush is the live
+            // region, and padding has to be measured from there rather than
+            // from a buffer that still carries everything already encoded.
+            self.pending.copy_within(self.head.., 0);
+            self.pending.truncate(self.buffered());
+            self.head = 0;
+
             self.pending.resize(FRAME_INTERLEAVED, 0.0);
             if self.current.is_none() {
                 self.open_segment()?;
@@ -272,6 +342,7 @@ impl SegmentedOpusWriter {
                     .map_err(EncodeError::Encode)?
             };
             self.pending.clear();
+            self.head = 0;
             let packet = self.packet[..encoded].to_vec();
             if let Some(previous) = self.held.replace(packet) {
                 self.emit(previous, false)?;
@@ -448,6 +519,135 @@ pub const fn samples_to_ms(samples: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A directory of this test's own.
+    ///
+    /// The counter is not decoration. Tests share a process, so the pid does
+    /// not separate them, and picking a name by hand already collided once:
+    /// `scratch("tail")` landed on the directory
+    /// `a_short_tail_is_kept_rather_than_dropped` had been using for months.
+    /// The two deleted each other's segments and the suite failed roughly one
+    /// run in three, in whichever test lost the race - which is the worst kind
+    /// of red, because it accuses innocent code.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("nb-opus-{name}-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// D1: the defect that cost 10.25 % of an hour-long recording.
+    ///
+    /// `drain(..FRAME_INTERLEAVED)` shifted the whole remaining buffer on every
+    /// frame, so consuming a backlog of n frames moved about n squared over two
+    /// samples. The further behind the encoder fell the more each frame cost,
+    /// which is a feedback loop rather than a constant penalty.
+    ///
+    /// The bound below is deliberately generous - linear with a factor of two.
+    /// The old implementation exceeds it by orders of magnitude, and no
+    /// plausible correct implementation comes near it.
+    #[test]
+    fn compaction_stays_linear_under_backlog() {
+        let directory = scratch("backlog");
+        let mut writer = SegmentedOpusWriter::new(&directory, "seg", 24_000, 5.0)
+            .expect("the writer should open");
+
+        // A backlog, then a small remainder: the shape that made `drain` fold.
+        // Each call hands over 200 whole frames plus a few stray samples, so
+        // the old code shifted a shrinking tail two hundred times per call.
+        const BURSTS: usize = 20;
+        const FRAMES_PER_BURST: usize = 200;
+        let burst = vec![0.0_f32; FRAME_INTERLEAVED * FRAMES_PER_BURST + 7];
+
+        for _ in 0..BURSTS {
+            writer.write(&burst).expect("writing should succeed");
+        }
+
+        let fed = (burst.len() * BURSTS) as u64;
+        assert!(
+            writer.samples_moved() <= fed * 2,
+            "compaction moved {} samples for {fed} fed - that is superlinear",
+            writer.samples_moved()
+        );
+
+        let _ = writer.finish("mic", "sys", 0);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The steady state is the one that runs for an hour: chunks arriving a
+    /// little faster than one frame, for hundreds of thousands of frames.
+    ///
+    /// What matters here is memory, not copies. The buffer holds what has not
+    /// yet made a whole frame and nothing else, so it stays within a frame
+    /// however long the recording runs - which is the difference between the
+    /// 668 MB measured over an hour and a flat few kilobytes.
+    #[test]
+    fn the_buffer_stays_within_a_frame_however_long_it_runs() {
+        let directory = scratch("steady");
+        let mut writer = SegmentedOpusWriter::new(&directory, "seg", 24_000, 5.0)
+            .expect("the writer should open");
+
+        let chunk = vec![0.0_f32; FRAME_INTERLEAVED / 2 + 3];
+        for round in 0..2_000 {
+            writer.write(&chunk).expect("writing should succeed");
+            assert!(
+                writer.buffered() < FRAME_INTERLEAVED,
+                "round {round}: {} samples buffered, more than one frame",
+                writer.buffered()
+            );
+        }
+
+        // And the copying stayed proportional to what went in, rather than to
+        // the square of it. Compaction here moves only the few samples left
+        // over from each frame, which is the amortisation working, not a leak.
+        let fed = (chunk.len() * 2_000) as u64;
+        assert!(
+            writer.samples_moved() <= fed,
+            "moved {} samples for {fed} fed",
+            writer.samples_moved()
+        );
+
+        let _ = writer.finish("mic", "sys", 0);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The cursor must not swallow the tail: `finish` pads whatever is left of
+    /// the live region, not of a buffer still holding everything encoded.
+    #[test]
+    fn the_tail_after_compaction_is_still_flushed() {
+        let directory = scratch("tail");
+        let mut writer = SegmentedOpusWriter::new(&directory, "seg", 24_000, 5.0)
+            .expect("the writer should open");
+
+        // Enough to force at least one compaction, then a partial frame left
+        // over that only `finish` can emit.
+        writer
+            .write(&vec![0.25_f32; FRAME_INTERLEAVED * 40])
+            .expect("writing should succeed");
+        writer
+            .write(&vec![0.25_f32; FRAME_INTERLEAVED / 3])
+            .expect("writing should succeed");
+
+        let before = writer.total_samples();
+        let manifest = writer
+            .finish("mic", "sys", 0)
+            .expect("finish should succeed");
+
+        assert!(
+            manifest.duration_ms > 0,
+            "the flushed tail should extend the recording"
+        );
+        assert!(
+            manifest.duration_ms * u64::from(TARGET_SAMPLE_RATE) / 1000 > before,
+            "the partial frame left after compaction was dropped"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     use super::{samples_to_ms, SegmentedOpusWriter, FRAME_INTERLEAVED, FRAME_SAMPLES};
     use crate::resample::TARGET_SAMPLE_RATE;
 

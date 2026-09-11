@@ -23,7 +23,7 @@ pub mod resample;
 #[cfg(windows)]
 pub mod capture;
 
-pub use drift::{projected_offset_ms, relative_ppm, DriftEstimate, DriftEstimator};
+pub use drift::{projected_offset_ms, relative_ppm, DriftEstimate, DriftEstimator, DriftRefusal};
 pub use encode::{EncodeError, Manifest, SegmentRecord, SegmentedOpusWriter};
 pub use error::{CaptureError, Endpoint, Result};
 pub use format::{downmix_to_mono, peak, SampleFormat, StreamFormat};

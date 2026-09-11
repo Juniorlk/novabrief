@@ -22,6 +22,9 @@ pub const TARGET_SAMPLE_RATE: u32 = 16_000;
 /// Input frames consumed per resampler call.
 const CHUNK: usize = 1024;
 
+/// Dead prefix tolerated before the pending buffer is compacted.
+const COMPACT_THRESHOLD: usize = CHUNK * 8;
+
 /// Resamples one mono stream to [`TARGET_SAMPLE_RATE`].
 ///
 /// Input arrives in whatever sizes WASAPI hands out, so the incoming samples are
@@ -30,6 +33,16 @@ const CHUNK: usize = 1024;
 pub struct MonoResampler {
     inner: Option<SincFixedIn<f32>>,
     pending: Vec<f32>,
+    /// How much of `pending` has already been converted.
+    ///
+    /// Same reasoning as the encoder: `drain(..CHUNK)` shifts the whole tail,
+    /// so a resampler that is behind pays O(n) per chunk and O(n squared) over
+    /// a backlog. A cursor moves nothing, and the tail is compacted only when
+    /// the dead prefix has earned the copy.
+    head: usize,
+    /// Samples physically copied by compaction. See the encoder's field of the
+    /// same name: this is the quantity that grew quadratically.
+    moved: u64,
     scratch_in: Vec<Vec<f32>>,
     scratch_out: Vec<Vec<f32>>,
     input_rate: u32,
@@ -56,6 +69,8 @@ impl MonoResampler {
             return Self {
                 inner: None,
                 pending: Vec::new(),
+                head: 0,
+                moved: 0,
                 scratch_in: Vec::new(),
                 scratch_out: Vec::new(),
                 input_rate,
@@ -80,6 +95,8 @@ impl MonoResampler {
         Self {
             inner,
             pending: Vec::new(),
+            head: 0,
+            moved: 0,
             scratch_in: vec![Vec::with_capacity(CHUNK)],
             scratch_out: Vec::new(),
             input_rate,
@@ -107,10 +124,19 @@ impl MonoResampler {
 
         self.pending.extend_from_slice(input);
 
-        while self.pending.len() >= CHUNK {
-            let chunk: Vec<f32> = self.pending.drain(..CHUNK).collect();
-            self.scratch_in.clear();
-            self.scratch_in.push(chunk);
+        while self.pending.len() - self.head >= CHUNK {
+            // Copied into the scratch buffer the resampler already owns rather
+            // than collected into a fresh Vec: one allocation per chunk is one
+            // allocation every few milliseconds, for the whole meeting.
+            let chunk = &self.pending[self.head..self.head + CHUNK];
+            match self.scratch_in.first_mut() {
+                Some(buffer) => {
+                    buffer.clear();
+                    buffer.extend_from_slice(chunk);
+                }
+                None => self.scratch_in.push(chunk.to_vec()),
+            }
+            self.head += CHUNK;
 
             match resampler.process(&self.scratch_in, None) {
                 Ok(converted) => {
@@ -128,6 +154,30 @@ impl MonoResampler {
                 }
             }
         }
+
+        // Same amortisation as the encoder: nothing moves in the steady state,
+        // and a sample is copied at most once per doubling of the backlog.
+        if self.head > 0
+            && (self.head >= self.pending.len() - self.head || self.head >= COMPACT_THRESHOLD)
+        {
+            self.moved += (self.pending.len() - self.head) as u64;
+            self.pending.copy_within(self.head.., 0);
+            self.pending.truncate(self.pending.len() - self.head);
+            self.head = 0;
+        }
+    }
+
+    /// Samples moved by compaction so far.
+    #[must_use]
+    pub const fn samples_moved(&self) -> u64 {
+        self.moved
+    }
+
+    /// Samples waiting to be converted. Exposed so a test can prove the buffer
+    /// does not grow without bound when the caller runs ahead.
+    #[must_use]
+    pub fn buffered(&self) -> usize {
+        self.pending.len() - self.head
     }
 }
 
@@ -219,7 +269,45 @@ impl StereoMixer {
 
 #[cfg(test)]
 mod tests {
-    use super::{MonoResampler, StereoMixer, TARGET_SAMPLE_RATE};
+
+    /// D1, the resampler's half: same quadratic drain, same generous bound.
+    #[test]
+    fn compaction_stays_linear_under_backlog() {
+        let mut resampler = MonoResampler::new(48_000);
+        let mut out = Vec::new();
+
+        const BURSTS: usize = 20;
+        let burst = vec![0.0_f32; CHUNK * 200 + 7];
+        for _ in 0..BURSTS {
+            resampler.process(&burst, &mut out);
+        }
+
+        let fed = (burst.len() * BURSTS) as u64;
+        assert!(
+            resampler.samples_moved() <= fed * 2,
+            "compaction moved {} samples for {fed} fed - that is superlinear",
+            resampler.samples_moved()
+        );
+    }
+
+    /// Whatever the backlog, the buffer keeps less than one chunk once the
+    /// caller stops feeding it: growth is bounded by the input, not by time.
+    #[test]
+    fn the_buffer_never_keeps_more_than_a_chunk() {
+        let mut resampler = MonoResampler::new(44_100);
+        let mut out = Vec::new();
+
+        for _ in 0..200 {
+            resampler.process(&vec![0.1_f32; CHUNK * 3 + 11], &mut out);
+            assert!(
+                resampler.buffered() < CHUNK,
+                "buffered {} samples, which is more than one chunk",
+                resampler.buffered()
+            );
+        }
+    }
+
+    use super::{MonoResampler, StereoMixer, CHUNK, TARGET_SAMPLE_RATE};
 
     #[test]
     fn matching_rate_is_passthrough() {
