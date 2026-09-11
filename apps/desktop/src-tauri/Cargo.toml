@@ -1,0 +1,27 @@
+[package]
+name = "novabrief-desktop"
+description = "NovaBrief for Windows: records a meeting from the machine, without a bot in the call."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# A library plus a thin binary rather than one `main.rs`. Tauri's own mobile
+# entry point expects the library shape, and it is also what lets the tray and
+# state logic below be unit-tested without starting a window.
+[lib]
+name = "novabrief_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+audio-engine = { path = "crates/audio-engine" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["tray-icon"] }

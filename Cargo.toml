@@ -1,8 +1,9 @@
-# Rust workspace. Only the crates required by POC #1 are members; vault,
-# uploader and api-client join when their lot starts (CLAUDE.md section 2).
+# Rust workspace. vault, uploader and api-client join when their sub-task
+# starts (CLAUDE.md section 2); the desktop binary itself arrives with L3.1.
 [workspace]
 resolver = "2"
 members = [
+    "apps/desktop/src-tauri",
     "apps/desktop/src-tauri/crates/audio-engine",
     "tools/nb-capture",
     "tools/nb-testsignal",

@@ -170,6 +170,13 @@ jobs:
       - name: ESLint
         run: pnpm run lint
 
+      # Never ran until now, which is why infra/ had drifted: CLAUDE.md section
+      # 6 asks for Prettier to pass, and a check nobody runs is a check that is
+      # not enforced. `make fmt-check` covers it locally, but only for whoever
+      # remembers.
+      - name: Prettier
+        run: pnpm run format:check
+
       - name: TypeScript
         run: pnpm run typecheck
 

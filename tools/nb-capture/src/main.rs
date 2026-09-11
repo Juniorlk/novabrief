@@ -779,13 +779,16 @@ fn write_stereo(
         if last_memory.elapsed() >= MEMORY_REPORT_INTERVAL {
             if let Some(bytes) = resident_bytes() {
                 peak_resident = peak_resident.max(bytes);
+                // The imbalance, named for what it is. It is a signed frame
+                // count - how far the leading side is ahead of the other -
+                // and calling it a queue depth, as this line first did, would
+                // have put a wrong unit next to a right number.
                 println!(
                     "
-[{:>5.1} min] resident memory: {:.1} MB (queued: mic {} / sys {} chunks)",
+[{:>5.1} min] resident memory: {:.1} MB (mixer imbalance: {:+} frames)",
                     started.elapsed().as_secs_f64() / 60.0,
                     bytes as f64 / 1_048_576.0,
-                    mixer.imbalance().max(0),
-                    (-mixer.imbalance()).max(0),
+                    mixer.imbalance(),
                 );
             }
             last_memory = Instant::now();
