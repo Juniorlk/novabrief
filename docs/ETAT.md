@@ -5,8 +5,8 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-12** (**validation 60 min prononcée** ;
-> L3.1, L3.2 et la première moitié de L3.3 livrés ; PR #29 à #35).
+> Dernière mise à jour : **2026-09-12** (validation 60 min prononcée ;
+> **L3.1, L3.2 et L3.3 livrés** ; PR #29 à #37).
 
 ---
 
@@ -28,7 +28,8 @@
 | Lot L3.2 — coffre local chiffré | **fait** | PR #32 |
 | L3.3 — récupération de périphérique (EF-15 / C5) | **fait** | PR #33 |
 | L3.3 — chemin audio → coffre chiffré | **fait** | PR #35 |
-| L3.3 — machine à états, pause, durées (EF-33, EF-34) | **reste à faire** | question ouverte ci-dessous |
+| L3.3 — machine à états, pause, durées (EF-33, EF-34) | **fait** | PR #37 |
+| L3.4 à L3.9 | pas commencés | `docs/tasks/06_L3_application_desktop.md` |
 | Lot L3.4 à L3.9 | pas commencés | `docs/tasks/06_L3_application_desktop.md` |
 
 ### Lot L1 en détail
@@ -218,31 +219,34 @@ et en constatant l'échec.
 
 ---
 
-## 2 ter. Question ouverte : que fait la pause du flux audio ? (EF-33)
+## 2 ter. La pause : une question posée pour rien
 
-EF-33 demande une pause qui **ne crée pas de second fichier** et dont le temps
-**n'est pas facturé**. Le chemin audio → coffre est en place (PR #35) ; c'est le
-pilotage qui reste, et il bute sur une interaction qui n'est pas évidente.
+Consigné parce que l'erreur est instructive, pas le résultat.
 
-Le moteur de capture **synthétise du silence contre l'horloge murale** : c'est
-ce qui garantit que la durée du fichier correspond à celle de la réunion. Si on
-se contente de jeter l'audio pendant une pause de dix minutes, le moteur
-considère qu'il a dix minutes de retard et émet dix minutes de silence à la
-reprise — ce qui annule exactement ce que la pause devait faire.
+J'avais écrit ici que la pause posait un arbitrage difficile : le moteur
+synthétise du silence **contre l'horloge murale**, donc jeter l'audio pendant
+une pause de dix minutes le laisserait croire qu'il a dix minutes de retard, et
+il en émettrait autant de silence à la reprise. Deux issues étaient proposées,
+dont l'une touchait aux flux WASAPI.
 
-Deux issues :
+**C'était faux.** Le moteur ne synthétise que s'il ne reçoit *rien* :
 
-1. **Arrêter les flux WASAPI à la pause, les redémarrer à la reprise.** L'horloge
-   du moteur repart de zéro. C'est cohérent — « pas de fichiers multiples »
-   parle de la *sortie*, et l'enregistrement du coffre reste ouvert. Le risque
-   est qu'un arrêt/redémarrage invalide le périphérique, ce que l'on sait
-   désormais gérer (PR #33) mais ce qui n'a jamais été exercé.
-2. **Apprendre la pause au moteur**, pour qu'il gèle sa référence temporelle.
-   Plus invasif, et ça met une notion produit dans une couche qui n'en a aucune.
+```rust
+if !produced_this_cycle {   // seulement si le périphérique n'a rien livré
+```
 
-Penche pour (1), mais c'est un arbitrage à poser plutôt qu'à décider en
-passant : il détermine ce qui se produit quand quelqu'un met une réunion en
-pause pendant un quart d'heure, ce qui est un usage réel.
+Pendant une pause, le micro continue de livrer — c'est en aval qu'on jette.
+Le moteur ne prend donc aucun retard et n'émet aucune rafale. Il n'y avait pas
+d'arbitrage, seulement un booléen.
+
+Ce que ça coûte : un arbitrage demandé à Novafrik sur un problème inexistant.
+Ce que ça enseigne : **relire le code avant de porter une difficulté à
+quelqu'un**, surtout quand la difficulté justifierait de toucher à une couche
+basse.
+
+La décision produit, elle, tient en une phrase de Novafrik (2026-09-12) :
+« au client de savoir mettre pause, vu que c'est lui qui décide quand la
+réunion se termine ». La pause reste, et c'est un contrôle utilisateur.
 
 ---
 
@@ -600,8 +604,10 @@ mv .env .env.hidden && python -m pytest -q ; mv .env.hidden .env
 - **Un changement de format au retour d'un périphérique fait échouer la
   capture** plutôt que de reconstruire le pipeline. `FormatChanged` nomme le
   cas ; le traiter est du ressort du reste de L3.3.
-- **Le coffre n'est branché à rien.** L3.2 est complet et testé seul ; c'est
-  L3.3 qui lui enverra de vrais segments de 5 s.
+- **Rien ne pilote encore les vrais fils de capture.** Les règles
+  (`session.rs`) et le chemin audio → coffre (`recording.rs`) sont en place et
+  testés séparément ; ce qui manque est la boucle qui ouvre les périphériques,
+  mixe et alimente l'encodeur — avec les boutons du widget, lot L3.4.
 - **Une réunion en `QUOTA_HOLD` n'a aucune sortie.** Seul le webhook de
   paiement du lot L5 peut la relancer, et il n'existe pas. Sans effet
   aujourd'hui — aucun quota n'est assigné avant L5, donc rien n'y entre — mais
