@@ -5,6 +5,7 @@
 //! it competes with is "remember to start the recorder", and an app that wants
 //! a window on screen loses that contest before the meeting begins.
 
+pub mod recording;
 pub mod state;
 
 use std::sync::Mutex;

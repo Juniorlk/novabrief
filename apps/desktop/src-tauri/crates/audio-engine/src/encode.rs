@@ -11,7 +11,7 @@
 //! and confirm one piece at a time.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use audiopus::coder::Encoder;
@@ -117,9 +117,8 @@ pub struct Manifest {
 /// Samples that do not fill a 20 ms frame are held back until the next call, so
 /// a caller can push whatever chunk sizes WASAPI produced without losing audio
 /// or padding the timeline with artificial silence.
-pub struct SegmentedOpusWriter {
-    directory: PathBuf,
-    prefix: String,
+pub struct SegmentedOpusWriter<S: SegmentSink = FileSegmentSink> {
+    sink: S,
     encoder: Encoder,
     bitrate: u32,
     segment_samples: u64,
@@ -159,21 +158,111 @@ pub struct SegmentedOpusWriter {
     total_samples: u64,
 }
 
+/// Where finished segments go.
+///
+/// The encoder used to create the files itself, which left nowhere to put
+/// encryption. EF-17 requires that plaintext audio never reach the disk on the
+/// desktop, so the destination becomes the caller's decision: a file for the
+/// measurement tool, the encrypted vault for the product.
+///
+/// A whole segment at a time rather than a stream of bytes. Five seconds of
+/// Opus at 32 kbit/s is about 20 KB, so buffering one costs nothing, and
+/// AES-GCM needs the whole thing anyway - it authenticates what it encrypts,
+/// and cannot do that a chunk at a time.
+pub trait SegmentSink {
+    /// Take one finished segment, and answer with the name it was stored under.
+    ///
+    /// The name goes into the manifest, so it is whatever the *sink* calls it -
+    /// a file name on disk, an identifier in the vault - rather than something
+    /// the encoder invents and hopes the sink agrees with.
+    ///
+    /// # Errors
+    ///
+    /// Whatever storing it failed with.
+    fn accept(&mut self, index: u32, bytes: &[u8], duration_ms: u64)
+        -> Result<String, EncodeError>;
+
+    /// Persist the manifest, if this sink keeps one of its own.
+    ///
+    /// Does nothing by default. The file sink writes the JSON next to its
+    /// segments; the vault already maintains a manifest with more in it - the
+    /// sealed key, the recording state - and a second one beside it would be a
+    /// second thing to keep in agreement.
+    ///
+    /// # Errors
+    ///
+    /// Whatever storing it failed with.
+    fn accept_manifest(&mut self, _manifest: &Manifest) -> Result<(), EncodeError> {
+        Ok(())
+    }
+}
+
+/// Writes each segment as `prefix-NNNN.opus` in a directory.
+#[derive(Debug, Clone)]
+pub struct FileSegmentSink {
+    directory: PathBuf,
+    prefix: String,
+}
+
+impl FileSegmentSink {
+    /// A sink that fills `directory`.
+    #[must_use]
+    pub fn new(directory: impl Into<PathBuf>, prefix: impl Into<String>) -> Self {
+        Self {
+            directory: directory.into(),
+            prefix: prefix.into(),
+        }
+    }
+}
+
+impl SegmentSink for FileSegmentSink {
+    fn accept(
+        &mut self,
+        index: u32,
+        bytes: &[u8],
+        _duration_ms: u64,
+    ) -> Result<String, EncodeError> {
+        std::fs::create_dir_all(&self.directory).map_err(|source| EncodeError::Io {
+            path: self.directory.clone(),
+            source,
+        })?;
+
+        let name = format!("{}-{index:04}.opus", self.prefix);
+        let path = self.directory.join(&name);
+        let write = || -> std::io::Result<()> {
+            let mut file = File::create(&path)?;
+            file.write_all(bytes)?;
+            // Flushed to the platter before the segment is reported as stored.
+            // The vault relies on the same ordering for EF-17, and a sink that
+            // reported a segment it had only handed to the page cache would
+            // make that promise untrue for the file path too.
+            file.sync_all()
+        };
+        write().map_err(|source| EncodeError::Io { path, source })?;
+        Ok(name)
+    }
+
+    fn accept_manifest(&mut self, manifest: &Manifest) -> Result<(), EncodeError> {
+        let path = self
+            .directory
+            .join(format!("{}-manifest.json", self.prefix));
+        let json = serde_json::to_string_pretty(manifest).map_err(EncodeError::Manifest)?;
+        std::fs::write(&path, json).map_err(|source| EncodeError::Io { path, source })
+    }
+}
+
 struct OpenSegment {
     index: u32,
-    path: PathBuf,
-    writer: ogg::PacketWriter<'static, BufWriter<File>>,
-    hasher: Sha256,
+    writer: ogg::PacketWriter<'static, Vec<u8>>,
     samples: u64,
     start_samples: u64,
     granule: u64,
     serial: u32,
 }
 
-impl std::fmt::Debug for SegmentedOpusWriter {
+impl<S: SegmentSink> std::fmt::Debug for SegmentedOpusWriter<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SegmentedOpusWriter")
-            .field("directory", &self.directory)
             .field("bitrate", &self.bitrate)
             .field("segments", &self.segments.len())
             .field("total_samples", &self.total_samples)
@@ -181,7 +270,7 @@ impl std::fmt::Debug for SegmentedOpusWriter {
     }
 }
 
-impl SegmentedOpusWriter {
+impl SegmentedOpusWriter<FileSegmentSink> {
     /// Create a writer that fills `directory` with `prefix-NNNN.opus` segments.
     ///
     /// `segment_seconds` is clamped to the 5-10 s window the brief fixed: below
@@ -193,6 +282,21 @@ impl SegmentedOpusWriter {
         bitrate: u32,
         segment_seconds: f64,
     ) -> Result<Self, EncodeError> {
+        Self::with_sink(
+            FileSegmentSink::new(directory, prefix),
+            bitrate,
+            segment_seconds,
+        )
+    }
+}
+
+impl<S: SegmentSink> SegmentedOpusWriter<S> {
+    /// Create a writer that hands each finished segment to `sink`.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::EncoderInit`] if Opus refuses the configuration.
+    pub fn with_sink(sink: S, bitrate: u32, segment_seconds: f64) -> Result<Self, EncodeError> {
         let mut encoder = Encoder::new(SampleRate::Hz16000, Channels::Stereo, Application::Voip)
             .map_err(EncodeError::EncoderInit)?;
         encoder
@@ -211,8 +315,7 @@ impl SegmentedOpusWriter {
         Ok(Self {
             pre_skip,
             held: None,
-            directory: directory.into(),
-            prefix: prefix.into(),
+            sink,
             encoder,
             bitrate,
             segment_samples: (seconds * f64::from(TARGET_SAMPLE_RATE)) as u64,
@@ -370,37 +473,21 @@ impl SegmentedOpusWriter {
             segments: self.segments.clone(),
         };
 
-        let path = self
-            .directory
-            .join(format!("{}-manifest.json", self.prefix));
-        let json = serde_json::to_string_pretty(&manifest).map_err(EncodeError::Manifest)?;
-        std::fs::write(&path, json).map_err(|source| EncodeError::Io { path, source })?;
+        self.sink.accept_manifest(&manifest)?;
         Ok(manifest)
     }
 
     fn open_segment(&mut self) -> Result<(), EncodeError> {
         let index = self.segments.len() as u32;
-        let path = self
-            .directory
-            .join(format!("{}-{index:04}.opus", self.prefix));
-
-        std::fs::create_dir_all(&self.directory).map_err(|source| EncodeError::Io {
-            path: self.directory.clone(),
-            source,
-        })?;
-        let file = File::create(&path).map_err(|source| EncodeError::Io {
-            path: path.clone(),
-            source,
-        })?;
 
         // Each segment is a standalone Ogg stream so it can be decoded on its
         // own; a distinct serial keeps them from being mistaken for one stream.
         let serial = 0x4E42_0000_u32.wrapping_add(index);
         let mut segment = OpenSegment {
             index,
-            path,
-            writer: ogg::PacketWriter::new(BufWriter::new(file)),
-            hasher: Sha256::new(),
+            // Into memory. Five seconds is about 20 KB, and the sink needs the
+            // whole segment anyway.
+            writer: ogg::PacketWriter::new(Vec::new()),
             samples: 0,
             start_samples: self.total_samples,
             granule: 0,
@@ -435,38 +522,31 @@ impl SegmentedOpusWriter {
             .writer
             .write_packet(data, segment.serial, info, segment.granule)
             .map_err(|source| EncodeError::Io {
-                path: segment.path.clone(),
+                path: PathBuf::from(format!("segment {}", segment.index)),
                 source,
             })
     }
 
     fn close_segment(&mut self) -> Result<(), EncodeError> {
-        let Some(mut segment) = self.current.take() else {
+        let Some(segment) = self.current.take() else {
             return Ok(());
         };
 
-        let mut inner = segment.writer.into_inner();
-        inner.flush().map_err(|source| EncodeError::Io {
-            path: segment.path.clone(),
-            source,
-        })?;
-        drop(inner);
+        let bytes = segment.writer.into_inner();
 
-        // Hash the file as it landed on disk rather than the bytes we meant to
-        // write: the manifest must describe what will actually be uploaded.
-        let bytes = std::fs::read(&segment.path).map_err(|source| EncodeError::Io {
-            path: segment.path.clone(),
-            source,
-        })?;
-        segment.hasher.update(&bytes);
-        let digest = segment.hasher.finalize();
+        // Of the bytes the encoder produced, which are exactly what the sink
+        // stores and what will later be uploaded. This used to read the file
+        // back to hash what had landed on disk - a useful check when the
+        // encoder owned the file, and a meaningless one now that it does not:
+        // each sink is responsible for its own durability, and the vault hashes
+        // its ciphertext separately.
+        let digest = Sha256::digest(&bytes);
+        let file = self
+            .sink
+            .accept(segment.index, &bytes, samples_to_ms(segment.samples))?;
 
         self.segments.push(SegmentRecord {
-            file: segment
-                .path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            file,
             index: segment.index,
             samples: segment.samples,
             duration_ms: samples_to_ms(segment.samples),
@@ -504,7 +584,7 @@ fn write_opus_headers(segment: &mut OpenSegment, pre_skip: u16) -> Result<(), En
             .writer
             .write_packet(packet, segment.serial, info, 0)
             .map_err(|source| EncodeError::Io {
-                path: segment.path.clone(),
+                path: PathBuf::from(format!("segment {}", segment.index)),
                 source,
             })?;
     }
