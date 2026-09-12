@@ -83,7 +83,7 @@ mod tests {
     use super::VaultSegmentSink;
     use audio_engine::encode::SegmentedOpusWriter;
     use audio_engine::resample::TARGET_SAMPLE_RATE;
-    use vault::{DpapiSealer, Vault};
+    use vault::{DeviceSecret, DpapiSealer, Vault};
 
     fn scratch(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -109,7 +109,9 @@ mod tests {
     #[test]
     fn segments_reach_the_vault_and_come_back() {
         let root = scratch("roundtrip");
-        let store = Vault::new(&root, b"a-refresh-token", DpapiSealer);
+        let secret = DeviceSecret::load_or_create(&root.join("device.key"), &DpapiSealer)
+            .expect("the device secret is creatable");
+        let store = Vault::new(&root, secret.account_key(), DpapiSealer);
         let recording = store
             .begin("mtg-1", "DBG-1", "mic", "speakers")
             .expect("the vault opens");
@@ -144,7 +146,9 @@ mod tests {
     #[test]
     fn no_plaintext_audio_reaches_the_disk() {
         let root = scratch("plaintext");
-        let store = Vault::new(&root, b"a-refresh-token", DpapiSealer);
+        let secret = DeviceSecret::load_or_create(&root.join("device.key"), &DpapiSealer)
+            .expect("the device secret is creatable");
+        let store = Vault::new(&root, secret.account_key(), DpapiSealer);
         let recording = store
             .begin("mtg-1", "DBG-1", "mic", "speakers")
             .expect("the vault opens");
@@ -179,7 +183,9 @@ mod tests {
     #[test]
     fn only_the_vaults_manifest_is_on_disk() {
         let root = scratch("manifest");
-        let store = Vault::new(&root, b"a-refresh-token", DpapiSealer);
+        let secret = DeviceSecret::load_or_create(&root.join("device.key"), &DpapiSealer)
+            .expect("the device secret is creatable");
+        let store = Vault::new(&root, secret.account_key(), DpapiSealer);
         let recording = store
             .begin("mtg-1", "DBG-1", "mic", "speakers")
             .expect("the vault opens");
