@@ -16,12 +16,16 @@
 //! * **A crash is visible afterwards.** A recording exists on disk from before
 //!   its first segment, so start-up can find it and say what happened.
 
+pub mod credentials;
+pub mod device;
 pub mod error;
 pub mod keys;
 pub mod manifest;
 pub mod seal;
 pub mod store;
 
+pub use credentials::CredentialStore;
+pub use device::DeviceSecret;
 pub use error::{Result, VaultError};
 pub use keys::{AccountKey, MeetingKey};
 pub use manifest::{Manifest, RecordingState, SegmentRecord};

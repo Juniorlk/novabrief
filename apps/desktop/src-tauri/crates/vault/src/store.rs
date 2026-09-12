@@ -47,12 +47,19 @@ pub struct Recording {
 }
 
 impl<S: Sealer> Vault<S> {
-    /// Open the vault at `root`, for the session `refresh_token` belongs to.
+    /// Open the vault at `root`, under `account`.
+    ///
+    /// The key is handed in rather than derived here, and that is deliberate.
+    /// It used to take a refresh token and derive the key itself, which looked
+    /// like what section 16.3 asks for and quietly broke every recording each
+    /// time the session refreshed - refresh tokens rotate. Taking the key means
+    /// the caller has to say where it came from, and [`crate::DeviceSecret`] is
+    /// the only thing that produces a stable one.
     #[must_use]
-    pub fn new(root: impl Into<PathBuf>, refresh_token: &[u8], sealer: S) -> Self {
+    pub fn new(root: impl Into<PathBuf>, account: AccountKey, sealer: S) -> Self {
         Self {
             root: root.into(),
-            account: AccountKey::derive(refresh_token),
+            account,
             sealer,
         }
     }
@@ -349,6 +356,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{manifest_path, Vault};
+    use crate::keys::AccountKey;
     use crate::manifest::RecordingState;
     use crate::seal::PassthroughSealer;
 
@@ -363,7 +371,11 @@ mod tests {
     }
 
     fn vault(root: &std::path::Path) -> Vault<PassthroughSealer> {
-        Vault::new(root, b"a-refresh-token", PassthroughSealer)
+        Vault::new(
+            root,
+            AccountKey::derive(b"a-device-secret"),
+            PassthroughSealer,
+        )
     }
 
     #[test]
@@ -489,7 +501,11 @@ mod tests {
             .expect("begins");
         recording.append(0, b"audio", 5000).expect("appends");
 
-        let theirs = Vault::new(&root, b"a-revoked-token", PassthroughSealer);
+        let theirs = Vault::new(
+            &root,
+            AccountKey::derive(b"another-device"),
+            PassthroughSealer,
+        );
         assert!(theirs.reopen("mtg-1").is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
