@@ -1,0 +1,34 @@
+[package]
+name = "api-client"
+description = "Talks to the NovaBrief API from the desktop (EF-11, section 16.4)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Already in the tree by way of Tauri, so it costs nothing against EF-10's
+# 15 MB installer budget.
+#
+# `native-tls` rather than `rustls`, which on Windows means schannel and the
+# Windows certificate store. An SME behind a corporate proxy - or running an
+# antivirus that inspects TLS, which is common - has that certificate installed
+# in Windows and nowhere else. A vendored root list would reject it, and
+# sign-in would fail with a certificate error on exactly the machines we are
+# trying to sell to. Inheriting the machine's TLS configuration is the correct
+# behaviour for a desktop application, not a compromise.
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "json",
+    "native-tls",
+] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+url = "2.5.7"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
