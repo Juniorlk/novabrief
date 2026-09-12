@@ -4,6 +4,7 @@
 resolver = "2"
 members = [
     "apps/desktop/src-tauri",
+    "apps/desktop/src-tauri/crates/api-client",
     "apps/desktop/src-tauri/crates/audio-engine",
     "apps/desktop/src-tauri/crates/vault",
     "tools/nb-capture",
