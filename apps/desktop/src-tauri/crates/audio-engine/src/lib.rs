@@ -22,6 +22,8 @@ pub mod resample;
 
 #[cfg(windows)]
 pub mod capture;
+#[cfg(windows)]
+pub mod pipeline;
 
 pub use drift::{projected_offset_ms, relative_ppm, DriftEstimate, DriftEstimator, DriftRefusal};
 pub use encode::{EncodeError, Manifest, SegmentRecord, SegmentedOpusWriter};
@@ -31,3 +33,5 @@ pub use resample::{MonoResampler, StereoMixer, TARGET_SAMPLE_RATE};
 
 #[cfg(windows)]
 pub use capture::{list_devices, CaptureStats, DeviceInfo, EndpointCapture, Packet};
+#[cfg(windows)]
+pub use pipeline::{EndpointOutcome, Endpoints, Overflow, Recorder};

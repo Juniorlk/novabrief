@@ -18,15 +18,13 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use audio_engine::{
-    downmix_to_mono, peak, projected_offset_ms, relative_ppm, CaptureStats, DriftEstimate,
-    DriftEstimator, DriftRefusal, Endpoint, EndpointCapture, MonoResampler, SegmentedOpusWriter,
-    StereoMixer, TARGET_SAMPLE_RATE,
+    projected_offset_ms, relative_ppm, DriftEstimate, Endpoint, EndpointOutcome, Endpoints,
+    Recorder, SegmentedOpusWriter, TARGET_SAMPLE_RATE,
 };
 use clap::Parser;
 
@@ -166,68 +164,12 @@ const fn resident_bytes() -> Option<u64> {
     None
 }
 
-/// How far a capture thread may run ahead of the writer.
-///
-/// The queues used to be unbounded, and that is the second half of the hour-long
-/// failure: when the writer fell behind, nothing pushed back, the backlog grew,
-/// the quadratic drain made the writer slower still, and memory reached 668 MB.
-/// Under that pressure the capture threads missed their deadlines and WASAPI's
-/// 200 ms buffer overran - which is where the 10.25 % of audio actually went.
-///
-/// A chunk is one WASAPI packet resampled to 16 kHz mono, roughly 10 ms. Three
-/// hundred of them is about three seconds and a couple of hundred kilobytes:
-/// long enough to ride out a disk hiccup, short enough that a writer which has
-/// genuinely stopped is noticed in seconds rather than in gigabytes.
-///
-/// Blocking on a full queue would be worse than dropping. The capture thread
-/// has a hard deadline against the device, and making it wait for a slow disk
-/// is precisely how frames are lost at the source - where nothing can recover
-/// them. Dropping at a counted, reported boundary keeps the loss in a place we
-/// can see and measure.
-const QUEUE_DEPTH_CHUNKS: usize = 300;
-
-/// A chunk of 16 kHz mono audio on its way to the writer.
-struct Chunk {
-    samples: Vec<f32>,
-    /// Timestamp of the first frame this endpoint ever delivered, repeated on
-    /// every chunk so the writer can align the two streams as soon as both have
-    /// spoken once.
-    first_qpc_100ns: Option<u64>,
-}
-
-/// What one capture thread reports back when it finishes.
-struct ThreadOutcome {
-    endpoint: Endpoint,
-    device_name: String,
-    input_rate: u32,
-    input_channels: u16,
-    mmcss: bool,
-    stats: CaptureStats,
-    /// How fast this device's clock actually ran, or why that could not be
-    /// said. A refusal is an answer, and it is printed as one.
-    drift: Result<DriftEstimate, DriftRefusal>,
-    /// Audio the writer could not keep up with, and which was therefore
-    /// dropped rather than silently accumulated.
-    overflow: Overflow,
-    /// What the device delivered, against what it owed, inside its own
-    /// streaming window. This is the C3 measurement.
-    delivery: Delivery,
-    /// Wall-clock time the capture loop actually ran.
-    ///
-    /// This is the measuring stick for C3. Windows' discontinuity flag counted
-    /// 2 and 5 events while 10.25 % of an hour went missing - it under-reports
-    /// by orders of magnitude, because a gap is flagged once however long it
-    /// lasts. Frames the device really delivered, against frames its nominal
-    /// rate says should have arrived in that much time, cannot be fooled that
-    /// way.
-    elapsed: Duration,
-}
-
-impl ThreadOutcome {
-    /// Frames the device really delivered, synthesised silence excluded.
-    const fn real_frames(&self) -> u64 {
-        self.stats.frames.saturating_sub(self.stats.padded_frames)
-    }
+/// Frames the device really delivered, synthesised silence excluded.
+const fn real_frames(outcome: &EndpointOutcome) -> u64 {
+    outcome
+        .stats
+        .frames
+        .saturating_sub(outcome.stats.padded_frames)
 }
 
 /// How much audio a device delivered, against how much its own clock says it
@@ -257,15 +199,14 @@ struct Delivery {
 }
 
 impl Delivery {
-    /// Record a packet the device really delivered.
-    ///
-    /// `frames_before` is the cumulative count *excluding* this packet, so the
-    /// window and the frames inside it are bounded by the same two events.
-    fn observe(&mut self, qpc_100ns: u64, frames_before: u64) {
-        if self.first.is_none() {
-            self.first = Some((qpc_100ns, frames_before));
-        }
-        self.last = Some((qpc_100ns, frames_before));
+    /// Take the packet bounds the pipeline recorded.
+    const fn from_outcome(outcome: &EndpointOutcome) -> Self {
+        Self::from_bounds(outcome.first_packet, outcome.last_packet)
+    }
+
+    /// The two events the window is measured between.
+    const fn from_bounds(first: Option<(u64, u64)>, last: Option<(u64, u64)>) -> Self {
+        Self { first, last }
     }
 
     /// Seconds between the first and last delivered packet.
@@ -298,120 +239,6 @@ impl Delivery {
     }
 }
 
-/// What a full queue cost.
-#[derive(Debug, Clone, Copy, Default)]
-struct Overflow {
-    chunks: u64,
-    frames: u64,
-}
-
-impl Overflow {
-    const fn happened(&self) -> bool {
-        self.chunks > 0
-    }
-}
-
-/// How much silence each channel needs so neither can run away from the other.
-///
-/// Returns `(left, right)` frames of silence to push.
-///
-/// The mixer only emits frames while **both** sides have data, which is what
-/// keeps the two voices aligned. The corollary is that a side which stops
-/// delivering pins the other one in memory, and that is not a theory: a
-/// 60-minute validation capture had the system loopback stop at minute 28 and
-/// the microphone backlog then grew by one second of audio per second of
-/// meeting - 6 003 681 frames and 34.8 MB by minute 35, on its way past a
-/// gigabyte over a four-hour meeting (EF-34 allows four hours).
-///
-/// Nothing reported it. The recording carried on, the file kept its duration,
-/// and the right channel was simply empty from minute 28 onwards - the same
-/// silent, plausible-looking failure as the 10.25 % loss.
-///
-/// `live` is about the thread, not the configuration. The original code padded
-/// a side nobody had asked to record, which is a different condition: it never
-/// covered a side that was being recorded and then ended.
-#[must_use]
-fn silence_needed(imbalance: i64, left_live: bool, right_live: bool) -> (usize, usize) {
-    // Both still running: the mixer holds the surplus on purpose, because the
-    // counterpart is on its way. That backlog is bounded by the clock
-    // difference between two devices, which is milliseconds.
-    if left_live && right_live {
-        return (0, 0);
-    }
-    match imbalance.cmp(&0) {
-        // Left leads: the right-hand side has stopped, so it is padded.
-        std::cmp::Ordering::Greater if !right_live => {
-            (0, usize::try_from(imbalance).unwrap_or(usize::MAX))
-        }
-        std::cmp::Ordering::Less if !left_live => {
-            (usize::try_from(-imbalance).unwrap_or(usize::MAX), 0)
-        }
-        _ => (0, 0),
-    }
-}
-
-/// What became of an item offered to a full-or-not queue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Offered {
-    /// The writer took it.
-    Taken,
-    /// The queue was full. The audio is gone, and counted.
-    Dropped {
-        /// True the first time only, so the warning is printed once rather
-        /// than a hundred times a second.
-        first: bool,
-    },
-    /// The writer is gone; there is nowhere left to send.
-    Closed,
-}
-
-/// The sending half of a bounded queue, which counts what it had to drop.
-///
-/// A type rather than three lines inside the capture callback, because this is
-/// the behaviour the hour-long failure turned on and it has to be something a
-/// test can drive. See `a_producer_faster_than_its_consumer_is_bounded_and_counted`.
-#[derive(Debug)]
-struct BoundedSink<T> {
-    tx: SyncSender<T>,
-    overflow: Overflow,
-}
-
-impl<T> BoundedSink<T> {
-    const fn new(tx: SyncSender<T>) -> Self {
-        Self {
-            tx,
-            overflow: Overflow {
-                chunks: 0,
-                frames: 0,
-            },
-        }
-    }
-
-    /// Offer one item without ever waiting.
-    ///
-    /// `frames` is what the item is worth in audio, so the counter measures
-    /// lost *audio* rather than lost messages - which is the number anyone
-    /// reading the report actually cares about.
-    ///
-    /// Never blocks, and that is the whole design. The capture thread has a
-    /// hard deadline against the device; making it wait on a slow disk is
-    /// exactly how frames are lost at the source, where nothing can recover
-    /// them. Dropping here is a loss we can count, in a place we can see.
-    fn offer(&mut self, item: T, frames: u64) -> Offered {
-        match self.tx.try_send(item) {
-            Ok(()) => Offered::Taken,
-            Err(TrySendError::Full(_)) => {
-                self.overflow.chunks += 1;
-                self.overflow.frames += frames;
-                Offered::Dropped {
-                    first: self.overflow.chunks == 1,
-                }
-            }
-            Err(TrySendError::Disconnected(_)) => Offered::Closed,
-        }
-    }
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -419,35 +246,19 @@ fn main() -> Result<()> {
         return list_all_devices();
     }
 
-    let want_mic = !cli.system_only;
-    let want_system = !cli.mic_only;
+    let endpoints = Endpoints {
+        microphone: cli.input.clone(),
+        system: cli.output.clone(),
+        without_microphone: cli.system_only,
+        without_system: cli.mic_only,
+    };
+    let max_duration = cli.duration.map(Duration::from_secs);
 
+    let recorder =
+        Recorder::start(&endpoints, max_duration).context("could not open the audio endpoints")?;
     let stop = Arc::new(AtomicBool::new(false));
     let ctrlc_flag = Arc::clone(&stop);
     install_ctrlc_handler(move || ctrlc_flag.store(true, Ordering::Relaxed))?;
-
-    let max_duration = cli.duration.map(Duration::from_secs);
-    let (mic_tx, mic_rx) = sync_channel::<Chunk>(QUEUE_DEPTH_CHUNKS);
-    let (sys_tx, sys_rx) = sync_channel::<Chunk>(QUEUE_DEPTH_CHUNKS);
-
-    let mic_thread = want_mic.then(|| {
-        spawn_capture(
-            Endpoint::Microphone,
-            cli.input.clone(),
-            Arc::clone(&stop),
-            max_duration,
-            mic_tx,
-        )
-    });
-    let sys_thread = want_system.then(|| {
-        spawn_capture(
-            Endpoint::SystemLoopback,
-            cli.output.clone(),
-            Arc::clone(&stop),
-            max_duration,
-            sys_tx,
-        )
-    });
 
     println!("Working rate  : {TARGET_SAMPLE_RATE} Hz, stereo (L = microphone, R = system)");
     println!("Output        : {}", cli.out.display());
@@ -457,33 +268,26 @@ fn main() -> Result<()> {
     }
     println!("\nRecording. Press Ctrl+C to stop.\n");
 
-    let (written, sink, skew_frames) = write_stereo(&cli, &mic_rx, &sys_rx)?;
+    let (written, sink, skew_frames, outcomes) = write_stereo(&cli, recorder, &stop)?;
 
-    // The channels are closed once both capture threads have finished, so the
-    // writer above has already drained everything by the time we join.
-    let mic_outcome = join_capture(mic_thread)?;
-    let sys_outcome = join_capture(sys_thread)?;
-
-    // The manifest records which devices produced the recording, so finalising
-    // waits until the capture threads have reported their device names.
-    let device_of = |outcome: &Option<ThreadOutcome>| {
-        outcome
-            .as_ref()
+    let device_of = |endpoint: Endpoint| {
+        outcomes
+            .iter()
+            .find(|outcome| outcome.endpoint == endpoint)
             .map_or_else(|| "not recorded".to_owned(), |o| o.device_name.clone())
     };
-    let skew_ms = skew_frames * 1000 / i64::from(TARGET_SAMPLE_RATE);
+    let skew_ms = skew_frames.unwrap_or(0) * 1000 / i64::from(TARGET_SAMPLE_RATE);
     let output_path = match cli.format {
         Format::Wav => cli.out.clone(),
         Format::Opus => opus_directory(&cli.out),
     };
     finalize(
         sink,
-        &device_of(&mic_outcome),
-        &device_of(&sys_outcome),
+        &device_of(Endpoint::Microphone),
+        &device_of(Endpoint::SystemLoopback),
         skew_ms,
     )?;
 
-    let outcomes = [mic_outcome, sys_outcome];
     report(&output_path, written, &outcomes);
     report_relative_drift(&outcomes);
     Ok(())
@@ -558,112 +362,14 @@ fn list_all_devices() -> Result<()> {
     Ok(())
 }
 
-/// Start one endpoint capture on its own thread, resampling to the working rate.
-fn spawn_capture(
-    endpoint: Endpoint,
-    device: Option<String>,
-    stop: Arc<AtomicBool>,
-    max_duration: Option<Duration>,
-    tx: SyncSender<Chunk>,
-) -> std::thread::JoinHandle<Result<ThreadOutcome>> {
-    std::thread::spawn(move || -> Result<ThreadOutcome> {
-        let mut capture = EndpointCapture::open_named(endpoint, device.as_deref())
-            .with_context(|| format!("could not open the {endpoint} endpoint"))?;
-
-        let format = capture.format();
-        let mut resampler = MonoResampler::new(format.sample_rate);
-        let mut mono = Vec::new();
-        let mut converted = Vec::new();
-        let mut first_qpc: Option<u64> = None;
-        let mut estimator = DriftEstimator::new(format.sample_rate);
-        let mut device_frames: u64 = 0;
-        let mut delivery = Delivery::default();
-        let mut sink = BoundedSink::new(tx);
-
-        let started = Instant::now();
-        let stats = capture.record(&stop, max_duration, |packet| {
-            // Use the engine's reconstructed stream start, not the raw packet
-            // timestamp: for a loopback endpoint the first packet only arrives
-            // once something plays, which can be far into the recording.
-            if first_qpc.is_none() {
-                first_qpc = packet.stream_start_qpc_100ns;
-            }
-
-            // Only real packets time the device's own clock. Synthesised
-            // silence is generated against the system clock, so feeding it to
-            // the estimator would compare that clock with itself and report no
-            // drift however far the hardware actually strays.
-            let packet_frames =
-                (packet.samples.len() / format.channels.max(1) as usize) as u64;
-            if packet.synthesised {
-                // Counted, never fitted. Synthesised silence is timed by our own
-                // clock, so feeding it to the fit would compare that clock with
-                // itself - but how much of it there is decides whether the fit
-                // on the real frames means anything (D3).
-                estimator.note_synthesised(packet_frames);
-            } else {
-                if let Some(qpc) = packet.qpc_100ns {
-                    estimator.observe(qpc, device_frames);
-                    delivery.observe(qpc, device_frames);
-                }
-                device_frames += packet_frames;
-            }
-            downmix_to_mono(packet.samples, format.channels, &mut mono);
-            converted.clear();
-            resampler.process(&mono, &mut converted);
-            if !converted.is_empty() {
-                let frames = converted.len() as u64;
-                let chunk = Chunk {
-                    samples: std::mem::take(&mut converted),
-                    first_qpc_100ns: first_qpc,
-                };
-                // Counted and announced, never absorbed. The point of bounding
-                // the queue is that falling behind becomes a fact somebody
-                // reads, instead of memory growing until the capture itself
-                // starts failing.
-                if let Offered::Dropped { first: true } = sink.offer(chunk, frames) {
-                    eprintln!(
-                        "\n!! {endpoint}: the writer fell more than {QUEUE_DEPTH_CHUNKS} chunks behind; audio is being dropped"
-                    );
-                }
-            }
-        })?;
-
-        Ok(ThreadOutcome {
-            endpoint,
-            device_name: capture.device_name().to_owned(),
-            input_rate: format.sample_rate,
-            input_channels: format.channels,
-            mmcss: capture.mmcss_active(),
-            delivery,
-            elapsed: started.elapsed(),
-            stats,
-            drift: estimator.estimate(),
-            overflow: sink.overflow,
-        })
-    })
-}
-
-fn join_capture(
-    handle: Option<std::thread::JoinHandle<Result<ThreadOutcome>>>,
-) -> Result<Option<ThreadOutcome>> {
-    match handle {
-        None => Ok(None),
-        Some(handle) => match handle.join() {
-            Ok(result) => result.map(Some),
-            Err(_) => Err(anyhow!("a capture thread panicked")),
-        },
-    }
-}
-
 /// Interleave both streams into a stereo WAV until the capture threads stop.
 ///
 /// Returns the number of stereo frames written.
 fn write_stereo(
     cli: &Cli,
-    mic_rx: &Receiver<Chunk>,
-    sys_rx: &Receiver<Chunk>,
-) -> Result<(u64, Sink, i64)> {
+    mut recorder: Recorder,
+    stop: &AtomicBool,
+) -> Result<(u64, Sink, Option<i64>, Vec<EndpointOutcome>)> {
     let mut sink = match cli.format {
         Format::Wav => {
             let spec = hound::WavSpec {
@@ -690,197 +396,80 @@ fn write_stereo(
         }
     };
 
-    let mut mixer = StereoMixer::new();
     let mut interleaved = Vec::new();
     let mut frames: u64 = 0;
-
-    let mic_recorded = !cli.system_only;
-    let sys_recorded = !cli.mic_only;
-    let mut mic_open = mic_recorded;
-    let mut sys_open = sys_recorded;
-    let mut mic_peak = 0.0_f32;
-    let mut sys_peak = 0.0_f32;
     let mut last_meter = Instant::now();
     let mut last_memory = Instant::now();
-    let mut mic_ended_reported = false;
-    let mut sys_ended_reported = false;
     let started = Instant::now();
     let mut peak_resident: u64 = 0;
-    let mut worst_imbalance: i64 = 0;
-    let mut mic_start: Option<u64> = None;
-    let mut sys_start: Option<u64> = None;
-    let mut applied_skew: Option<i64> = None;
 
-    while mic_open || sys_open {
-        let mut received = false;
-
-        // Drain whatever is ready on both sides before writing, so neither
-        // channel accumulates a backlog while the other is served. Disconnection
-        // is detected here rather than by a second try_recv, which would consume
-        // and discard a chunk that arrived in between.
-        loop {
-            match mic_rx.try_recv() {
-                Ok(chunk) => {
-                    mic_start = mic_start.or(chunk.first_qpc_100ns);
-                    mic_peak = mic_peak.max(peak(&chunk.samples));
-                    mixer.push_left(&chunk.samples);
-                    received = true;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    mic_open = false;
-                    break;
-                }
-            }
-        }
-        loop {
-            match sys_rx.try_recv() {
-                Ok(chunk) => {
-                    sys_start = sys_start.or(chunk.first_qpc_100ns);
-                    sys_peak = sys_peak.max(peak(&chunk.samples));
-                    mixer.push_right(&chunk.samples);
-                    received = true;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    sys_open = false;
-                    break;
-                }
-            }
-        }
-
-        // Correct the start skew exactly once, as soon as both endpoints have
-        // reported when their first frame was captured. The two devices never
-        // open at the same instant, and how far apart they open is a property
-        // of the machine — so it is measured here from the shared performance
-        // counter rather than assumed or hard-coded. The stream that started
-        // later is missing audio at the front, so it gets that much silence.
-        if applied_skew.is_none() && mic_recorded && sys_recorded {
-            if let (Some(mic_qpc), Some(sys_qpc)) = (mic_start, sys_start) {
-                let delta_100ns = i128::from(mic_qpc) - i128::from(sys_qpc);
-                let frames = (delta_100ns * i128::from(TARGET_SAMPLE_RATE)) / 10_000_000;
-                let frames = i64::try_from(frames).unwrap_or(0);
-                match frames.cmp(&0) {
-                    std::cmp::Ordering::Greater => {
-                        // The microphone started later: pad its front.
-                        mixer.push_front_left(&vec![0.0; frames as usize]);
-                    }
-                    std::cmp::Ordering::Less => {
-                        mixer.push_front_right(&vec![0.0; frames.unsigned_abs() as usize]);
-                    }
-                    std::cmp::Ordering::Equal => {}
-                }
-                applied_skew = Some(frames);
-            }
-        }
-
-        // A side that is not producing - never asked for, or stopped part way
-        // through - is fed silence to match the one that is. Without it no
-        // stereo frame is ever complete: the file stays empty in the first
-        // case, and in the second the live side accumulates in memory for the
-        // rest of the meeting.
-        let (pad_left, pad_right) = silence_needed(
-            mixer.imbalance(),
-            mic_recorded && mic_open,
-            sys_recorded && sys_open,
-        );
-        if pad_left > 0 {
-            mixer.push_left(&vec![0.0; pad_left]);
-        }
-        if pad_right > 0 {
-            mixer.push_right(&vec![0.0; pad_right]);
-        }
-
-        // An endpoint that was being recorded and has stopped is a partial
-        // recording, and the person who ran the capture has to be told at the
-        // moment it happens rather than at the end.
-        if mic_recorded && !mic_open && !mic_ended_reported {
-            eprintln!(
-                "\n!! the microphone stopped delivering; the rest is silence on the left channel"
-            );
-            mic_ended_reported = true;
-        }
-        if sys_recorded && !sys_open && !sys_ended_reported {
-            eprintln!(
-                "\n!! system audio stopped delivering; the rest is silence on the right channel"
-            );
-            sys_ended_reported = true;
-        }
-
-        // Measure the imbalance only while both endpoints are still running and
-        // the start skew has been corrected. Outside that window the number is
-        // an artefact, not a measurement: before the correction it is dominated
-        // by the startup difference, and after one stream ends it simply grows
-        // by however long the other keeps recording. What is left in between is
-        // the genuine divergence between the two device clocks.
-        let skew_settled = applied_skew.is_some() || !(mic_recorded && sys_recorded);
-        let both_running = mic_open && sys_open;
-        if skew_settled && both_running && mixer.imbalance().abs() > worst_imbalance.abs() {
-            worst_imbalance = mixer.imbalance();
-        }
-
+    while recorder.running() && !stop.load(Ordering::Relaxed) {
         interleaved.clear();
-        mixer.drain_into(&mut interleaved);
+        let produced = recorder.poll(&mut interleaved);
         sink.write(&interleaved)
             .context("writing the capture failed mid-recording")?;
-        frames += (interleaved.len() / 2) as u64;
+        frames += produced as u64;
+
+        for endpoint in recorder.newly_stalled() {
+            eprintln!("\n!! {endpoint} stopped delivering; the rest is silence on that channel");
+        }
 
         if last_meter.elapsed() >= METER_REFRESH {
-            render_meters(mic_peak, sys_peak, cli.no_tty);
-            mic_peak = 0.0;
-            sys_peak = 0.0;
+            let (mic, system) = recorder.levels();
+            render_meters(mic, system, cli.no_tty);
             last_meter = Instant::now();
         }
 
-        // Criterion 2: the slope matters more than the endpoint, so this prints
-        // as the capture runs rather than once at the end.
+        // Criterion 2 of the correction brief: the slope matters more than the
+        // endpoint, so this prints as the capture runs rather than once at the
+        // end. The 2026-09-07 run reached 668 MB at 32 minutes; readings at 5,
+        // 10 and 15 would have shown the slope long before that.
         if last_memory.elapsed() >= MEMORY_REPORT_INTERVAL {
             if let Some(bytes) = resident_bytes() {
                 peak_resident = peak_resident.max(bytes);
-                // The imbalance, named for what it is. It is a signed frame
-                // count - how far the leading side is ahead of the other -
-                // and calling it a queue depth, as this line first did, would
-                // have put a wrong unit next to a right number.
                 println!(
-                    "
-[{:>5.1} min] resident memory: {:.1} MB (mixer imbalance: {:+} frames)",
+                    "\n[{:>5.1} min] resident memory: {:.1} MB",
                     started.elapsed().as_secs_f64() / 60.0,
                     bytes as f64 / 1_048_576.0,
-                    mixer.imbalance(),
                 );
             }
             last_memory = Instant::now();
         }
 
-        if !received && (mic_open || sys_open) {
+        if produced == 0 {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
 
-    // Nothing more will arrive: emit the tail, padding the shorter side.
+    let skew = recorder.applied_skew();
+    let worst_imbalance = recorder.worst_imbalance();
+
     interleaved.clear();
-    mixer.flush_into(&mut interleaved);
+    let outcomes = recorder.finish(&mut interleaved)?;
     sink.write(&interleaved)
         .context("writing the capture tail failed")?;
     frames += (interleaved.len() / 2) as u64;
 
     let to_ms = |f: i64| f as f64 * 1000.0 / f64::from(TARGET_SAMPLE_RATE);
     println!();
-    match applied_skew {
-        Some(skew) => println!(
-            "\nStart skew (measured from the device clock): {skew} frames ({:.1} ms), corrected",
-            to_ms(skew)
+    match skew {
+        Some(frames) => println!(
+            "\nStart skew (measured from the device clock): {frames} frames ({:.1} ms), corrected",
+            to_ms(frames)
         ),
-        None => println!("\nStart skew: not measured (only one endpoint recorded)"),
+        // Not the same as a skew of zero. One endpoint never delivered a real
+        // packet - which happens whenever nothing is playing - so there was
+        // nothing to line the other one up against. Reporting that as "no skew"
+        // would claim the two streams are aligned when nobody checked.
+        None => {
+            println!("\nStart skew: not measurable (one endpoint never delivered a real packet)")
+        }
     }
     println!(
         "Worst divergence while both streams ran   : {worst_imbalance} frames ({:.1} ms)",
         to_ms(worst_imbalance)
     );
-    // The high-water mark, which is the figure criterion 2 is written against.
-    // Sampled every five minutes rather than continuously: a peak between two
-    // samples would be missed, but the failure this guards against is steady
-    // growth, which no sampling interval can hide.
+
     let final_resident = resident_bytes().unwrap_or(0);
     peak_resident = peak_resident.max(final_resident);
     if peak_resident > 0 {
@@ -889,7 +478,8 @@ fn write_stereo(
             peak_resident as f64 / 1_048_576.0
         );
     }
-    Ok((frames, sink, applied_skew.unwrap_or(0)))
+
+    Ok((frames, sink, skew, outcomes))
 }
 
 /// Directory that holds the Opus segments and their manifest.
@@ -902,10 +492,9 @@ fn opus_directory(out: &Path) -> PathBuf {
 
 /// Print the C2 verdict: how far apart the two clocks run, and what that means
 /// for a meeting of realistic length.
-fn report_relative_drift(outcomes: &[Option<ThreadOutcome>]) {
+fn report_relative_drift(outcomes: &[EndpointOutcome]) {
     let drifts: Vec<DriftEstimate> = outcomes
         .iter()
-        .flatten()
         .filter_map(|outcome| outcome.drift.as_ref().ok().copied())
         .collect();
 
@@ -918,7 +507,7 @@ fn report_relative_drift(outcomes: &[Option<ThreadOutcome>]) {
 --- Clock drift (C2) ---"
         );
         println!("Relative drift    : not measurable");
-        for outcome in outcomes.iter().flatten() {
+        for outcome in outcomes {
             if let Err(reason) = &outcome.drift {
                 println!("  {:<16}: {reason}", outcome.endpoint.to_string());
             }
@@ -956,7 +545,7 @@ fn report_relative_drift(outcomes: &[Option<ThreadOutcome>]) {
     }
 }
 
-fn report(out: &Path, frames: u64, outcomes: &[Option<ThreadOutcome>]) {
+fn report(out: &Path, frames: u64, outcomes: &[EndpointOutcome]) {
     let size = directory_or_file_size(out);
     let duration = frames as f64 / f64::from(TARGET_SAMPLE_RATE);
 
@@ -966,7 +555,7 @@ fn report(out: &Path, frames: u64, outcomes: &[Option<ThreadOutcome>]) {
     println!("File size         : {size} bytes");
     println!("Output            : {}", out.display());
 
-    for outcome in outcomes.iter().flatten() {
+    for outcome in outcomes {
         let stats = &outcome.stats;
         let padded_share = if stats.frames == 0 {
             0.0
@@ -987,11 +576,11 @@ fn report(out: &Path, frames: u64, outcomes: &[Option<ThreadOutcome>]) {
         );
         // C3, measured properly. The Windows flag stays on the line below as
         // a hint, which is all it ever deserved to be.
-        match outcome.delivery.shortfall_percent(outcome.input_rate) {
+        match Delivery::from_outcome(outcome).shortfall_percent(outcome.input_rate) {
             Some(shortfall) => println!(
                 "  REAL LOSS (C3)  : {shortfall:.3} % over {:.1} s of streaming ({} frames delivered)",
-                outcome.delivery.window_seconds().unwrap_or(0.0),
-                outcome.real_frames()
+                Delivery::from_outcome(outcome).window_seconds().unwrap_or(0.0),
+                real_frames(outcome)
             ),
             // Said plainly rather than printed as 100 %. A loopback endpoint
             // delivers nothing while nothing plays, and calling that a total
@@ -1127,79 +716,22 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundedSink, Offered};
-
-    use super::silence_needed;
-
-    /// D5, found by the 60-minute validation capture rather than by review.
-    ///
-    /// The loopback endpoint stopped at minute 28. Nothing padded the right
-    /// channel, the mixer held every microphone frame waiting for a
-    /// counterpart that never came, and the backlog grew one second per second:
-    /// 6 003 681 frames and 34.8 MB by minute 35, heading past a gigabyte over
-    /// the four hours EF-34 allows.
-    #[test]
-    fn a_side_that_stops_is_padded_rather_than_waited_for() {
-        // The microphone leads by ten seconds at 16 kHz and the system side is
-        // gone: the whole lead has to be covered with silence.
-        let (left, right) = silence_needed(160_000, true, false);
-        assert_eq!(left, 0);
-        assert_eq!(right, 160_000);
-    }
-
-    #[test]
-    fn the_same_holds_when_it_is_the_microphone_that_stops() {
-        let (left, right) = silence_needed(-160_000, false, true);
-        assert_eq!(left, 160_000);
-        assert_eq!(right, 0);
-    }
-
-    /// While both are running the mixer holds the surplus on purpose - that is
-    /// what keeps the two voices aligned, and the backlog is bounded by the
-    /// difference between two device clocks, which is milliseconds.
-    #[test]
-    fn a_healthy_lead_is_left_alone() {
-        assert_eq!(silence_needed(4_000, true, true), (0, 0));
-        assert_eq!(silence_needed(-4_000, true, true), (0, 0));
-    }
-
-    /// An endpoint nobody asked to record: the original condition, still
-    /// covered.
-    #[test]
-    fn an_endpoint_that_was_never_recorded_is_padded_too() {
-        assert_eq!(silence_needed(48_000, true, false).1, 48_000);
-        assert_eq!(silence_needed(48_000, false, false), (0, 48_000));
-    }
-
-    /// Nothing to pad when the side that stopped is the one already behind.
-    #[test]
-    fn a_stopped_side_that_is_ahead_needs_nothing() {
-        assert_eq!(silence_needed(-5_000, true, false), (0, 0));
-        assert_eq!(silence_needed(0, true, false), (0, 0));
-    }
-
     use super::Delivery;
 
-    /// 100 ms of packets at exactly 48 kHz: nothing missing.
-    fn stream(delivery: &mut Delivery, rate: f64, seconds: f64, packet_ms: f64, share: f64) {
-        let packets = (seconds * 1000.0 / packet_ms) as u64;
-        let mut frames = 0_u64;
-        for packet in 0..packets {
-            let elapsed = packet as f64 * packet_ms / 1000.0;
-            let qpc = 5_000_000_000 + (elapsed * 10_000_000.0) as u64;
-            delivery.observe(qpc, frames);
-            // `share` of the packets arrive; the rest are the ones that went
-            // missing, so the frame counter advances by less than the clock.
-            frames += (rate * packet_ms / 1000.0 * share) as u64;
-        }
+    /// A device that ran for `seconds` and delivered `share` of what its own
+    /// clock says it owed. The window is the two packet bounds the pipeline
+    /// reports, which is what the measurement is actually built on.
+    fn stream(rate: f64, seconds: f64, share: f64) -> Delivery {
+        let delivered = (rate * seconds * share) as u64;
+        Delivery::from_bounds(
+            Some((5_000_000_000, 0)),
+            Some((5_000_000_000 + (seconds * 10_000_000.0) as u64, delivered)),
+        )
     }
 
     #[test]
     fn a_clean_stream_reports_no_loss() {
-        let mut delivery = Delivery::default();
-        stream(&mut delivery, 48_000.0, 60.0, 20.0, 1.0);
-
-        let shortfall = delivery
+        let shortfall = stream(48_000.0, 60.0, 1.0)
             .shortfall_percent(48_000)
             .expect("a minute of packets is measurable");
         assert!(shortfall < 0.1, "expected no loss, got {shortfall} %");
@@ -1209,10 +741,7 @@ mod tests {
     /// what its own clock owes must be reported as having lost 10.25 %.
     #[test]
     fn a_stream_missing_a_tenth_reports_a_tenth() {
-        let mut delivery = Delivery::default();
-        stream(&mut delivery, 48_000.0, 3600.0, 20.0, 0.8975);
-
-        let shortfall = delivery
+        let shortfall = stream(48_000.0, 3600.0, 0.8975)
             .shortfall_percent(48_000)
             .expect("an hour of packets is measurable");
         assert!(
@@ -1227,109 +756,30 @@ mod tests {
     /// measurement to make.
     #[test]
     fn an_endpoint_that_never_streamed_has_no_measurement() {
-        let delivery = Delivery::default();
-        assert_eq!(delivery.shortfall_percent(48_000), None);
+        assert_eq!(Delivery::default().shortfall_percent(48_000), None);
     }
 
     /// One packet is an instant, not a window. Dividing by it would produce a
     /// number out of nothing.
     #[test]
     fn a_single_packet_is_not_a_window() {
-        let mut delivery = Delivery::default();
-        delivery.observe(5_000_000_000, 0);
+        let delivery = Delivery::from_bounds(Some((5_000_000_000, 0)), Some((5_000_000_000, 0)));
         assert_eq!(delivery.shortfall_percent(48_000), None);
     }
 
     /// Device startup must not be charged as loss. The window opens at the
-    /// first delivered packet, so a device that took 200 ms to come alive still
-    /// measures clean - which is the difference between 0.000 % and the
-    /// 0.225 % a wall-clock denominator reported on a flawless capture.
+    /// first delivered packet, so a device that took a second to come alive
+    /// still measures clean - the difference between 0.000 % and the 0.225 % a
+    /// wall-clock denominator reported on a flawless capture.
     #[test]
     fn a_slow_device_start_is_not_counted_as_loss() {
-        let mut delivery = Delivery::default();
-        // The first packet lands a full second after the capture began; the
-        // window starts there and ignores everything before it.
-        stream(&mut delivery, 48_000.0, 30.0, 20.0, 1.0);
-
+        // The first packet lands a full second after the capture began.
+        let delivery =
+            Delivery::from_bounds(Some((5_010_000_000, 0)), Some((5_310_000_000, 1_440_000)));
         let shortfall = delivery.shortfall_percent(48_000).expect("measurable");
         assert!(
             shortfall < 0.1,
             "startup latency leaked into the measurement: {shortfall} %"
         );
-    }
-
-    use std::sync::mpsc::sync_channel;
-
-    /// Criterion 4 of the brief: a producer faster than its consumer must leave
-    /// memory bounded and say that it did.
-    ///
-    /// The unbounded queues are the other half of the hour-long failure. When
-    /// the writer fell behind nothing pushed back, so the backlog grew, the
-    /// quadratic drain made the writer slower still, and 668 MB later the
-    /// capture threads were missing their own deadlines. Nothing reported any
-    /// of it: the recording simply came out short.
-    #[test]
-    fn a_producer_faster_than_its_consumer_is_bounded_and_counted() {
-        const DEPTH: usize = 8;
-        const OFFERED: usize = 1_000;
-        const FRAMES_EACH: u64 = 160;
-
-        let (tx, rx) = sync_channel::<u32>(DEPTH);
-        let mut sink = BoundedSink::new(tx);
-
-        // Nobody ever receives, which is the worst case the writer can present.
-        let mut taken = 0_usize;
-        for item in 0..OFFERED {
-            match sink.offer(item as u32, FRAMES_EACH) {
-                Offered::Taken => taken += 1,
-                Offered::Dropped { .. } => {}
-                Offered::Closed => panic!("the receiver is still alive"),
-            }
-        }
-
-        // Bounded: the queue holds the depth it was given, and not one more,
-        // however long the producer runs.
-        assert_eq!(taken, DEPTH, "the queue accepted more than its depth");
-        assert_eq!(
-            rx.try_iter().count(),
-            DEPTH,
-            "the queue held more than its depth"
-        );
-
-        // Counted: and in frames of audio, not in messages, because that is
-        // what the person reading the report needs to know.
-        assert_eq!(sink.overflow.chunks as usize, OFFERED - DEPTH);
-        assert_eq!(
-            sink.overflow.frames,
-            (OFFERED - DEPTH) as u64 * FRAMES_EACH,
-            "the counter must measure lost audio, not lost messages"
-        );
-    }
-
-    /// The warning is worth printing once. A hundred times a second it becomes
-    /// noise that hides the line above it.
-    #[test]
-    fn only_the_first_drop_announces_itself() {
-        let (tx, _rx) = sync_channel::<u32>(1);
-        let mut sink = BoundedSink::new(tx);
-
-        assert_eq!(sink.offer(0, 1), Offered::Taken);
-        assert_eq!(sink.offer(1, 1), Offered::Dropped { first: true });
-        for _ in 0..10 {
-            assert_eq!(sink.offer(2, 1), Offered::Dropped { first: false });
-        }
-    }
-
-    /// A writer that has gone away is not a saturation, and must not be counted
-    /// as lost audio: there is simply nothing left to send to.
-    #[test]
-    fn a_closed_writer_is_not_counted_as_loss() {
-        let (tx, rx) = sync_channel::<u32>(4);
-        let mut sink = BoundedSink::new(tx);
-        drop(rx);
-
-        assert_eq!(sink.offer(0, 160), Offered::Closed);
-        assert_eq!(sink.overflow.chunks, 0);
-        assert_eq!(sink.overflow.frames, 0);
     }
 }

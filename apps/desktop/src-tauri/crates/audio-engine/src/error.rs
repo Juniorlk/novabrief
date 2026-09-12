@@ -66,6 +66,14 @@ pub enum CaptureError {
         source: windows::core::Error,
     },
 
+    /// A capture thread panicked.
+    ///
+    /// Its own message is lost with it, so this says only that it happened -
+    /// which is still better than a join error swallowed into a generic
+    /// failure, because it tells an operator to look at the panic in the log.
+    #[error("a capture thread panicked")]
+    ThreadPanicked,
+
     /// The replacement device negotiated a different format.
     ///
     /// Refused rather than accepted. Everything downstream - the resampler, the
