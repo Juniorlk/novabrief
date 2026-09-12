@@ -5,8 +5,8 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-12** (L3.1 et L3.2 livrés ; récupération de
-> périphérique ; PR #29, #30, #32, #33).
+> Dernière mise à jour : **2026-09-12** (**validation 60 min prononcée** ;
+> L3.1, L3.2 et la première moitié de L3.3 livrés ; PR #29 à #35).
 
 ---
 
@@ -26,7 +26,9 @@
 | Correctifs capture longue durée | **codés**, validation 60 min en attente | PR #27 ; `docs/tasks/02_…` |
 | Lot L3.1 — coquille Tauri + i18n | **fait** | PR #29 |
 | Lot L3.2 — coffre local chiffré | **fait** | PR #32 |
-| L3.3 — récupération de périphérique (EF-15 / C5) | **partiel** | PR #33 ; le reste du pilotage reste à faire |
+| L3.3 — récupération de périphérique (EF-15 / C5) | **fait** | PR #33 |
+| L3.3 — chemin audio → coffre chiffré | **fait** | PR #35 |
+| L3.3 — machine à états, pause, durées (EF-33, EF-34) | **reste à faire** | question ouverte ci-dessous |
 | Lot L3.4 à L3.9 | pas commencés | `docs/tasks/06_L3_application_desktop.md` |
 
 ### Lot L1 en détail
@@ -67,7 +69,35 @@ Les quatre défauts de `02_correctifs_capture_longue_duree.md` sont corrigés :
 | Dérive rapportée | −83 293 ppm (impossible) | +12,72 ppm, ou refus motivé |
 | Mesure de C3 | drapeau Windows (sous-estime ×1000) | trames livrées / trames dues |
 
-### La validation 60 min a tourné le 2026-09-11, et elle ne compte pas
+### La validation 60 min est passée le 2026-09-12
+
+Seconde passe, mise en veille désactivée, une heure continue :
+
+| Critère | Cible | Mesuré | |
+|---|---|---|---|
+| 1 — perte réelle | < 0,1 % | **0,000 %** sur 3600,2 s | ✅ |
+| 2 — RAM sur 60 min | < 50 Mo | **13,2 Mo** de pic | ✅ |
+| 3 — dérive mesurable ou refus motivé | — | **+1,64 ppm**, 3659 points | ✅ |
+| 4 — test producteur/consommateur | automatisé | PR #27 | ✅ |
+| 5 — deux configurations matérielles | intégré **+ Bluetooth** | intégré seul | ❌ |
+
+172 808 160 trames livrées côté micro, **zéro synthétisée**. La dérive de
++1,64 ppm est enfin une valeur physiquement possible, là où l'ancienne version
+rendait −83 293 ppm.
+
+**Le correctif D5 s'est prouvé sur le terrain.** Rien ne jouait sur la machine,
+donc le loopback n'a streamé que 44,7 s sur une heure — exactement ce qui avait
+fait exploser la mémoire à 363 Mo la fois précédente. Cette fois l'avertissement
+est sorti au moment où c'est arrivé, le canal droit a été comblé, et la mémoire
+n'a pas bougé.
+
+**Ce qui reste non prononcé** : le critère 5, faute de casque Bluetooth. Et la
+**dérive relative (C2)** reste non mesurable — elle compare deux horloges, et le
+loopback n'a presque pas streamé faute de son joué. Il faut une passe **avec de
+l'audio qui joue** pour la prononcer. C'est une exigence du protocole de test
+qui n'était écrite nulle part.
+
+### La passe du 2026-09-11 et pourquoi elle ne comptait pas
 
 Elle a fait exactement ce qu'on attendait d'elle : **trouver ce qu'aucun test
 court ne voit**. Deux découvertes, et aucune n'était dans D1–D4.
@@ -185,6 +215,34 @@ correctif.
 
 **Vérifié** : 339 tests, dont chaque correctif prouvé en retirant le correctif
 et en constatant l'échec.
+
+---
+
+## 2 ter. Question ouverte : que fait la pause du flux audio ? (EF-33)
+
+EF-33 demande une pause qui **ne crée pas de second fichier** et dont le temps
+**n'est pas facturé**. Le chemin audio → coffre est en place (PR #35) ; c'est le
+pilotage qui reste, et il bute sur une interaction qui n'est pas évidente.
+
+Le moteur de capture **synthétise du silence contre l'horloge murale** : c'est
+ce qui garantit que la durée du fichier correspond à celle de la réunion. Si on
+se contente de jeter l'audio pendant une pause de dix minutes, le moteur
+considère qu'il a dix minutes de retard et émet dix minutes de silence à la
+reprise — ce qui annule exactement ce que la pause devait faire.
+
+Deux issues :
+
+1. **Arrêter les flux WASAPI à la pause, les redémarrer à la reprise.** L'horloge
+   du moteur repart de zéro. C'est cohérent — « pas de fichiers multiples »
+   parle de la *sortie*, et l'enregistrement du coffre reste ouvert. Le risque
+   est qu'un arrêt/redémarrage invalide le périphérique, ce que l'on sait
+   désormais gérer (PR #33) mais ce qui n'a jamais été exercé.
+2. **Apprendre la pause au moteur**, pour qu'il gèle sa référence temporelle.
+   Plus invasif, et ça met une notion produit dans une couche qui n'en a aucune.
+
+Penche pour (1), mais c'est un arbitrage à poser plutôt qu'à décider en
+passant : il détermine ce qui se produit quand quelqu'un met une réunion en
+pause pendant un quart d'heure, ce qui est un usage réel.
 
 ---
 
@@ -531,6 +589,10 @@ mv .env .env.hidden && python -m pytest -q ; mv .env.hidden .env
   coupée par une mise en veille de la machine. Critères 1, 2 et 5 de
   `02_correctifs_capture_longue_duree.md` non prononcés. Bloque la mise en main
   d'une PME pilote.
+- **La dérive relative (C2) n'a jamais été mesurée.** Il faut une capture
+  longue durée **pendant laquelle de l'audio joue**, sans quoi le loopback ne
+  streame pas et il n'y a pas deux horloges à comparer.
+- **Le critère 5 attend un casque Bluetooth.**
 - **Le chemin de réouverture de périphérique n'a jamais été exécuté.** La
   détection est testée (PR #33), la réouverture elle-même exige que Windows
   invalide réellement un périphérique. La preuve viendra d'une capture longue
