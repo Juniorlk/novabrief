@@ -21,9 +21,15 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+api-client = { path = "crates/api-client" }
 audio-engine = { path = "crates/audio-engine" }
+uploader = { path = "crates/uploader" }
 vault = { path = "crates/vault" }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2.0.20"
 serde_json = "1"
 tauri = { version = "2", features = ["tray-icon"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

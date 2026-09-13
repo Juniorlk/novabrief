@@ -2203,12 +2203,15 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 name = "novabrief-desktop"
 version = "0.1.0"
 dependencies = [
+ "api-client",
  "audio-engine",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "thiserror 2.0.20",
+ "tokio",
+ "uploader",
  "vault",
 ]
 

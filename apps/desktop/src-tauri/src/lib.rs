@@ -5,6 +5,7 @@
 //! it competes with is "remember to start the recorder", and an app that wants
 //! a window on screen loses that contest before the meeting begins.
 
+pub mod auth;
 pub mod devices;
 pub mod engine;
 pub mod paths;
@@ -16,14 +17,24 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use api_client::ApiClient;
 use audio_engine::encode::SegmentedOpusWriter;
 use audio_engine::pipeline::Endpoints;
+use auth::{Account, Identified};
 use engine::{Engine, EngineError, Outcome, Snapshot, Source};
 use recording::VaultSegmentSink;
 use session::Session;
 use state::{tray_menu, AppState, MenuItem};
 use tauri::Manager;
-use vault::{AccountKey, DeviceSecret, DpapiSealer, Vault};
+use vault::{AccountKey, CredentialStore, DeviceSecret, DpapiSealer, Vault};
+
+/// Where the API lives.
+///
+/// Not a plan value and not a secret: it is which deployment this build talks
+/// to. The override exists so a developer can point at a machine of their own,
+/// and it is read once at start-up rather than per request, so a build cannot
+/// change endpoint under a running session.
+const DEFAULT_API: &str = "https://api.novabrief.cloud";
 
 /// Bits per second handed to Opus.
 ///
@@ -492,6 +503,89 @@ fn recorded_ms(recorder: tauri::State<'_, Recorder>) -> u64 {
     recorder.recorded().as_millis() as u64
 }
 
+/// Which API this installation talks to.
+#[must_use]
+pub fn api_base() -> String {
+    std::env::var("NOVABRIEF_API_URL").unwrap_or_else(|_| DEFAULT_API.to_owned())
+}
+
+/// The account, as the commands see it.
+pub type Signed = Account<ApiClient>;
+
+/// Sign in with an email and a password (EF-11).
+///
+/// # Errors
+///
+/// When they are wrong, or the session cannot be written to this machine.
+#[tauri::command]
+async fn sign_in(
+    account: tauri::State<'_, Signed>,
+    email: String,
+    password: String,
+) -> Result<Identified, String> {
+    account.sign_in(&email, &password).await
+}
+
+/// Bring back the session this machine was left with.
+///
+/// # Errors
+///
+/// When the stored token is no longer accepted, which means signing in again.
+#[tauri::command]
+async fn restore_session(account: tauri::State<'_, Signed>) -> Result<Identified, String> {
+    account.restore().await
+}
+
+/// Who is signed in, without asking the server.
+///
+/// # Errors
+///
+/// Never; the `Result` is what Tauri requires of an async command.
+#[tauri::command]
+async fn session(account: tauri::State<'_, Signed>) -> Result<Option<Identified>, String> {
+    Ok(account.identified().await)
+}
+
+/// Whether this machine has been linked at all.
+///
+/// Read from the disk, so the first screen can be drawn before any request.
+///
+/// # Errors
+///
+/// Never; the `Result` is what Tauri requires of an async command.
+#[tauri::command]
+async fn is_linked(account: tauri::State<'_, Signed>) -> Result<bool, String> {
+    Ok(account.is_linked())
+}
+
+/// Forget the session on this machine.
+///
+/// # Errors
+///
+/// When the stored credential cannot be removed.
+#[tauri::command]
+async fn sign_out(account: tauri::State<'_, Signed>) -> Result<(), String> {
+    account.sign_out().await
+}
+
+/// The account this installation uses.
+///
+/// # Panics
+///
+/// If `NOVABRIEF_API_URL` is set to something credentials must not be sent to.
+/// Falling back to the default would be worse: an operator who pointed the
+/// build at a staging server would get production without being told.
+#[must_use]
+pub fn account() -> Signed {
+    let client = ApiClient::new(&api_base())
+        .expect("NOVABRIEF_API_URL must be an HTTPS address, or a loopback one");
+    let credentials = paths::data_root().map_or_else(
+        |_| PathBuf::from("credentials.bin"),
+        |root| paths::credentials_path(&root),
+    );
+    Account::new(client, CredentialStore::new(credentials, DpapiSealer))
+}
+
 /// Build and run the application.
 ///
 /// # Panics
@@ -502,7 +596,13 @@ fn recorded_ms(recorder: tauri::State<'_, Recorder>) -> u64 {
 pub fn run() {
     tauri::Builder::default()
         .manage(Recorder::new())
+        .manage(account())
         .invoke_handler(tauri::generate_handler![
+            sign_in,
+            sign_out,
+            session,
+            is_linked,
+            restore_session,
             current_state,
             snapshot,
             menu,
