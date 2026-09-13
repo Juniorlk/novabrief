@@ -141,6 +141,15 @@ jobs:
       - name: mypy --strict
         run: python -m mypy
 
+      - name: The desktop's copy of the API contract is current
+        # The desktop reads `crates/api-client/contract/openapi.json` in its
+        # own tests. A route renamed or a field moved here, and not there, is
+        # how sign-in shipped answering "the service answered something
+        # unexpected" with every test green.
+        env:
+          PYTHONPATH: apps/api:packages
+        run: python tools/dump_openapi.py --check
+
       - name: pytest
         run: python -m pytest
 
