@@ -37,6 +37,7 @@ const opened = ref<MeetingDetail | null>(null);
 const listFailure = ref<string | null>(null);
 const busy = ref(false);
 const actionFailure = ref<string | null>(null);
+const autostart = ref(false);
 
 /**
  * Four hours, the technical ceiling of EF-34.
@@ -122,6 +123,18 @@ function useTheirLanguage(preferred: string): void {
   }
 }
 
+/** EF-10: optional, and only when somebody asks for it. */
+async function toggleAutostart(enabled: boolean): Promise<void> {
+  try {
+    await api.setStartsWithWindows(enabled);
+    autostart.value = enabled;
+  } catch (error) {
+    actionFailure.value = String(error);
+    // Left showing what the machine actually does, not what was asked.
+    autostart.value = await api.startsWithWindows().catch(() => false);
+  }
+}
+
 function setLocale(next: Locale): void {
   locale.value = next;
   document.documentElement.lang = next;
@@ -145,6 +158,13 @@ onMounted(async () => {
   slowTimer = window.setInterval(() => void readLists(), SLOW);
   void readSnapshot();
   void refreshTray();
+  try {
+    autostart.value = await api.startsWithWindows();
+  } catch {
+    // A machine whose registry refuses to be read still records. The setting
+    // simply shows as off, which is what it effectively is.
+    autostart.value = false;
+  }
 
   // The same operations the buttons call, reached from the notification area.
   unlisten.push(await onTray("start", () => void start()));
@@ -253,6 +273,14 @@ const capturing = computed(
     </template>
 
     <footer>
+      <label class="autostart">
+        <input
+          type="checkbox"
+          :checked="autostart"
+          @change="toggleAutostart(($event.target as HTMLInputElement).checked)"
+        />
+        {{ t("settings.autostart") }}
+      </label>
       <label for="locale">{{ t("language.label") }}</label>
       <select
         id="locale"
@@ -319,11 +347,18 @@ h1 {
 footer {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 0.5rem;
   margin-top: auto;
   padding-top: 0.5rem;
   font-size: 0.8rem;
   color: var(--nb-muted);
+}
+
+.autostart {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
 }
 
 .link {

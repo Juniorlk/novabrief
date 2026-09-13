@@ -97,6 +97,9 @@ export const fr = {
     noSystemAudio: "Impossible de capter l'audio système.",
     diskFull: "Espace disque insuffisant pour continuer l'enregistrement.",
   },
+  settings: {
+    autostart: "Démarrer avec Windows",
+  },
   language: {
     label: "Langue",
     fr: "Français",

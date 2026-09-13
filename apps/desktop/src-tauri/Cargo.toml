@@ -35,6 +35,10 @@ thiserror = "2.0.20"
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 tauri = { version = "2", features = ["tray-icon"] }
+# EF-10 asks for optional automatic start. A registry key under HKCU, which is
+# what "per-user, no administrator" means on Windows - and writing it by hand
+# would be a second implementation of something Windows has opinions about.
+tauri-plugin-autostart = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

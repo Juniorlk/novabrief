@@ -88,6 +88,9 @@ export const en = {
     noSystemAudio: "System audio could not be captured.",
     diskFull: "Not enough disk space to keep recording.",
   },
+  settings: {
+    autostart: "Start with Windows",
+  },
   language: {
     label: "Language",
     fr: "Français",

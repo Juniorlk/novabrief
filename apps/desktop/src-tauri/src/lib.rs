@@ -649,6 +649,41 @@ fn set_tray_menu(app: tauri::AppHandle, items: Vec<TrayLabel>) -> Result<(), Str
     tray.set_menu(Some(menu)).map_err(|error| error.to_string())
 }
 
+/// Whether NovaBrief starts with Windows (EF-10).
+///
+/// # Errors
+///
+/// If the registry cannot be read.
+#[tauri::command]
+fn starts_with_windows(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt as _;
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|error| error.to_string())
+}
+
+/// Turn automatic start on or off.
+///
+/// Optional, and off until somebody asks. The product it competes with is
+/// "remember to start the recorder", so starting with Windows is what makes it
+/// win - but an application that installed itself into somebody's start-up
+/// without asking is one they uninstall.
+///
+/// # Errors
+///
+/// If the registry cannot be written.
+#[tauri::command]
+fn set_starts_with_windows(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt as _;
+    let launcher = app.autolaunch();
+    if enabled {
+        launcher.enable()
+    } else {
+        launcher.disable()
+    }
+    .map_err(|error| error.to_string())
+}
+
 /// Put the window on screen (EF-12).
 ///
 /// # Errors
@@ -844,6 +879,12 @@ fn reveal(app: &tauri::AppHandle) {
 /// recover from.
 pub fn run() {
     tauri::Builder::default()
+        // Started minimised: automatic start exists so the recorder is there
+        // when a meeting begins, not so a window is in the way every morning.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--hidden"]),
+        ))
         .setup(|app| {
             let recorder = Recorder::new();
             app.manage(desk(&recorder));
@@ -909,6 +950,8 @@ pub fn run() {
             meetings,
             meeting_detail,
             set_tray_menu,
+            starts_with_windows,
+            set_starts_with_windows,
             show_window,
             hide_window
         ])

@@ -130,6 +130,9 @@ export const api = {
     invoke("meeting_detail", { meetingId }),
 
   hideWindow: (): Promise<void> => invoke("hide_window"),
+  startsWithWindows: (): Promise<boolean> => invoke("starts_with_windows"),
+  setStartsWithWindows: (enabled: boolean): Promise<void> =>
+    invoke("set_starts_with_windows", { enabled }),
   menu: (): Promise<MenuItem[]> => invoke("menu"),
   setTrayMenu: (items: TrayLabel[]): Promise<void> => invoke("set_tray_menu", { items }),
 };

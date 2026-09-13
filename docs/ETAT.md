@@ -5,8 +5,9 @@
 > `docs/cahier-des-charges.md`, le *pourquoi* dans `docs/adr/`, le *comment*
 > dans `docs/tasks/`.
 >
-> Dernière mise à jour : **2026-09-12** (validation 60 min prononcée ;
-> **L3.1, L3.2 et L3.3 livrés** ; PR #29 à #37).
+> Dernière mise à jour : **2026-09-13** (**le lot L3 va de bout en bout** : le
+> logiciel enregistre, téléverse et affiche le compte rendu ; installateur
+> 2,66 Mo ; PR #42 à #49).
 
 ---
 
@@ -32,7 +33,15 @@
 | L3.5 — secret d'appareil, coffre à jetons, client API | **fait** | PR #39, #40 |
 | Boucle de capture partagée outil / produit | **fait** | PR #41 |
 | L3.3 — **le logiciel enregistre vraiment** | **fait** | PR #42 |
-| L3.4, L3.6 à L3.9 | pas commencés | `docs/tasks/06_L3_application_desktop.md` |
+| Segments = un seul flux Ogg (fichier téléversable) | **fait** | PR #43 |
+| API — un téléversement survit à ses signatures | **fait** | PR #44 |
+| L3.6 — téléverseur résilient (EF-18, T-01) | **fait** | PR #45 |
+| L3.5 — connexion et session (EF-11) | **fait** | PR #46 |
+| L3.6 — file de téléversement | **fait** | PR #47 |
+| L3.4 — fenêtre, vu-mètres, **compte rendu affiché** | **fait** | PR #48 |
+| L3.9 — installateur 2,66 Mo, démarrage auto | **fait**, signature bloquée | PR #49 ; `07_L3_9_installateur.md` |
+| L3.7 — test audio guidé (EF-16) | pas commencé | `06_L3_application_desktop.md` |
+| L3.8 — journal local (EF-20) | pas commencé | `06_L3_application_desktop.md` |
 
 ### Lot L1 en détail
 
@@ -378,6 +387,38 @@ Et c'est aussi un fait produit, pas seulement un fait de test : la veille lève
 `AUDCLNT_E_DEVICE_INVALIDATED` sur le flux en cours, et NovaBrief doit y
 survivre (EF-15, C5).
 
+### Un double qui ne suspend jamais rend un test de course inutile
+
+Le test « deux appelants ne dépensent jamais deux refresh tokens » **passait
+aussi sans le correctif**. Le double répondait par un futur déjà prêt, donc
+`tokio::join!` menait le premier à terme avant même de démarrer le second : la
+course n'avait jamais lieu. Un `yield_now()` dans le double, et le test tombe
+correctement.
+
+Troisième piège de cette famille sur ce dépôt, après un test qui *skippait* et
+un compteur d'événements pris pour une mesure de volume. **Un test vert n'est
+une preuve que si on l'a vu rouge.**
+
+### Une propriété peut être fausse, et le commentaire qui l'affirme aussi
+
+« Une passe de la file dépense un seul refresh token » : le test passait avec le
+renouvellement déplacé dans la boucle, parce que renouveler est idempotent tant
+que le jeton est vivant. La propriété n'existait pas. Le test a été remplacé par
+une vraie — *un enregistrement illisible n'est pas réessayé indéfiniment* — et
+le commentaire corrigé. Un commentaire qui affirme une garantie inexistante est
+pire qu'aucun commentaire.
+
+### Un fichier Ogg recollé n'est pas un fichier Ogg chaîné
+
+Chaque segment était un flux autonome ; les recoller donnait un Ogg **chaîné**,
+et un décodeur retire le pre-skip déclaré au début de chaque maillon alors que
+l'encodeur ne paie ce délai qu'une fois. Sur une heure, 720 maillons : plusieurs
+secondes de parole perdues par petits morceaux, et tous les horodatages décalés.
+
+Et le premier test écrit pour ça **ne pouvait pas échouer** : la concaténation
+est identique quel que soit l'endroit des coupes. L'invariante se lit segment
+par segment.
+
 ### Mes scripts Python réécrivent les fichiers en CRLF
 
 `Path.write_text()` traduit `\n` en `\r\n` sous Windows. Les fichiers
@@ -529,6 +570,7 @@ Elles ne sont pas dans le cahier des charges et priment sur lui.
 | 2026-09-10 | Dépôt GitHub passé en **public** ; historique vérifié, aucune clé n'y figure |
 | 2026-09-10 | Clés de développement réutilisées en production, à remplacer plus tard (décision Novafrik) |
 | 2026-09-09 | **Cloudflare R2 retenu** plutôt que MinIO sur le VPS : à ce volume R2 coûte quelques centimes par mois, et sortir l'audio du disque qui porte PostgreSQL vaut plus que l'économie |
+| 2026-09-13 | Lot L3 mené jusqu'à l'installateur d'un trait (« on continue jusqu'à l'installateur signé ») |
 | 2026-09-09 | Domaine **`novabrief.cloud`** (OVH) ; DNS Resend configure ; redirection `contact@` vers l'adresse personnelle faute de boite OVH disponible |
 
 **Le risque « l'IA invente une décision » (risque n°2 du cahier des charges)
@@ -606,12 +648,20 @@ mv .env .env.hidden && python -m pytest -q ; mv .env.hidden .env
 - **Un changement de format au retour d'un périphérique fait échouer la
   capture** plutôt que de reconstruire le pipeline. `FormatChanged` nomme le
   cas ; le traiter est du ressort du reste de L3.3.
-- **Le compte rendu n'est visible nulle part.** L'API le produit, le desktop ne
-  l'affiche pas encore : il n'a ni écran de connexion, ni liste de réunions, ni
-  vue de compte rendu. C'est le lot L3.4 et la demande explicite de Novafrik
-  (« je veux voir le résultat sur le logiciel et pas en console »).
-- **Rien ne téléverse.** Le coffre se remplit et se ferme en `Uploading` ;
-  personne ne vient chercher les segments (lot L3.6).
+- **Le parcours complet n'a jamais tourné contre l'API déployée.** Chaque pièce
+  est éprouvée — enregistrement sur vrai matériel, téléversement contre un
+  double, URL présignées contre MinIO — mais « une réunion enregistrée sur le
+  poste traverse l'API jusqu'à `PUBLISHED` » (critère de sortie n°5 du lot L3)
+  **n'est pas prononcé**. C'est la prochaine chose à faire, et elle demande un
+  compte réel sur l'API déployée.
+- **T-12 (SmartScreen) est bloqué sur un certificat** de signature de code.
+  Sans lui, chaque installation affiche « Windows a protégé votre ordinateur ».
+- **La mise à jour automatique (EF-19) n'existe pas** : elle demande une paire
+  de clés Ed25519 et un endpoint de publication. Le plugin n'est volontairement
+  pas ajouté — une configuration à moitié remplie accepterait des mises à jour
+  que personne n'a signées. Détail dans `07_L3_9_installateur.md`.
+- **L'installateur n'a pas été essayé sur une machine vierge**, donc sans
+  WebView2 préinstallé — c'est là que se découvre le dernier prérequis manquant.
 - **Une réunion en `QUOTA_HOLD` n'a aucune sortie.** Seul le webhook de
   paiement du lot L5 peut la relancer, et il n'existe pas. Sans effet
   aujourd'hui — aucun quota n'est assigné avant L5, donc rien n'y entre — mais
