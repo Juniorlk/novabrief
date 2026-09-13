@@ -29,8 +29,10 @@
 | L3.3 — récupération de périphérique (EF-15 / C5) | **fait** | PR #33 |
 | L3.3 — chemin audio → coffre chiffré | **fait** | PR #35 |
 | L3.3 — machine à états, pause, durées (EF-33, EF-34) | **fait** | PR #37 |
-| L3.4 à L3.9 | pas commencés | `docs/tasks/06_L3_application_desktop.md` |
-| Lot L3.4 à L3.9 | pas commencés | `docs/tasks/06_L3_application_desktop.md` |
+| L3.5 — secret d'appareil, coffre à jetons, client API | **fait** | PR #39, #40 |
+| Boucle de capture partagée outil / produit | **fait** | PR #41 |
+| L3.3 — **le logiciel enregistre vraiment** | **fait** | PR #42 |
+| L3.4, L3.6 à L3.9 | pas commencés | `docs/tasks/06_L3_application_desktop.md` |
 
 ### Lot L1 en détail
 
@@ -604,10 +606,12 @@ mv .env .env.hidden && python -m pytest -q ; mv .env.hidden .env
 - **Un changement de format au retour d'un périphérique fait échouer la
   capture** plutôt que de reconstruire le pipeline. `FormatChanged` nomme le
   cas ; le traiter est du ressort du reste de L3.3.
-- **Rien ne pilote encore les vrais fils de capture.** Les règles
-  (`session.rs`) et le chemin audio → coffre (`recording.rs`) sont en place et
-  testés séparément ; ce qui manque est la boucle qui ouvre les périphériques,
-  mixe et alimente l'encodeur — avec les boutons du widget, lot L3.4.
+- **Le compte rendu n'est visible nulle part.** L'API le produit, le desktop ne
+  l'affiche pas encore : il n'a ni écran de connexion, ni liste de réunions, ni
+  vue de compte rendu. C'est le lot L3.4 et la demande explicite de Novafrik
+  (« je veux voir le résultat sur le logiciel et pas en console »).
+- **Rien ne téléverse.** Le coffre se remplit et se ferme en `Uploading` ;
+  personne ne vient chercher les segments (lot L3.6).
 - **Une réunion en `QUOTA_HOLD` n'a aucune sortie.** Seul le webhook de
   paiement du lot L5 peut la relancer, et il n'existe pas. Sans effet
   aujourd'hui — aucun quota n'est assigné avant L5, donc rien n'y entre — mais

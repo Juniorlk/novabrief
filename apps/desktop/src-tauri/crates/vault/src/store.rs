@@ -291,6 +291,24 @@ impl Recording {
             .decrypt_segment(&self.manifest.meeting_id, index, &sealed)
     }
 
+    /// Record which devices the capture actually opened.
+    ///
+    /// Written at the end rather than at [`Vault::begin`], because what the
+    /// recorder can say before the first packet is which device it *asked*
+    /// for - "the Windows default" - and after a crash that is the one answer
+    /// support does not need. The manifest is the only thing that survives the
+    /// process, so it carries the names the audio was really recorded with.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Io`] if the manifest cannot be rewritten.
+    pub fn note_devices(&mut self, input: &str, output: &str) -> Result<()> {
+        self.manifest.input_device = input.to_owned();
+        self.manifest.output_device = output.to_owned();
+        self.manifest
+            .save_atomically(&manifest_path(&self.directory))
+    }
+
     /// Move the recording to a new state.
     ///
     /// # Errors
