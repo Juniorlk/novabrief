@@ -9,6 +9,15 @@
 //! (ADR-05): each finished segment is flushed to disk and hashed, so a crash or
 //! a power cut costs at most the segment in progress, and the uploader can send
 //! and confirm one piece at a time.
+//!
+//! The segments are **pieces of one Ogg stream**, not a series of little
+//! files. Put back together end to end they are the recording, byte for byte,
+//! which is what the server is sent: one object at one URL. Cutting the stream
+//! into standalone files instead would make the joined result a chained Ogg,
+//! and a decoder trims the declared pre-skip at the start of every link while
+//! the Opus encoder underneath pays that delay only once - so an hour of
+//! meeting, 720 links, would lose several seconds of speech in small bites and
+//! shift every timestamp after each one.
 
 use std::fs::File;
 use std::io::Write;
@@ -153,9 +162,37 @@ pub struct SegmentedOpusWriter<S: SegmentSink = FileSegmentSink> {
     /// once the next one fails to arrive, so one packet is always held back.
     held: Option<Vec<u8>>,
 
+    /// The one Ogg stream the whole recording is written into.
+    ///
+    /// Kept across segments so page sequence numbers, the serial and the
+    /// granule positions run unbroken through the file the segments make when
+    /// they are put back together. A writer per segment would restart the page
+    /// counter at zero in the middle of the stream.
+    stream: ogg::PacketWriter<'static, Vec<u8>>,
+    /// Granule position of the last packet handed to the muxer, in 48 kHz
+    /// samples, counted from the start of the recording.
+    granule: u64,
+
     current: Option<OpenSegment>,
     segments: Vec<SegmentRecord>,
     total_samples: u64,
+}
+
+/// What a packet is at the end of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    /// An ordinary packet, in the middle of a page.
+    Packet,
+    /// The last packet of a segment, so the muxer flushes its page there.
+    ///
+    /// Without it the muxer would flush when a page fills instead, and a
+    /// segment would be stored holding neither more nor less than whatever
+    /// had happened to be written by then - while its manifest entry claimed
+    /// five seconds. A crash would then cost however long ago the last flush
+    /// was, not the five seconds EF-17 promises.
+    Segment,
+    /// The last packet of the recording.
+    Stream,
 }
 
 /// Where finished segments go.
@@ -251,13 +288,39 @@ impl SegmentSink for FileSegmentSink {
     }
 }
 
+/// The Ogg serial number every page of a recording carries.
+///
+/// Fixed rather than random. A serial exists to tell interleaved logical
+/// streams apart inside one Ogg file, and a NovaBrief recording has exactly
+/// one; a constant makes a segment byte-identical from one run to the next,
+/// which is what lets a test compare two encodings at all.
+const STREAM_SERIAL: u32 = 0x4E42_0001;
+
+/// How many 48 kHz samples one sample at the working rate is worth.
+///
+/// Ogg Opus counts pre-skip and granule positions in 48 kHz samples whatever
+/// the stream's own rate, so every figure written into the container has to be
+/// scaled by this. Writing the encoder's raw lookahead instead would declare a
+/// third of the real delay and leave a few milliseconds of encoder lead-in at
+/// the front of every recording.
+const GRANULE_PER_SAMPLE: u32 = GRANULE_RATE as u32 / TARGET_SAMPLE_RATE;
+
+/// Where one segment starts and how much of the recording it holds.
+///
+/// It has no Ogg writer of its own. The whole recording is **one** logical Ogg
+/// stream, cut at page boundaries: concatenating the segments in order gives
+/// back a byte-exact, valid Ogg Opus file, which is what the server is sent.
+///
+/// The alternative - a standalone stream per segment - produces a chained file
+/// instead, and chaining is not free here. A decoder trims the declared
+/// pre-skip at the start of *every* link, while the Opus encoder underneath
+/// runs continuously and only ever pays that delay once. An hour of meeting is
+/// 720 links, so the chained file would lose several seconds of real audio in
+/// small bites and shift every timestamp after each one.
 struct OpenSegment {
     index: u32,
-    writer: ogg::PacketWriter<'static, Vec<u8>>,
     samples: u64,
     start_samples: u64,
-    granule: u64,
-    serial: u32,
 }
 
 impl<S: SegmentSink> std::fmt::Debug for SegmentedOpusWriter<S> {
@@ -306,10 +369,16 @@ impl<S: SegmentSink> SegmentedOpusWriter<S> {
         // The encoder delays the signal by its lookahead; declaring it as
         // pre-skip is what lets a decoder drop exactly that much and keep the
         // timeline aligned with the manifest.
+        //
+        // Scaled to 48 kHz, which is the unit the container counts in.
+        // `lookahead` answers in samples at the rate the encoder was created
+        // with - 16 kHz here - and writing that figure unscaled declared a
+        // third of the real delay.
         let pre_skip = encoder
             .lookahead()
-            .unwrap_or(312)
-            .clamp(0, u32::from(u16::MAX)) as u16;
+            .unwrap_or(312 / GRANULE_PER_SAMPLE)
+            .saturating_mul(GRANULE_PER_SAMPLE)
+            .min(u32::from(u16::MAX)) as u16;
 
         let seconds = segment_seconds.clamp(5.0, 10.0);
         Ok(Self {
@@ -323,6 +392,10 @@ impl<S: SegmentSink> SegmentedOpusWriter<S> {
             head: 0,
             moved: 0,
             packet: vec![0_u8; MAX_PACKET],
+            // Into memory. Five seconds is about 20 KB, and the sink needs the
+            // whole segment anyway.
+            stream: ogg::PacketWriter::new(Vec::new()),
+            granule: 0,
             current: None,
             segments: Vec::new(),
             total_samples: 0,
@@ -360,7 +433,7 @@ impl<S: SegmentSink> SegmentedOpusWriter<S> {
 
             let packet = self.packet[..encoded].to_vec();
             if let Some(previous) = self.held.replace(packet) {
-                self.emit(previous, false)?;
+                self.emit(previous, Boundary::Packet)?;
             }
             self.total_samples += FRAME_SAMPLES as u64;
 
@@ -372,7 +445,7 @@ impl<S: SegmentSink> SegmentedOpusWriter<S> {
             });
             if full {
                 if let Some(last) = self.held.take() {
-                    self.emit(last, true)?;
+                    self.emit(last, Boundary::Segment)?;
                 }
                 self.close_segment()?;
             }
@@ -448,13 +521,13 @@ impl<S: SegmentSink> SegmentedOpusWriter<S> {
             self.head = 0;
             let packet = self.packet[..encoded].to_vec();
             if let Some(previous) = self.held.replace(packet) {
-                self.emit(previous, false)?;
+                self.emit(previous, Boundary::Packet)?;
             }
             self.total_samples += FRAME_SAMPLES as u64;
         }
 
         if let Some(last) = self.held.take() {
-            self.emit(last, true)?;
+            self.emit(last, Boundary::Stream)?;
         }
         if self.current.is_some() {
             self.close_segment()?;
@@ -480,49 +553,77 @@ impl<S: SegmentSink> SegmentedOpusWriter<S> {
     fn open_segment(&mut self) -> Result<(), EncodeError> {
         let index = self.segments.len() as u32;
 
-        // Each segment is a standalone Ogg stream so it can be decoded on its
-        // own; a distinct serial keeps them from being mistaken for one stream.
-        let serial = 0x4E42_0000_u32.wrapping_add(index);
-        let mut segment = OpenSegment {
+        // The two mandatory headers open the stream, once, at the front of the
+        // first segment - not once per segment. They describe the whole
+        // recording, and a decoder that met them again mid-file would read the
+        // rest as a second, unrelated stream.
+        if index == 0 {
+            self.write_opus_headers()?;
+        }
+
+        self.current = Some(OpenSegment {
             index,
-            // Into memory. Five seconds is about 20 KB, and the sink needs the
-            // whole segment anyway.
-            writer: ogg::PacketWriter::new(Vec::new()),
             samples: 0,
             start_samples: self.total_samples,
-            granule: 0,
-            serial,
-        };
-        write_opus_headers(&mut segment, self.pre_skip)?;
-        self.current = Some(segment);
+        });
+        Ok(())
+    }
+
+    /// Write the two mandatory Ogg Opus headers, `OpusHead` and `OpusTags`.
+    fn write_opus_headers(&mut self) -> Result<(), EncodeError> {
+        let mut head = Vec::with_capacity(19);
+        head.extend_from_slice(b"OpusHead");
+        head.push(1); // version
+        head.push(2); // channel count
+        head.extend_from_slice(&self.pre_skip.to_le_bytes()); // pre-skip
+        head.extend_from_slice(&TARGET_SAMPLE_RATE.to_le_bytes()); // original rate
+        head.extend_from_slice(&0_i16.to_le_bytes()); // output gain
+        head.push(0); // channel mapping family 0
+
+        let vendor = b"NovaBrief";
+        let mut tags = Vec::with_capacity(32);
+        tags.extend_from_slice(b"OpusTags");
+        tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        tags.extend_from_slice(vendor);
+        tags.extend_from_slice(&0_u32.to_le_bytes()); // no user comments
+
+        // Each on a page of its own, as RFC 7845 requires.
+        for packet in [head, tags] {
+            self.stream
+                .write_packet(packet, STREAM_SERIAL, ogg::PacketWriteEndInfo::EndPage, 0)
+                .map_err(|source| EncodeError::Io {
+                    path: PathBuf::from("opus headers"),
+                    source,
+                })?;
+        }
         Ok(())
     }
 
     /// Hand one encoded packet to the muxer.
     ///
-    /// `last` marks the end of the logical Ogg stream. Ogg needs that flag on a
-    /// real packet: a zero-length packet is not a valid Opus packet, so an
-    /// empty end marker makes the whole stream undecodable.
-    fn emit(&mut self, data: Vec<u8>, last: bool) -> Result<(), EncodeError> {
+    /// [`Boundary::Stream`] marks the end of the logical Ogg stream. Ogg needs
+    /// that flag on a real packet: a zero-length packet is not a valid Opus
+    /// packet, so an empty end marker makes the whole stream undecodable.
+    fn emit(&mut self, data: Vec<u8>, boundary: Boundary) -> Result<(), EncodeError> {
         if self.current.is_none() {
             self.open_segment()?;
         }
         let Some(segment) = self.current.as_mut() else {
             return Ok(());
         };
-        segment.granule += FRAME_GRANULE;
+        let index = segment.index;
         segment.samples += FRAME_SAMPLES as u64;
+        self.granule += FRAME_GRANULE;
 
-        let info = if last {
-            ogg::PacketWriteEndInfo::EndStream
-        } else {
-            ogg::PacketWriteEndInfo::NormalPacket
+        let info = match boundary {
+            Boundary::Packet => ogg::PacketWriteEndInfo::NormalPacket,
+            Boundary::Segment => ogg::PacketWriteEndInfo::EndPage,
+            Boundary::Stream => ogg::PacketWriteEndInfo::EndStream,
         };
-        segment
-            .writer
-            .write_packet(data, segment.serial, info, segment.granule)
+        self.stream
+            .write_packet(data, STREAM_SERIAL, info, self.granule)
             .map_err(|source| EncodeError::Io {
-                path: PathBuf::from(format!("segment {}", segment.index)),
+                path: PathBuf::from(format!("segment {index}")),
                 source,
             })
     }
@@ -532,7 +633,10 @@ impl<S: SegmentSink> SegmentedOpusWriter<S> {
             return Ok(());
         };
 
-        let bytes = segment.writer.into_inner();
+        // Everything the muxer has produced since the previous segment was
+        // closed, which is a whole number of pages: the last packet of a
+        // segment always ends its page.
+        let bytes = std::mem::take(self.stream.inner_mut());
 
         // Of the bytes the encoder produced, which are exactly what the sink
         // stores and what will later be uploaded. This used to read the file
@@ -556,39 +660,6 @@ impl<S: SegmentSink> SegmentedOpusWriter<S> {
         });
         Ok(())
     }
-}
-
-/// Write the two mandatory Ogg Opus headers, `OpusHead` and `OpusTags`.
-fn write_opus_headers(segment: &mut OpenSegment, pre_skip: u16) -> Result<(), EncodeError> {
-    let mut head = Vec::with_capacity(19);
-    head.extend_from_slice(b"OpusHead");
-    head.push(1); // version
-    head.push(2); // channel count
-    head.extend_from_slice(&pre_skip.to_le_bytes()); // pre-skip
-    head.extend_from_slice(&TARGET_SAMPLE_RATE.to_le_bytes()); // original rate
-    head.extend_from_slice(&0_i16.to_le_bytes()); // output gain
-    head.push(0); // channel mapping family 0
-
-    let vendor = b"NovaBrief";
-    let mut tags = Vec::with_capacity(32);
-    tags.extend_from_slice(b"OpusTags");
-    tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
-    tags.extend_from_slice(vendor);
-    tags.extend_from_slice(&0_u32.to_le_bytes()); // no user comments
-
-    for (packet, info) in [
-        (head, ogg::PacketWriteEndInfo::EndPage),
-        (tags, ogg::PacketWriteEndInfo::EndPage),
-    ] {
-        segment
-            .writer
-            .write_packet(packet, segment.serial, info, 0)
-            .map_err(|source| EncodeError::Io {
-                path: PathBuf::from(format!("segment {}", segment.index)),
-                source,
-            })?;
-    }
-    Ok(())
 }
 
 /// Convert a per-channel sample count at the working rate to milliseconds.
@@ -728,7 +799,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    use super::{samples_to_ms, SegmentedOpusWriter, FRAME_INTERLEAVED, FRAME_SAMPLES};
+    use super::{
+        samples_to_ms, SegmentedOpusWriter, FRAME_INTERLEAVED, FRAME_SAMPLES, GRANULE_PER_SAMPLE,
+    };
     use crate::resample::TARGET_SAMPLE_RATE;
 
     fn tone(seconds: f64) -> Vec<f32> {
@@ -806,6 +879,276 @@ mod tests {
         writer.write(&tone(11.0)).expect("write");
         let manifest = writer.finish("mic", "speakers", 0).expect("finish");
         assert_eq!(manifest.segments.len(), 3, "clamped to 5 s, not 1 s");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One Ogg page, as it sits in the byte stream.
+    #[derive(Debug)]
+    struct Page {
+        beginning: bool,
+        end: bool,
+        granule: u64,
+        serial: u32,
+        sequence: u32,
+        length: usize,
+    }
+
+    /// Walk a byte stream as Ogg pages, checking each page's own checksum.
+    ///
+    /// The checksum is the point. Everything else a test could assert about
+    /// this file - the headers are there, the timestamps rise - would still
+    /// pass if a page had been cut in half and glued to another, which is
+    /// exactly what segmenting a stream can get wrong. A page whose CRC
+    /// matches is a page that arrived whole.
+    fn pages(bytes: &[u8]) -> Vec<Page> {
+        /// Ogg uses CRC-32 with the polynomial below, no reflection and no
+        /// final inversion - not the CRC-32 of zip or PNG.
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = 0_u32;
+            for byte in data {
+                crc ^= u32::from(*byte) << 24;
+                for _ in 0..8 {
+                    crc = if crc & 0x8000_0000 == 0 {
+                        crc << 1
+                    } else {
+                        (crc << 1) ^ 0x04c1_1db7
+                    };
+                }
+            }
+            crc
+        }
+
+        let mut pages = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            assert_eq!(&bytes[at..at + 4], b"OggS", "no page header at byte {at}");
+            assert_eq!(bytes[at + 4], 0, "unknown Ogg version");
+            let flags = bytes[at + 5];
+            let count = bytes[at + 26] as usize;
+            let header = 27 + count;
+            let payload: usize = bytes[at + 27..at + header]
+                .iter()
+                .map(|lacing| *lacing as usize)
+                .sum();
+            let length = header + payload;
+
+            let mut whole = bytes[at..at + length].to_vec();
+            let declared = u32::from_le_bytes([whole[22], whole[23], whole[24], whole[25]]);
+            whole[22..26].fill(0);
+            assert_eq!(
+                crc32(&whole),
+                declared,
+                "page {} does not checksum: it was cut or reassembled wrongly",
+                pages.len()
+            );
+
+            pages.push(Page {
+                beginning: flags & 0x02 != 0,
+                end: flags & 0x04 != 0,
+                granule: u64::from_le_bytes(bytes[at + 6..at + 14].try_into().expect("8 bytes")),
+                serial: u32::from_le_bytes(bytes[at + 14..at + 18].try_into().expect("4 bytes")),
+                sequence: u32::from_le_bytes(bytes[at + 18..at + 22].try_into().expect("4 bytes")),
+                length,
+            });
+            at += length;
+        }
+        pages
+    }
+
+    /// The segments are pieces of one file, not a pile of little files.
+    ///
+    /// This is what the server is sent: `finalize-local` takes one object and
+    /// the transcription provider is handed one URL, so the uploader puts the
+    /// segments back together end to end. That only produces a valid recording
+    /// if the encoder wrote one logical stream and cut it at page boundaries -
+    /// which is the property below, checked page by page and checksum by
+    /// checksum on the concatenation itself.
+    #[test]
+    fn the_segments_reassemble_into_one_ogg_stream() {
+        let dir = scratch("reassemble");
+        let mut writer = SegmentedOpusWriter::new(&dir, "test", 32_000, 5.0).expect("writer");
+        writer.write(&tone(17.0)).expect("write");
+        let manifest = writer.finish("mic", "speakers", 0).expect("finish");
+        assert!(manifest.segments.len() >= 3, "expected several segments");
+
+        // Each segment file holds the audio the manifest says it holds. This
+        // is what concatenation cannot check - the joined bytes are the same
+        // wherever the cuts fall - and it is what EF-17 rests on: a crash
+        // loses the segment in progress, so "at most five seconds" is only
+        // true if the segments already stored really contain the rest.
+        //
+        // The muxer only ever emits whole pages, and it emits them when a page
+        // fills rather than when a segment ends. Without a flush at the
+        // boundary the first segment comes out holding nothing but the two
+        // headers while its manifest entry claims five seconds of audio.
+        let mut whole = Vec::new();
+        let mut so_far = 0_u64;
+        for segment in &manifest.segments {
+            let bytes = std::fs::read(dir.join(&segment.file)).expect("segment");
+            so_far += segment.samples;
+
+            let within = pages(&bytes);
+            assert_eq!(
+                within.iter().map(|page| page.length).sum::<usize>(),
+                bytes.len(),
+                "segment {} ends in the middle of a page",
+                segment.index
+            );
+            assert_eq!(
+                within
+                    .last()
+                    .expect("a segment holds at least one page")
+                    .granule,
+                so_far * u64::from(GRANULE_PER_SAMPLE),
+                "segment {} ends at a different point than the manifest says: \
+                 its audio was left in a page that had not been flushed",
+                segment.index
+            );
+            whole.extend_from_slice(&bytes);
+        }
+
+        let pages = pages(&whole);
+        assert!(pages.len() > manifest.segments.len());
+        assert_eq!(
+            pages.iter().map(|page| page.length).sum::<usize>(),
+            whole.len(),
+            "the pages do not account for every byte"
+        );
+
+        // One stream: one beginning, one end, one serial, and page numbers
+        // that run without a gap or a restart from end to end.
+        assert!(pages[0].beginning, "the first page is not a stream start");
+        assert_eq!(
+            pages.iter().filter(|page| page.beginning).count(),
+            1,
+            "a second stream starts inside the file"
+        );
+        assert!(
+            pages.last().expect("pages").end,
+            "the stream never ends: no page carries the end-of-stream flag"
+        );
+        assert_eq!(pages.iter().filter(|page| page.end).count(), 1);
+
+        let serial = pages[0].serial;
+        assert!(pages.iter().all(|page| page.serial == serial));
+        for (expected, page) in pages.iter().enumerate() {
+            assert_eq!(
+                page.sequence, expected as u32,
+                "page numbering restarts mid-file, which is what a stream per segment does"
+            );
+        }
+
+        // And the headers describe the recording once, not once per segment.
+        let occurrences = |needle: &[u8]| {
+            whole
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        };
+        assert_eq!(occurrences(b"OpusHead"), 1);
+        assert_eq!(occurrences(b"OpusTags"), 1);
+
+        // Timestamps run through the whole file rather than restarting at each
+        // segment, and the last one is the length of the recording.
+        let audio: Vec<u64> = pages.iter().skip(2).map(|page| page.granule).collect();
+        assert!(
+            audio.windows(2).all(|pair| pair[1] > pair[0]),
+            "granule positions do not increase across the file: {audio:?}"
+        );
+        assert_eq!(
+            *audio.last().expect("audio pages"),
+            manifest.total_samples * u64::from(GRANULE_PER_SAMPLE),
+            "the final timestamp is not the length of the recording"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reassembled file decodes, and decodes to the whole recording.
+    ///
+    /// Everything else here reads the container. This plays it: the Ogg
+    /// demuxer is the crate's own reader rather than our writer, and the
+    /// decoder is the libopus a transcription provider would put it through.
+    /// A file that satisfies every structural assertion and still cannot be
+    /// decoded would be an hour of meeting nobody can hear.
+    #[test]
+    fn the_reassembled_file_decodes_to_the_whole_recording() {
+        let dir = scratch("decode");
+        let mut writer = SegmentedOpusWriter::new(&dir, "test", 32_000, 5.0).expect("writer");
+        writer.write(&tone(17.0)).expect("write");
+        let manifest = writer.finish("mic", "speakers", 0).expect("finish");
+
+        let mut whole = Vec::new();
+        for segment in &manifest.segments {
+            whole.extend_from_slice(&std::fs::read(dir.join(&segment.file)).expect("segment"));
+        }
+
+        let mut reader = ogg::PacketReader::new(std::io::Cursor::new(&whole));
+        let mut decoder = audiopus::coder::Decoder::new(
+            audiopus::SampleRate::Hz16000,
+            audiopus::Channels::Stereo,
+        )
+        .expect("the decoder opens");
+
+        // 120 ms of stereo is more than any packet we produce.
+        let mut out = vec![0.0_f32; FRAME_SAMPLES * 2 * 6];
+        let mut decoded = 0_u64;
+        let mut packets = 0_usize;
+        let mut loudest = 0.0_f32;
+
+        while let Some(packet) = reader.read_packet().expect("the stream demuxes") {
+            packets += 1;
+            // The two headers are not Opus packets.
+            if packets <= 2 {
+                continue;
+            }
+            let samples = decoder
+                .decode_float(Some(&packet.data[..]), &mut out[..], false)
+                .unwrap_or_else(|error| panic!("packet {packets} did not decode: {error}"));
+            decoded += samples as u64;
+            for sample in &out[..samples * 2] {
+                loudest = loudest.max(sample.abs());
+            }
+        }
+
+        assert_eq!(
+            decoded, manifest.total_samples,
+            "the file decodes to a different length than the manifest claims"
+        );
+        assert!(
+            loudest > 0.2,
+            "the file decodes to near-silence ({loudest:.3}); a 440 Hz tone went in"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RFC 7845: the pre-skip is counted in 48 kHz samples whatever the rate
+    /// the stream was encoded at. Writing the encoder's own figure declared a
+    /// third of the real delay, and a decoder trimming a third of the encoder
+    /// lead-in leaves the rest of it at the front of the recording.
+    #[test]
+    fn the_pre_skip_is_written_in_forty_eight_kilohertz_samples() {
+        let dir = scratch("preskip");
+        let mut writer = SegmentedOpusWriter::new(&dir, "test", 32_000, 5.0).expect("writer");
+        writer.write(&tone(6.0)).expect("write");
+        let manifest = writer.finish("mic", "speakers", 0).expect("finish");
+
+        let first = std::fs::read(dir.join(&manifest.segments[0].file)).expect("segment");
+        let head = first
+            .windows(8)
+            .position(|window| window == b"OpusHead")
+            .expect("the stream declares no OpusHead");
+        let pre_skip = u16::from_le_bytes([first[head + 10], first[head + 11]]);
+
+        // libopus reports 6.5 ms of lookahead at 16 kHz, which is 104 samples
+        // there and 312 at the rate the container counts in.
+        assert!(
+            pre_skip >= 240,
+            "pre-skip of {pre_skip} is too small to be a 48 kHz figure"
+        );
+        assert!(pre_skip <= 1000, "pre-skip of {pre_skip} is implausible");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

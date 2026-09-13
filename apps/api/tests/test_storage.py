@@ -146,6 +146,47 @@ async def test_an_upload_in_several_parts_is_reassembled(storage: S3StorageProvi
     await storage.delete(key=key)
 
 
+async def test_an_upload_survives_losing_its_signatures(storage: S3StorageProvider) -> None:
+    """EF-18: the outage outlasts the fifteen-minute URLs.
+
+    Half the recording is sent, the signatures are thrown away, new ones are
+    asked for, and the rest goes up. What has to come out the other end is one
+    object holding the whole thing - which means the second half was written
+    into the *same* upload, beside a first half that was never resent.
+
+    Only a real store can say this. A double would accept any of it.
+    """
+    key = _key()
+    first = b"1" * MIN_PART_SIZE_BYTES
+    second = b"2" * 1024
+
+    upload = await storage.start_multipart(key=key, size_bytes=len(first) + len(second))
+    etags: list[tuple[int, str]] = []
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.put(upload.parts[0].url, content=first)
+        assert response.status_code == 200, response.text
+        etags.append((1, response.headers["ETag"].strip('"')))
+
+    # The network goes away long enough for the URLs to be worthless.
+    again = await storage.presign_parts(
+        key=key, upload_id=upload.upload_id, size_bytes=len(first) + len(second)
+    )
+    assert again.upload_id == upload.upload_id
+    assert len(again.parts) == len(upload.parts)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.put(again.parts[1].url, content=second)
+        assert response.status_code == 200, response.text
+        etags.append((2, response.headers["ETag"].strip('"')))
+
+    stored = await storage.complete_multipart(key=key, upload_id=upload.upload_id, etags=etags)
+
+    assert stored.size_bytes == len(first) + len(second), (
+        "the part sent before the outage did not survive it"
+    )
+    await storage.delete(key=key)
+
+
 async def test_the_object_does_not_exist_until_the_upload_completes(
     storage: S3StorageProvider,
 ) -> None:
