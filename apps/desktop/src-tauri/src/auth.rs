@@ -85,6 +85,34 @@ impl<I: Identity + Sync> Identity for &I {
     }
 }
 
+/// A shared identity is an identity.
+///
+/// The session and the upload queue hold the same client, so a renewal made
+/// for one is seen by the other.
+impl<I: Identity + Send + Sync> Identity for std::sync::Arc<I> {
+    fn sign_in(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> impl std::future::Future<Output = Result<TokenPair, ApiError>> + Send {
+        I::sign_in(self, email, password)
+    }
+
+    fn refresh(
+        &self,
+        refresh_token: &str,
+    ) -> impl std::future::Future<Output = Result<TokenPair, ApiError>> + Send {
+        I::refresh(self, refresh_token)
+    }
+
+    fn profile(
+        &self,
+        access_token: &str,
+    ) -> impl std::future::Future<Output = Result<Profile, ApiError>> + Send {
+        I::profile(self, access_token)
+    }
+}
+
 impl Identity for ApiClient {
     fn sign_in(
         &self,

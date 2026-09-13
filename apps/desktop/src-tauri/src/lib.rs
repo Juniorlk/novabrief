@@ -9,12 +9,13 @@ pub mod auth;
 pub mod devices;
 pub mod engine;
 pub mod paths;
+pub mod queue;
 pub mod recording;
 pub mod session;
 pub mod state;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use api_client::ApiClient;
@@ -22,6 +23,7 @@ use audio_engine::encode::SegmentedOpusWriter;
 use audio_engine::pipeline::Endpoints;
 use auth::{Account, Identified};
 use engine::{Engine, EngineError, Outcome, Snapshot, Source};
+use queue::{Pending, Queue};
 use recording::VaultSegmentSink;
 use session::Session;
 use state::{tray_menu, AppState, MenuItem};
@@ -49,6 +51,25 @@ const BITRATE: u32 = 32_000;
 /// The lower end of the 5-10 s window the POC fixed: a crash costs at most one
 /// segment, so the shorter it is the less EF-17 has to promise away.
 const SEGMENT_SECONDS: f64 = 5.0;
+
+/// What a recording is called, before and after the server has heard of it.
+///
+/// Two identifiers, deliberately. The local one names the vault directory and
+/// is generated here, so a recording can begin with no network at all
+/// (ADR-05); the server one arrives from the declaration of EF-40 and is
+/// `None` until it does. Collapsing them would mean either refusing to record
+/// without a network, or sending audio to a meeting that does not exist.
+#[derive(Debug, Clone)]
+pub struct Declared {
+    /// Names the vault directory. Generated on this machine.
+    pub local_id: String,
+    /// The meeting the server knows, once it does.
+    pub server_meeting_id: Option<String>,
+    /// ADR-07. From the server when it answered, local when it did not.
+    pub debug_id: String,
+    /// When the recording began, RFC 3339.
+    pub started_at: String,
+}
 
 /// What the application is doing, shared between the tray and any open window.
 ///
@@ -187,12 +208,11 @@ impl Recorder {
     pub fn start(
         &self,
         limit: Duration,
-        meeting_id: &str,
-        debug_id: &str,
+        declared: &Declared,
         endpoints: &Endpoints,
     ) -> Result<Snapshot, String> {
         let devices = devices::Devices::open(endpoints)?;
-        self.start_with(Box::new(devices), limit, meeting_id, debug_id)
+        self.start_with(Box::new(devices), limit, declared)
     }
 
     /// Begin a recording from an arbitrary source.
@@ -211,8 +231,7 @@ impl Recorder {
         &self,
         source: Box<dyn Source>,
         limit: Duration,
-        meeting_id: &str,
-        debug_id: &str,
+        declared: &Declared,
     ) -> Result<Snapshot, String> {
         // A recording that ended on its own is collected first, or starting
         // the next meeting would be refused by a thread that is already over.
@@ -235,9 +254,24 @@ impl Recorder {
         let vault = self.vault()?;
         // Opened before anything is started, so a store that refuses is a
         // refusal to record rather than a meeting that is lost at the end.
-        let recording = vault
-            .begin(meeting_id, debug_id, "default input", "default output")
+        let mut recording = vault
+            .begin(
+                &declared.local_id,
+                &declared.debug_id,
+                "default input",
+                "default output",
+            )
             .map_err(|error| error.to_string())?;
+        // Written now, not at the end: a laptop that dies mid-meeting and
+        // uploads on Monday would otherwise declare Friday as Monday.
+        recording
+            .note_start(&declared.started_at)
+            .map_err(|error| error.to_string())?;
+        if let Some(server) = declared.server_meeting_id.as_deref() {
+            recording
+                .note_server_meeting(server)
+                .map_err(|error| error.to_string())?;
+        }
         let writer = SegmentedOpusWriter::with_sink(
             VaultSegmentSink::new(recording),
             BITRATE,
@@ -250,8 +284,8 @@ impl Recorder {
             writer,
             Session::start(limit),
             vault,
-            meeting_id.to_owned(),
-            debug_id.to_owned(),
+            declared.local_id.clone(),
+            declared.debug_id.clone(),
         );
         let snapshot = engine.snapshot();
         *guard = Some(engine);
@@ -445,20 +479,45 @@ fn menu(recorder: tauri::State<'_, Recorder>) -> Vec<MenuItem> {
 
 /// Begin a recording. `limit_seconds` comes from the plan, never from here.
 ///
+/// EF-40 wants the meeting declared as recording starts, and ADR-05 wants the
+/// network to be optional. Both: the declaration is attempted, and a failure
+/// is not one - the recording begins under an identifier of this machine and
+/// the queue declares it when a network appears.
+///
 /// # Errors
 ///
 /// When a recording is already under way, or the devices cannot be opened.
+/// Never because the server could not be reached.
 #[tauri::command]
-fn start_recording(
+async fn start_recording(
     recorder: tauri::State<'_, Recorder>,
+    desk: tauri::State<'_, Desk>,
     limit_seconds: u64,
-    meeting_id: String,
-    debug_id: String,
+    title: Option<String>,
 ) -> Result<Snapshot, String> {
+    let local = local_id();
+    let started_at = now();
+
+    let announced = match desk.account.access_token().await {
+        Ok(token) => desk
+            .client
+            .declare_meeting(&token, &started_at, title.as_deref())
+            .await
+            .ok(),
+        Err(_) => None,
+    };
+
+    let declared = Declared {
+        debug_id: announced
+            .as_ref()
+            .map_or_else(|| format!("DBG-LOCAL-{local}"), |m| m.debug_id.clone()),
+        server_meeting_id: announced.map(|meeting| meeting.id),
+        local_id: local,
+        started_at,
+    };
     recorder.start(
         Duration::from_secs(limit_seconds),
-        &meeting_id,
-        &debug_id,
+        &declared,
         &Endpoints::default(),
     )
 }
@@ -487,14 +546,31 @@ fn resume(recorder: tauri::State<'_, Recorder>) -> Result<AppState, String> {
     recorder.resume()
 }
 
-/// End the recording.
+/// End the recording, and set the upload going.
 ///
 /// # Errors
 ///
 /// When nothing is being recorded.
 #[tauri::command]
-fn finish(recorder: tauri::State<'_, Recorder>) -> Result<AppState, String> {
-    recorder.finish()
+fn finish(
+    recorder: tauri::State<'_, Recorder>,
+    desk: tauri::State<'_, Desk>,
+) -> Result<AppState, String> {
+    let state = recorder.finish()?;
+    // The queue would find it on its next sweep anyway; this is what makes the
+    // upload start in the second after the button rather than the minute.
+    desk.queue.nudge();
+    Ok(state)
+}
+
+/// What is still owed to the server, and why it has not gone yet.
+///
+/// # Errors
+///
+/// Never; the `Result` is what Tauri requires of an async command.
+#[tauri::command]
+async fn uploads(desk: tauri::State<'_, Desk>) -> Result<Vec<Pending>, String> {
+    Ok(desk.queue.status().await)
 }
 
 /// Milliseconds of audio kept so far - the figure EF-33 says is billed.
@@ -510,7 +586,37 @@ pub fn api_base() -> String {
 }
 
 /// The account, as the commands see it.
-pub type Signed = Account<ApiClient>;
+pub type Signed = Account<Arc<ApiClient>>;
+
+/// Everything the application owns besides the recorder.
+///
+/// One client, shared. The session renews the token and the upload queue uses
+/// it; two clients would each hold a connection pool and, worse, each renew -
+/// and a refresh token presented twice revokes the family.
+#[derive(Debug)]
+pub struct Desk {
+    /// Who is signed in.
+    pub account: Arc<Signed>,
+    /// The API, shared with the account.
+    pub client: Arc<ApiClient>,
+    /// What is still owed to the server.
+    pub queue: Queue,
+}
+
+/// A fresh identifier for a recording, valid with no network at all.
+fn local_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Now, in the format the API declares meetings in.
+fn now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        // A clock that cannot be formatted is not a reason to refuse to
+        // record. The server fills a missing start with the declaration time,
+        // which is wrong by seconds rather than by a meeting.
+        .unwrap_or_default()
+}
 
 /// Sign in with an email and a password (EF-11).
 ///
@@ -576,14 +682,38 @@ async fn sign_out(account: tauri::State<'_, Signed>) -> Result<(), String> {
 /// Falling back to the default would be worse: an operator who pointed the
 /// build at a staging server would get production without being told.
 #[must_use]
-pub fn account() -> Signed {
-    let client = ApiClient::new(&api_base())
-        .expect("NOVABRIEF_API_URL must be an HTTPS address, or a loopback one");
+pub fn desk(recorder: &Recorder) -> Desk {
+    let client = Arc::new(
+        ApiClient::new(&api_base())
+            .expect("NOVABRIEF_API_URL must be an HTTPS address, or a loopback one"),
+    );
     let credentials = paths::data_root().map_or_else(
         |_| PathBuf::from("credentials.bin"),
         |root| paths::credentials_path(&root),
     );
-    Account::new(client, CredentialStore::new(credentials, DpapiSealer))
+    let account = Arc::new(Account::new(
+        Arc::clone(&client),
+        CredentialStore::new(credentials, DpapiSealer),
+    ));
+
+    let queue = Queue::start(
+        Arc::clone(&account),
+        Arc::clone(&client),
+        recorder.root.clone().unwrap_or_default(),
+        recorder.account.clone().unwrap_or_else(|| {
+            // A machine with no device secret cannot record either, so the
+            // queue has nothing to find. A key that opens nothing is the
+            // honest value: every recording it meets is reported unreadable
+            // rather than silently skipped.
+            AccountKey::derive(b"novabrief/no-device-secret")
+        }),
+    );
+
+    Desk {
+        account,
+        client,
+        queue,
+    }
 }
 
 /// Build and run the application.
@@ -595,8 +725,12 @@ pub fn account() -> Signed {
 /// recover from.
 pub fn run() {
     tauri::Builder::default()
-        .manage(Recorder::new())
-        .manage(account())
+        .setup(|app| {
+            let recorder = Recorder::new();
+            app.manage(desk(&recorder));
+            app.manage(recorder);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             sign_in,
             sign_out,
@@ -610,7 +744,8 @@ pub fn run() {
             pause,
             resume,
             finish,
-            recorded_ms
+            recorded_ms,
+            uploads
         ])
         .setup(|app| {
             // The window exists but stays hidden until asked for. Creating it

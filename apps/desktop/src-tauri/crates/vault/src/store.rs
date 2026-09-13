@@ -107,6 +107,9 @@ impl<S: Sealer> Vault<S> {
             segments: Vec::new(),
             input_device: input_device.to_owned(),
             output_device: output_device.to_owned(),
+            server_meeting_id: None,
+            started_at: String::new(),
+            paused_ms: 0,
         };
         manifest.save_atomically(&manifest_path(&directory))?;
 
@@ -299,6 +302,43 @@ impl Recording {
     #[must_use]
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    /// Record which meeting the server gave this recording.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Io`] if the manifest cannot be rewritten.
+    pub fn note_server_meeting(&mut self, meeting_id: &str) -> Result<()> {
+        self.manifest.server_meeting_id = Some(meeting_id.to_owned());
+        self.manifest
+            .save_atomically(&manifest_path(&self.directory))
+    }
+
+    /// Record when the meeting began.
+    ///
+    /// Written at the start, because it is the one fact about a recording that
+    /// cannot be recovered afterwards: a crashed laptop that uploads on Monday
+    /// would otherwise declare Friday's meeting as having happened on Monday.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Io`] if the manifest cannot be rewritten.
+    pub fn note_start(&mut self, started_at: &str) -> Result<()> {
+        self.manifest.started_at = started_at.to_owned();
+        self.manifest
+            .save_atomically(&manifest_path(&self.directory))
+    }
+
+    /// Record how much audio the pauses threw away.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Io`] if the manifest cannot be rewritten.
+    pub fn note_paused(&mut self, paused_ms: u64) -> Result<()> {
+        self.manifest.paused_ms = paused_ms;
+        self.manifest
+            .save_atomically(&manifest_path(&self.directory))
     }
 
     /// Record which devices the capture actually opened.

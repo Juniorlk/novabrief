@@ -399,6 +399,10 @@ fn run(mut task: Task) -> Result<Outcome, EngineError> {
     // a vault that cannot be reopened is found now rather than at upload time.
     let mut recording = task.vault.reopen(&task.meeting_id)?;
     recording.note_devices(&report.input_device, &report.output_device)?;
+    // EF-33: the pause is the other half of the answer to "why is this
+    // recording shorter than the meeting", and nothing else survives the
+    // process to carry it.
+    recording.note_paused(task.session.discarded().as_millis() as u64)?;
     recording.set_state(RecordingState::Uploading)?;
 
     publish(&task.shared, |snapshot| {

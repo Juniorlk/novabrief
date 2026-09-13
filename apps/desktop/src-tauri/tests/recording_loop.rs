@@ -13,7 +13,7 @@ use std::time::Duration;
 use audio_engine::resample::TARGET_SAMPLE_RATE;
 use novabrief_desktop_lib::engine::{Report, Source};
 use novabrief_desktop_lib::state::AppState;
-use novabrief_desktop_lib::Recorder;
+use novabrief_desktop_lib::{Declared, Recorder};
 use vault::{AccountKey, DpapiSealer, RecordingState, Vault};
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -129,6 +129,17 @@ impl Source for Tone {
     }
 }
 
+/// A recording that has never been declared to a server, which is what a
+/// meeting recorded with no network is.
+fn declared(local: &str) -> Declared {
+    Declared {
+        local_id: local.to_owned(),
+        server_meeting_id: None,
+        debug_id: format!("DBG-{local}"),
+        started_at: "2026-09-13T10:00:00Z".to_owned(),
+    }
+}
+
 /// Wait for the recorder to reach `state`, or say what it reached instead.
 fn wait_for(recorder: &Recorder, state: AppState) {
     for _ in 0..1000 {
@@ -170,7 +181,7 @@ fn a_recording_ends_up_in_the_vault() {
     let root = scratch("vault");
     let recorder = recorder(&root);
     recorder
-        .start_with(Box::new(Tone::of(12.0)), HOUR, "mtg-1", "DBG-1")
+        .start_with(Box::new(Tone::of(12.0)), HOUR, &declared("mtg-1"))
         .expect("starts");
 
     wait_for(&recorder, AppState::Uploading);
@@ -209,7 +220,7 @@ fn a_pause_keeps_nothing_and_bills_nothing() {
     let root = scratch("pause");
     let recorder = recorder(&root);
     recorder
-        .start_with(Box::new(Tone::endless()), HOUR, "mtg-2", "DBG-2")
+        .start_with(Box::new(Tone::endless()), HOUR, &declared("mtg-2"))
         .expect("starts");
 
     let before = wait_until_recorded(&recorder, Duration::from_secs(2));
@@ -252,7 +263,7 @@ fn pausing_does_not_start_a_second_recording() {
     let root = scratch("onefile");
     let recorder = recorder(&root);
     recorder
-        .start_with(Box::new(Tone::endless()), HOUR, "mtg-3", "DBG-3")
+        .start_with(Box::new(Tone::endless()), HOUR, &declared("mtg-3"))
         .expect("starts");
 
     wait_until_recorded(&recorder, Duration::from_secs(6));
@@ -283,8 +294,7 @@ fn the_limit_stops_the_recording_on_its_own() {
         .start_with(
             Box::new(Tone::endless()),
             Duration::from_secs(6),
-            "mtg-4",
-            "DBG-4",
+            &declared("mtg-4"),
         )
         .expect("starts");
 
@@ -315,8 +325,7 @@ fn the_two_meters_are_read_separately() {
         .start_with(
             Box::new(Tone::endless().silent_on_the_right()),
             HOUR,
-            "mtg-5",
-            "DBG-5",
+            &declared("mtg-5"),
         )
         .expect("starts");
 
@@ -347,11 +356,11 @@ fn a_second_recording_cannot_displace_the_first() {
     let root = scratch("second");
     let recorder = recorder(&root);
     recorder
-        .start_with(Box::new(Tone::endless()), HOUR, "mtg-6", "DBG-6")
+        .start_with(Box::new(Tone::endless()), HOUR, &declared("mtg-6"))
         .expect("starts");
 
     let message = recorder
-        .start_with(Box::new(Tone::endless()), HOUR, "mtg-7", "DBG-7")
+        .start_with(Box::new(Tone::endless()), HOUR, &declared("mtg-7"))
         .expect_err("already recording");
     assert!(message.contains("Recording"), "{message}");
 
@@ -369,7 +378,7 @@ fn a_refused_operation_changes_nothing() {
     assert_eq!(recorder.state(), AppState::Idle);
 
     recorder
-        .start_with(Box::new(Tone::endless()), HOUR, "mtg-8", "DBG-8")
+        .start_with(Box::new(Tone::endless()), HOUR, &declared("mtg-8"))
         .expect("starts");
     assert!(recorder.resume().is_err(), "it is not paused");
     assert_eq!(recorder.state(), AppState::Recording);
@@ -404,8 +413,7 @@ fn real_devices_record_into_the_vault() {
     recorder
         .start(
             HOUR,
-            "mtg-real",
-            "DBG-REAL",
+            &declared("mtg-real"),
             &audio_engine::pipeline::Endpoints::default(),
         )
         .expect("the audio devices open");

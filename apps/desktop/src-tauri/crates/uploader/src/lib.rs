@@ -312,7 +312,11 @@ impl<T: Transport> Uploader<T> {
         access_token: &str,
         recording: &mut Recording,
         job: &Job,
-        report: &mut dyn FnMut(Sent),
+        // `Send`, because the only caller worth having runs this on a
+        // background task: a future that cannot cross a thread cannot be
+        // spawned, and an upload that runs on the interface thread is one
+        // that stops whenever a window is being drawn.
+        report: &mut (dyn FnMut(Sent) + Send),
     ) -> Result<Meeting, UploadError> {
         let directory = recording.directory().to_path_buf();
         let record = Progress::path_in(&directory);

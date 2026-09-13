@@ -71,13 +71,41 @@ pub struct Manifest {
     pub input_device: String,
     /// Render device the system audio was captured from.
     pub output_device: String,
+    /// The meeting the server knows, once it has been declared.
+    ///
+    /// `None` for a recording made with no network, which ADR-05 allows: the
+    /// declaration then happens at the first upload attempt. Kept apart from
+    /// `meeting_id`, which names the directory and is generated here - putting
+    /// a locally invented identifier where a server one is expected would send
+    /// the audio to a meeting that does not exist, for ever.
+    #[serde(default)]
+    pub server_meeting_id: Option<String>,
+    /// When the recording began, RFC 3339.
+    ///
+    /// Here rather than only in memory because it is what the meeting is
+    /// declared with, and a recording that outlives the process it was made in
+    /// has to be declarable afterwards. Outliving the process is the whole
+    /// reason this file exists; a meeting dated from whenever the upload
+    /// happened would put yesterday evening in this morning.
+    #[serde(default)]
+    pub started_at: String,
+    /// Audio thrown away because the recording was paused, in milliseconds.
+    ///
+    /// Cannot be derived from the segments: paused audio never became one.
+    /// EF-33 bills the recorded time, and this is the other half of the answer
+    /// to "why is this recording shorter than the meeting".
+    #[serde(default)]
+    pub paused_ms: u64,
 }
 
 impl Manifest {
     /// The current format version.
     pub const VERSION: u32 = 1;
 
-    /// Total audio recorded so far, in milliseconds.
+    /// Total audio kept so far, in milliseconds.
+    ///
+    /// The sum of the segments, so a pause simply does not add to it - which
+    /// is the whole of EF-33 and needs no separate subtraction.
     #[must_use]
     pub fn duration_ms(&self) -> u64 {
         self.segments
@@ -216,6 +244,9 @@ mod tests {
             }],
             input_device: "mic".to_owned(),
             output_device: "speakers".to_owned(),
+            server_meeting_id: None,
+            started_at: "2026-09-13T10:00:00Z".to_owned(),
+            paused_ms: 0,
         }
     }
 
