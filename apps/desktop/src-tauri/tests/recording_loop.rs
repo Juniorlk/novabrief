@@ -394,6 +394,10 @@ fn the_error_says_what_was_being_asked_of_nothing() {
 /// belongs in the task report rather than in a green tick.
 #[test]
 #[ignore = "opens the real audio devices"]
+// The printed line is this test result, not a leftover debug statement: what
+// it proves is which devices Windows actually opened and what the meters read
+// on them, and neither is something an assertion can carry into a report.
+#[allow(clippy::print_stdout)]
 fn real_devices_record_into_the_vault() {
     let root = scratch("real");
     let recorder = recorder(&root);
