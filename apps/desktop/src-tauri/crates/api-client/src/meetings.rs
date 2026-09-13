@@ -340,6 +340,12 @@ impl ApiClient {
 
     /// One meeting, with its report and transcript when they exist.
     ///
+    /// The path is `/report`, not `/detail`: the body is a `MeetingDetail` but
+    /// the route is named after what a person asked for. It was `/detail` here
+    /// for a while, which is a 404 - a button that opens nothing, discovered by
+    /// whoever clicks it. `tests/contract.rs` now checks every path against the
+    /// API's own schema.
+    ///
     /// # Errors
     ///
     /// See [`ApiClient::declare_meeting`].
@@ -348,7 +354,7 @@ impl ApiClient {
         access_token: &str,
         meeting_id: &str,
     ) -> Result<MeetingDetail, ApiError> {
-        self.authorised_get(&format!("meetings/{meeting_id}/detail"), access_token)
+        self.authorised_get(&format!("meetings/{meeting_id}/report"), access_token)
             .await
     }
 }

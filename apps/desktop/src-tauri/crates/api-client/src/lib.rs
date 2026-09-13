@@ -116,6 +116,25 @@ pub struct Profile {
     pub email_verified: bool,
 }
 
+/// What `GET /me` actually answers: the user **and** the organization.
+///
+/// The desktop only needs the user half, and for a while this type did not
+/// exist: `profile` decoded the body straight into [`Profile`], the two
+/// objects nested one level down never matched, and every sign-in ended in
+/// `ApiError::Protocol` - "the service answered something unexpected" - in
+/// front of the person typing their password. Nothing in the suite could say
+/// so, because the tests replaced the whole client with a double that handed
+/// back a `Profile` value and never parsed a byte of JSON. The answer to that
+/// is `tests/contract.rs`, which reads the API's own schema.
+///
+/// The organization is deliberately not carried: a field the desktop does not
+/// display is a field that can only go stale. It joins this struct the day
+/// something shows the quota.
+#[derive(Deserialize)]
+struct CurrentSession {
+    user: Profile,
+}
+
 #[derive(Serialize)]
 struct SignInBody<'a> {
     email: &'a str,
@@ -222,7 +241,7 @@ impl ApiClient {
             .map_err(|_| ApiError::Unreachable)?;
 
         match response.status().as_u16() {
-            200 => decode(response).await,
+            200 => decode::<CurrentSession>(response).await.map(|it| it.user),
             401 | 403 => Err(ApiError::SessionExpired),
             _ => Err(problem(response).await),
         }

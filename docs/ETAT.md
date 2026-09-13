@@ -66,6 +66,26 @@
 
 ## 2. Prochaine étape
 
+### Novafrik tient les essais (2026-09-13)
+
+Le logiciel est installé sur le poste de Novafrik, qui conduit les essais
+lui-même désormais. Trois retours de la première session, et ce qu'ils ont
+donné :
+
+| Retour | Verdict |
+|---|---|
+| plusieurs instances au clic | **corrigé** (PR #50) |
+| l'icône n'apparaît pas dans la barre des tâches | **pas un défaut** : Windows 11 range toute icône inconnue dans le débordement (chevron `^`). Aucune application ne peut s'épingler elle-même. À traiter côté accueil au moment du logo |
+| « the NovaBrief service answered something unexpected » à la connexion | **corrigé** — voir le piège « un client écrit d'après un contrat de mémoire » en §4 |
+
+**Le critère de sortie n°5 du lot L3 reste non prononcé** : aucune réunion
+enregistrée sur un poste n'a jamais traversé l'API déployée jusqu'à
+`PUBLISHED`. C'est aussi le tout premier appel réel à AssemblyAI et à OpenAI.
+
+Documentation ajoutée pour Novafrik : **`docs/ARCHITECTURE.md`** — ce qui tourne
+sur le VPS, le rangement du code, le chemin d'une réunion, le parcours
+utilisateur.
+
 **Lot L3 — application desktop Windows**, dont le brief est écrit
 (`docs/tasks/06_L3_application_desktop.md`). C'est elle qui produit l'audio que
 tout le reste attend : sans elle, l'API déployée n'a rien à traiter.
@@ -542,6 +562,36 @@ Pas à la racine du dépôt. Chaque `${VAR:?}` échoue en accusant la variable
 plutôt que le chemin — pendant que les entrées `env_file:` *à l'intérieur* du
 même fichier, qui sont un autre mécanisme, fonctionnent. Passer toujours par
 `infra/deploy/compose.sh`.
+
+### Un client écrit d'après un contrat de mémoire
+
+Le client Rust de l'API a été écrit d'après le contrat **tel qu'on croyait le
+connaître**, jamais confronté au serveur. Deux décalages ont voyagé jusqu'à
+l'écran d'un utilisateur, la suite verte :
+
+- `GET /me` répond `{"user": …, "organization": …}` et le client décodait un
+  profil **à plat** : chaque connexion finissait sur « the NovaBrief service
+  answered something unexpected », sous le champ mot de passe ;
+- le client demandait `/meetings/{id}/detail`, une adresse que l'API n'a jamais
+  servie : ouvrir un compte rendu répondait 404.
+
+Aucun test ne pouvait le dire : **ils remplacent tout le client par un double**
+qui rend un objet Rust et ne lit pas une ligne de JSON.
+
+La parade est `crates/api-client/tests/contract.rs`, adossé à
+`contract/openapi.json` — le schéma de l'API, produit par
+`tools/dump_openapi.py` et vérifié en CI :
+
+1. toute adresse que le client construit existe dans le schéma ;
+2. **le vrai client** interroge un serveur de bouclage qui ne sert que ce que le
+   schéma promet (champs `required` uniquement).
+
+Le deuxième point a d'abord été écrit comme un tableau « ce type parse ce
+schéma ». Inutile : nommer `CurrentSession` dans le test prouvait que
+`CurrentSession` lit `/me`, ce dont personne ne doutait — le défaut était que
+`profile()` ne l'utilisait pas. **Un test qui redit le correctif ne peut pas
+échouer sur le bug.** Les deux tests ont été vus rouges avec les défauts
+remis.
 
 ### La perte audio est invisible
 

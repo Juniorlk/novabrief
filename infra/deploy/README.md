@@ -146,6 +146,24 @@ bash infra/deploy/compose.sh logs --tail=50 worker
 Le worker doit lister ses quatre tâches (`transcribe_meeting`,
 `analyse_meeting`, `purge_organizations`, `purge_audio`) et dire `ready`.
 
+### Et surtout : le serveur sert-il bien ce que le code décrit ?
+
+```bash
+python tools/dump_openapi.py --deployed https://api.novabrief.cloud
+```
+
+**C'est la vérification qui manquait.** Un serveur qui répond `ok` à `/health`
+peut très bien tourner sur une image antérieure : le 2026-09-13, une réunion de
+44 s est restée bloquée en `UPLOADING` sur « the NovaBrief service answered
+404 » parce que le VPS n'avait pas été redéployé depuis l'ajout de
+`/meetings/{id}/upload-parts`. Le logiciel de bureau était juste, le code était
+juste, les tests étaient verts — seule l'image en service était vieille, et
+rien ne le disait.
+
+La commande compare les adresses servies à celles que le dépôt décrit, et nomme
+celles qui manquent. Elle se lance depuis n'importe quelle machine : elle n'a
+besoin que du réseau.
+
 ## Ce qui n'est pas encore là
 
 **Les sauvegardes.** Elles arrivent au lot L6 (chiffrées vers R2, RPO 6 h,
