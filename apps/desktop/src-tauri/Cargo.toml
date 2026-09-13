@@ -39,6 +39,10 @@ tauri = { version = "2", features = ["tray-icon"] }
 # what "per-user, no administrator" means on Windows - and writing it by hand
 # would be a second implementation of something Windows has opinions about.
 tauri-plugin-autostart = "2"
+# One instance per machine. Clicking the icon twice used to start a second
+# recorder on the same vault, the same microphone and the same single-use
+# refresh token.
+tauri-plugin-single-instance = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

@@ -5,6 +5,13 @@
 //! audio that belongs to this machine and to no other - a recording that
 //! roamed would double the network cost of every meeting and arrive on a
 //! second machine where DPAPI cannot open it anyway.
+//!
+//! **Under the publisher, not under the product name.** A per-user NSIS
+//! installation puts the program itself in `%LOCALAPPDATA%\NovaBrief`, so
+//! data kept there would sit among the executables - and uninstalling would
+//! delete the recordings that had not been uploaded yet, along with the device
+//! key that is the only thing able to open them. An uninstall must cost the
+//! program, never the meetings.
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +27,7 @@ pub fn data_root() -> std::io::Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or_else(|| std::io::Error::other("LOCALAPPDATA is not set"))?;
-    let root = base.join("NovaBrief");
+    let root = base.join("Novafrik").join("NovaBrief");
     std::fs::create_dir_all(&root)?;
     Ok(root)
 }
