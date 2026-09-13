@@ -70,6 +70,10 @@ export default tseslint.config(
       "vue/singleline-html-element-content-newline": "off",
       "vue/html-closing-bracket-newline": "off",
       "vue/html-indent": "off",
+      // Same reason, third time: Prettier writes `<input />` and this rule
+      // rewrites it to `<input>`, so the two take turns undoing each other
+      // and neither `lint:fix` nor `format` ever reaches a fixed point.
+      "vue/html-self-closing": "off",
     },
   },
 );

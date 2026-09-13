@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::{decode, problem, ApiClient, ApiError};
 
 /// A meeting the server now knows about (EF-40).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Meeting {
     /// The server's identifier, which the upload is addressed to.
     pub id: String,
@@ -78,7 +78,7 @@ pub struct UploadedPart {
 }
 
 /// One line of the transcript.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TranscriptSegment {
     /// Who spoke, as the provider labelled them.
     pub speaker_tag: String,
@@ -91,7 +91,7 @@ pub struct TranscriptSegment {
 }
 
 /// A decision the analysis found. Never one it invented.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Decision {
     /// The decision, as stated.
     pub content: String,
@@ -100,7 +100,7 @@ pub struct Decision {
 }
 
 /// A task, with an owner only if somebody was named.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Task {
     /// What is to be done.
     pub action: String,
@@ -113,7 +113,7 @@ pub struct Task {
 }
 
 /// The report itself.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Report {
     /// A title the analysis proposed.
     pub title: String,
@@ -128,7 +128,7 @@ pub struct Report {
 }
 
 /// A meeting and everything the server has made of it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MeetingDetail {
     /// The meeting itself.
     pub meeting: Meeting,

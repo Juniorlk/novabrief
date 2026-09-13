@@ -27,7 +27,7 @@ use queue::{Pending, Queue};
 use recording::VaultSegmentSink;
 use session::Session;
 use state::{tray_menu, AppState, MenuItem};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use vault::{AccountKey, CredentialStore, DeviceSecret, DpapiSealer, Vault};
 
 /// Where the API lives.
@@ -563,6 +563,113 @@ fn finish(
     Ok(state)
 }
 
+/// The organization's meetings, newest first.
+///
+/// Asked of the server rather than assembled from the vault: the vault knows
+/// what this machine recorded, and what the person wants to see is what their
+/// organization has - including the meeting a colleague recorded and the
+/// report that was produced after this laptop was closed.
+///
+/// # Errors
+///
+/// When the session is not usable, or the server cannot be reached.
+#[tauri::command]
+async fn meetings(desk: tauri::State<'_, Desk>) -> Result<Vec<api_client::Meeting>, String> {
+    let token = desk.account.access_token().await?;
+    desk.client
+        .meetings(&token)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// One meeting, with its report and transcript once they exist.
+///
+/// # Errors
+///
+/// See [`meetings`].
+#[tauri::command]
+async fn meeting_detail(
+    desk: tauri::State<'_, Desk>,
+    meeting_id: String,
+) -> Result<api_client::MeetingDetail, String> {
+    let token = desk.account.access_token().await?;
+    desk.client
+        .meeting_detail(&token, &meeting_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// One entry of the notification-area menu, with its label already
+/// translated.
+///
+/// The labels come from the front end because that is where i18n lives
+/// (`CLAUDE.md` section 6), and a tray menu built in Rust is exactly where
+/// hard-coded French creeps in. `state.rs` still decides which entries exist
+/// and which are enabled; this only carries the words.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TrayLabel {
+    /// Matches the identifier `state::tray_menu` hands out.
+    pub id: String,
+    /// What to draw, in the language the person reads.
+    pub label: String,
+    /// Whether it can be chosen right now.
+    pub enabled: bool,
+}
+
+/// Replace the notification-area menu.
+///
+/// Choosing an entry emits `tray://<id>` rather than acting here. The window
+/// already knows how to start, pause and stop - it has buttons that do exactly
+/// that - and a second path into the recorder would be a second place for the
+/// rules to be applied slightly differently.
+///
+/// # Errors
+///
+/// If the tray icon is gone, or Windows refuses the menu.
+#[tauri::command]
+fn set_tray_menu(app: tauri::AppHandle, items: Vec<TrayLabel>) -> Result<(), String> {
+    use tauri::menu::{Menu, MenuItem};
+
+    let built: Vec<MenuItem<tauri::Wry>> = items
+        .iter()
+        .map(|item| {
+            MenuItem::with_id(&app, &item.id, &item.label, item.enabled, None::<&str>)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<_, String>>()?;
+    let entries: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = built
+        .iter()
+        .map(|item| item as &dyn tauri::menu::IsMenuItem<tauri::Wry>)
+        .collect();
+
+    let menu = Menu::with_items(&app, &entries).map_err(|error| error.to_string())?;
+    let tray = app
+        .tray_by_id("main")
+        .ok_or_else(|| "the notification area icon is gone".to_owned())?;
+    tray.set_menu(Some(menu)).map_err(|error| error.to_string())
+}
+
+/// Put the window on screen (EF-12).
+///
+/// # Errors
+///
+/// If the window is gone, which on Windows means the WebView died.
+#[tauri::command]
+fn show_window(window: tauri::Window) -> Result<(), String> {
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())
+}
+
+/// Put it away again. The recording carries on (EF-12).
+///
+/// # Errors
+///
+/// See [`show_window`].
+#[tauri::command]
+fn hide_window(window: tauri::Window) -> Result<(), String> {
+    window.hide().map_err(|error| error.to_string())
+}
+
 /// What is still owed to the server, and why it has not gone yet.
 ///
 /// # Errors
@@ -716,6 +823,18 @@ pub fn desk(recorder: &Recorder) -> Desk {
     }
 }
 
+/// Bring the window forward.
+///
+/// Shown *and* focused: on Windows a window that is merely shown can come up
+/// behind the meeting somebody is in, which reads as the click having done
+/// nothing.
+fn reveal(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 /// Build and run the application.
 ///
 /// # Panics
@@ -729,6 +848,47 @@ pub fn run() {
             let recorder = Recorder::new();
             app.manage(desk(&recorder));
             app.manage(recorder);
+
+            if let Some(tray) = app.tray_by_id("main") {
+                // A left click opens the window. It is the gesture people try
+                // first, and EF-12 is about the software being reachable in
+                // one action from wherever they are - which is usually inside
+                // the meeting software, not looking for a menu.
+                tray.on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        reveal(tray.app_handle());
+                    }
+                });
+                tray.on_menu_event(|app, event| {
+                    match event.id().as_ref() {
+                        // Only the application itself can do these two.
+                        "quit" => {
+                            app.exit(0);
+                            return;
+                        }
+                        "meetings" | "settings" | "audio-test" => reveal(app),
+                        _ => {}
+                    }
+                    // Everything else is the window's business. It runs even
+                    // while hidden, and it is where the rules already are - a
+                    // second path into the recorder would be a second place
+                    // for them to drift.
+                    let _ = app.emit(&format!("tray://{}", event.id().as_ref()), ());
+                });
+            }
+
+            // The window exists but stays hidden until asked for. Creating it
+            // lazily would mean the first open pays for WebView2 startup,
+            // which is seconds - and the moment somebody wants it is the
+            // moment they are already in a hurry.
+            if let Some(window) = app.get_webview_window("main") {
+                window.hide()?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -745,18 +905,13 @@ pub fn run() {
             resume,
             finish,
             recorded_ms,
-            uploads
+            uploads,
+            meetings,
+            meeting_detail,
+            set_tray_menu,
+            show_window,
+            hide_window
         ])
-        .setup(|app| {
-            // The window exists but stays hidden until asked for. Creating it
-            // lazily would mean the first open pays for WebView2 startup, which
-            // is seconds - and the moment somebody wants it is the moment they
-            // are already in a hurry.
-            if let Some(window) = app.get_webview_window("main") {
-                window.hide()?;
-            }
-            Ok(())
-        })
         .run(tauri::generate_context!())
         .expect("NovaBrief could not start");
 }
