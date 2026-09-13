@@ -627,19 +627,22 @@ pub struct TrayLabel {
 ///
 /// If the tray icon is gone, or Windows refuses the menu.
 #[tauri::command]
-fn set_tray_menu(app: tauri::AppHandle, items: Vec<TrayLabel>) -> Result<(), String> {
+fn set_tray_menu<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    items: Vec<TrayLabel>,
+) -> Result<(), String> {
     use tauri::menu::{Menu, MenuItem};
 
-    let built: Vec<MenuItem<tauri::Wry>> = items
+    let built: Vec<MenuItem<R>> = items
         .iter()
         .map(|item| {
             MenuItem::with_id(&app, &item.id, &item.label, item.enabled, None::<&str>)
                 .map_err(|error| error.to_string())
         })
         .collect::<Result<_, String>>()?;
-    let entries: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = built
+    let entries: Vec<&dyn tauri::menu::IsMenuItem<R>> = built
         .iter()
-        .map(|item| item as &dyn tauri::menu::IsMenuItem<tauri::Wry>)
+        .map(|item| item as &dyn tauri::menu::IsMenuItem<R>)
         .collect();
 
     let menu = Menu::with_items(&app, &entries).map_err(|error| error.to_string())?;
@@ -655,7 +658,7 @@ fn set_tray_menu(app: tauri::AppHandle, items: Vec<TrayLabel>) -> Result<(), Str
 ///
 /// If the registry cannot be read.
 #[tauri::command]
-fn starts_with_windows(app: tauri::AppHandle) -> Result<bool, String> {
+fn starts_with_windows<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<bool, String> {
     use tauri_plugin_autostart::ManagerExt as _;
     app.autolaunch()
         .is_enabled()
@@ -673,7 +676,10 @@ fn starts_with_windows(app: tauri::AppHandle) -> Result<bool, String> {
 ///
 /// If the registry cannot be written.
 #[tauri::command]
-fn set_starts_with_windows(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+fn set_starts_with_windows<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    enabled: bool,
+) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt as _;
     let launcher = app.autolaunch();
     if enabled {
@@ -690,7 +696,7 @@ fn set_starts_with_windows(app: tauri::AppHandle, enabled: bool) -> Result<(), S
 ///
 /// If the window is gone, which on Windows means the WebView died.
 #[tauri::command]
-fn show_window(window: tauri::Window) -> Result<(), String> {
+fn show_window<R: tauri::Runtime>(window: tauri::Window<R>) -> Result<(), String> {
     window.show().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())
 }
@@ -701,7 +707,7 @@ fn show_window(window: tauri::Window) -> Result<(), String> {
 ///
 /// See [`show_window`].
 #[tauri::command]
-fn hide_window(window: tauri::Window) -> Result<(), String> {
+fn hide_window<R: tauri::Runtime>(window: tauri::Window<R>) -> Result<(), String> {
     window.hide().map_err(|error| error.to_string())
 }
 
@@ -728,6 +734,12 @@ pub fn api_base() -> String {
 }
 
 /// The account, as the commands see it.
+///
+/// Reached through [`Desk`], never managed on its own. Tauri resolves command
+/// state by type at **run time**, so a command asking for a type nobody
+/// managed compiles cleanly and fails in the window with "state not managed" -
+/// which is how sign-in shipped broken. One state, one owner, and the mistake
+/// is no longer expressible.
 pub type Signed = Account<Arc<ApiClient>>;
 
 /// Everything the application owns besides the recorder.
@@ -767,11 +779,11 @@ fn now() -> String {
 /// When they are wrong, or the session cannot be written to this machine.
 #[tauri::command]
 async fn sign_in(
-    account: tauri::State<'_, Signed>,
+    desk: tauri::State<'_, Desk>,
     email: String,
     password: String,
 ) -> Result<Identified, String> {
-    account.sign_in(&email, &password).await
+    desk.account.sign_in(&email, &password).await
 }
 
 /// Bring back the session this machine was left with.
@@ -780,8 +792,8 @@ async fn sign_in(
 ///
 /// When the stored token is no longer accepted, which means signing in again.
 #[tauri::command]
-async fn restore_session(account: tauri::State<'_, Signed>) -> Result<Identified, String> {
-    account.restore().await
+async fn restore_session(desk: tauri::State<'_, Desk>) -> Result<Identified, String> {
+    desk.account.restore().await
 }
 
 /// Who is signed in, without asking the server.
@@ -790,8 +802,8 @@ async fn restore_session(account: tauri::State<'_, Signed>) -> Result<Identified
 ///
 /// Never; the `Result` is what Tauri requires of an async command.
 #[tauri::command]
-async fn session(account: tauri::State<'_, Signed>) -> Result<Option<Identified>, String> {
-    Ok(account.identified().await)
+async fn session(desk: tauri::State<'_, Desk>) -> Result<Option<Identified>, String> {
+    Ok(desk.account.identified().await)
 }
 
 /// Whether this machine has been linked at all.
@@ -802,8 +814,8 @@ async fn session(account: tauri::State<'_, Signed>) -> Result<Option<Identified>
 ///
 /// Never; the `Result` is what Tauri requires of an async command.
 #[tauri::command]
-async fn is_linked(account: tauri::State<'_, Signed>) -> Result<bool, String> {
-    Ok(account.is_linked())
+async fn is_linked(desk: tauri::State<'_, Desk>) -> Result<bool, String> {
+    Ok(desk.account.is_linked())
 }
 
 /// Forget the session on this machine.
@@ -812,8 +824,8 @@ async fn is_linked(account: tauri::State<'_, Signed>) -> Result<bool, String> {
 ///
 /// When the stored credential cannot be removed.
 #[tauri::command]
-async fn sign_out(account: tauri::State<'_, Signed>) -> Result<(), String> {
-    account.sign_out().await
+async fn sign_out(desk: tauri::State<'_, Desk>) -> Result<(), String> {
+    desk.account.sign_out().await
 }
 
 /// The account this installation uses.
@@ -863,11 +875,119 @@ pub fn desk(recorder: &Recorder) -> Desk {
 /// Shown *and* focused: on Windows a window that is merely shown can come up
 /// behind the meeting somebody is in, which reads as the click having done
 /// nothing.
-fn reveal(app: &tauri::AppHandle) {
+fn reveal<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+/// Every command the window may call.
+///
+/// Extracted so a test can register exactly this list against a mock
+/// application. It is the other half of [`install`]: Tauri matches a command's
+/// state arguments to managed types at run time, so a command added here that
+/// asks for a type nobody manages compiles cleanly and fails in front of a
+/// user.
+pub fn invoke_handler<R: tauri::Runtime>(
+) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
+        sign_in,
+        sign_out,
+        session,
+        is_linked,
+        restore_session,
+        current_state,
+        snapshot,
+        menu,
+        start_recording,
+        pause,
+        resume,
+        finish,
+        recorded_ms,
+        uploads,
+        meetings,
+        meeting_detail,
+        set_tray_menu,
+        starts_with_windows,
+        set_starts_with_windows,
+        show_window,
+        hide_window
+    ]
+}
+
+/// Everything the commands need, put where they look for it.
+///
+/// Separate from [`run`] so a test can boot the same application. Tauri
+/// resolves command state by type at run time, so this and the handler list
+/// below are the two halves of a contract nothing checks at compile time -
+/// which is exactly how sign-in shipped asking for a type nobody managed.
+///
+/// # Errors
+///
+/// If the window cannot be hidden.
+pub fn install<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+    let recorder = Recorder::new();
+    app.manage(desk(&recorder));
+    app.manage(recorder);
+
+    if let Some(tray) = app.tray_by_id("main") {
+        // A left click opens the window. It is the gesture people try first,
+        // and EF-12 is about the software being reachable in one action from
+        // wherever they are - which is usually inside the meeting software,
+        // not looking for a menu.
+        tray.on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click {
+                button: tauri::tray::MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                reveal(tray.app_handle());
+            }
+        });
+        tray.on_menu_event(|app, event| {
+            match event.id().as_ref() {
+                // Only the application itself can do these two.
+                "quit" => {
+                    app.exit(0);
+                    return;
+                }
+                "meetings" | "settings" | "audio-test" => reveal(app),
+                _ => {}
+            }
+            // Everything else is the window's business. It runs even while
+            // hidden, and it is where the rules already are - a second path
+            // into the recorder would be a second place for them to drift.
+            let _ = app.emit(&format!("tray://{}", event.id().as_ref()), ());
+        });
+    }
+
+    // The window is created up front - opening it lazily would make the first
+    // open pay for WebView2 startup, which is seconds, at the moment somebody
+    // is already in a hurry - but whether it is *shown* depends on who
+    // started the application.
+    //
+    // Hidden only when Windows did, at sign-in, through the automatic start
+    // that passes `--hidden`. EF-12 asks for a product that lives in the
+    // notification area, not for one that answers a double click with
+    // nothing: somebody who has just installed NovaBrief and clicked it has
+    // no session, no icon they recognise yet, and no reason to believe it ran
+    // at all.
+    if let Some(window) = app.get_webview_window("main") {
+        if started_by_windows() {
+            window.hide()?;
+        } else {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
+    Ok(())
+}
+
+/// Whether this process was started by the automatic-start entry.
+fn started_by_windows() -> bool {
+    std::env::args().any(|argument| argument == "--hidden")
 }
 
 /// Build and run the application.
@@ -881,80 +1001,24 @@ pub fn run() {
     tauri::Builder::default()
         // Started minimised: automatic start exists so the recorder is there
         // when a meeting begins, not so a window is in the way every morning.
+        // One NovaBrief per machine, and that is not tidiness. Two instances
+        // would open the same vault, fight over the same microphone and rotate
+        // the same single-use refresh token - and the second rotation revokes
+        // the session, on a laptop holding a meeting that has not been
+        // uploaded. A second launch brings the first window forward instead,
+        // which is what somebody clicking the icon again actually wanted.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            reveal(app);
+        }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--hidden"]),
         ))
         .setup(|app| {
-            let recorder = Recorder::new();
-            app.manage(desk(&recorder));
-            app.manage(recorder);
-
-            if let Some(tray) = app.tray_by_id("main") {
-                // A left click opens the window. It is the gesture people try
-                // first, and EF-12 is about the software being reachable in
-                // one action from wherever they are - which is usually inside
-                // the meeting software, not looking for a menu.
-                tray.on_tray_icon_event(|tray, event| {
-                    if let tauri::tray::TrayIconEvent::Click {
-                        button: tauri::tray::MouseButton::Left,
-                        button_state: tauri::tray::MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        reveal(tray.app_handle());
-                    }
-                });
-                tray.on_menu_event(|app, event| {
-                    match event.id().as_ref() {
-                        // Only the application itself can do these two.
-                        "quit" => {
-                            app.exit(0);
-                            return;
-                        }
-                        "meetings" | "settings" | "audio-test" => reveal(app),
-                        _ => {}
-                    }
-                    // Everything else is the window's business. It runs even
-                    // while hidden, and it is where the rules already are - a
-                    // second path into the recorder would be a second place
-                    // for them to drift.
-                    let _ = app.emit(&format!("tray://{}", event.id().as_ref()), ());
-                });
-            }
-
-            // The window exists but stays hidden until asked for. Creating it
-            // lazily would mean the first open pays for WebView2 startup,
-            // which is seconds - and the moment somebody wants it is the
-            // moment they are already in a hurry.
-            if let Some(window) = app.get_webview_window("main") {
-                window.hide()?;
-            }
+            install(app.handle())?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            sign_in,
-            sign_out,
-            session,
-            is_linked,
-            restore_session,
-            current_state,
-            snapshot,
-            menu,
-            start_recording,
-            pause,
-            resume,
-            finish,
-            recorded_ms,
-            uploads,
-            meetings,
-            meeting_detail,
-            set_tray_menu,
-            starts_with_windows,
-            set_starts_with_windows,
-            show_window,
-            hide_window
-        ])
+        .invoke_handler(invoke_handler())
         .run(tauri::generate_context!())
         .expect("NovaBrief could not start");
 }
