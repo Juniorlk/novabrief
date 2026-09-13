@@ -291,6 +291,16 @@ impl Recording {
             .decrypt_segment(&self.manifest.meeting_id, index, &sealed)
     }
 
+    /// Where this recording lives.
+    ///
+    /// Exposed so that whatever else belongs to one recording - the
+    /// uploader keeps a record of how far it has got - sits in the same
+    /// directory, and is therefore deleted by the same purge.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     /// Record which devices the capture actually opened.
     ///
     /// Written at the end rather than at [`Vault::begin`], because what the

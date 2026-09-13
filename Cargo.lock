@@ -4326,6 +4326,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "uploader"
+version = "0.1.0"
+dependencies = [
+ "api-client",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "vault",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
