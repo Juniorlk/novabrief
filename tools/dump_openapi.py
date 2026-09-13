@@ -12,10 +12,20 @@ visible in this document. So it is committed, regenerated here, and checked in
 CI: a route renamed or a field moved changes this file, and a changed file that
 nobody regenerated fails the build before it reaches an installer.
 
+A third way to disagree has nothing to do with the code: the **deployed**
+server can be older than both. That is how a 44-second recording sat in
+UPLOADING answering "the NovaBrief service answered 404" with the desktop, the
+schema and the tests all correct - the VPS had not been redeployed since the
+resumable-upload endpoint was merged. `--deployed` is the thirty-second check
+that says so, and belongs after every deployment.
+
     python tools/dump_openapi.py            # rewrite the snapshot
     python tools/dump_openapi.py --check    # fail if it is out of date
+    python tools/dump_openapi.py --deployed https://api.novabrief.cloud
+                                            # does the running server match?
 
-The API must be importable, which means `apps/api` and `packages` on the path:
+The first two need the API importable, which means `apps/api` and `packages`
+on the path; `--deployed` needs neither, only the network:
 
     PYTHONPATH="apps/api:packages" python tools/dump_openapi.py
 """
@@ -25,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import urllib.request
 from pathlib import Path
 
 # The repository root, from tools/.
@@ -52,6 +63,41 @@ def rendered() -> str:
     return json.dumps(document(), indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
 
+def compare_deployed(base_url: str) -> int:
+    """Say whether the running server serves what this repository describes.
+
+    Paths only, and deliberately so. A field added to a response is something
+    the desktop ignores; a path that is not there is a call that answers 404
+    and an upload that never completes.
+    """
+    snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    url = base_url.rstrip("/") + "/api/v1/openapi.json"
+
+    with urllib.request.urlopen(url, timeout=30) as answer:  # noqa: S310
+        live = json.loads(answer.read().decode("utf-8"))
+
+    here = set(snapshot["paths"])
+    there = set(live.get("paths", {}))
+
+    if missing := sorted(here - there):
+        print(
+            f"{base_url} is behind this repository. It does not serve:\n"
+            + "".join(f"    {path}\n" for path in missing)
+            + "Every desktop calling one of those gets a 404. Redeploy: see "
+            "infra/deploy/README.md.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if extra := sorted(there - here):
+        # Not a failure: a server ahead of the checkout is what a deployment
+        # looks like from a branch that has not pulled yet.
+        print(f"{base_url} serves {len(extra)} path(s) this checkout does not: {extra}")
+
+    print(f"{base_url} serves every path this repository describes")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -59,7 +105,15 @@ def main() -> int:
         action="store_true",
         help="do not write; exit non-zero if the snapshot is out of date",
     )
+    parser.add_argument(
+        "--deployed",
+        metavar="URL",
+        help="do not write; compare the snapshot against a running server",
+    )
     arguments = parser.parse_args()
+
+    if arguments.deployed:
+        return compare_deployed(arguments.deployed)
 
     fresh = rendered()
     current = SNAPSHOT.read_text(encoding="utf-8") if SNAPSHOT.exists() else None
