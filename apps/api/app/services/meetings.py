@@ -435,6 +435,46 @@ async def start_upload(
     return upload
 
 
+async def resume_upload(
+    session: AsyncSession,
+    *,
+    storage: StorageProvider,
+    meeting: Meeting,
+    caller: User,
+) -> MultipartUpload:
+    """`upload-parts`: the signatures expired, the upload did not.
+
+    **Nothing moves.** No state change, no second multipart upload, no new
+    key: the parts the store has already accepted keep their numbers, so a
+    client that comes back after an hour off the network sends what is missing
+    rather than the meeting again. That is what makes EF-18 affordable on a
+    connection where an outage outlasts a fifteen-minute signature.
+
+    Starting a fresh upload here instead would look identical from the outside
+    and quietly bill the customer's data plan for the whole recording a second
+    time — and leave the first upload's parts behind, billed by the store until
+    somebody names them.
+    """
+    if meeting.created_by != caller.id:
+        raise MeetingError("FORBIDDEN", "only the author may upload a meeting's audio")
+    if meeting.status != MeetingStatus.UPLOADING.value:
+        raise MeetingError(
+            "UPLOAD_NOT_STARTED",
+            f"a meeting in {meeting.status} has no upload in progress",
+        )
+    if not (meeting.audio_upload_id and meeting.audio_key and meeting.audio_bytes):
+        raise MeetingError("UPLOAD_NOT_STARTED", "this meeting has no upload in progress")
+
+    try:
+        return await storage.presign_parts(
+            key=meeting.audio_key,
+            upload_id=meeting.audio_upload_id,
+            size_bytes=meeting.audio_bytes,
+        )
+    except StorageError as exc:
+        raise MeetingError("STORAGE_UNAVAILABLE", str(exc)) from exc
+
+
 async def finalize(
     session: AsyncSession,
     *,

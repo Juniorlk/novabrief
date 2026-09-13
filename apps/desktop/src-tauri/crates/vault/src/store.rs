@@ -107,6 +107,9 @@ impl<S: Sealer> Vault<S> {
             segments: Vec::new(),
             input_device: input_device.to_owned(),
             output_device: output_device.to_owned(),
+            server_meeting_id: None,
+            started_at: String::new(),
+            paused_ms: 0,
         };
         manifest.save_atomically(&manifest_path(&directory))?;
 
@@ -289,6 +292,71 @@ impl Recording {
         let sealed = std::fs::read(&path).map_err(|source| VaultError::Io { path, source })?;
         self.key
             .decrypt_segment(&self.manifest.meeting_id, index, &sealed)
+    }
+
+    /// Where this recording lives.
+    ///
+    /// Exposed so that whatever else belongs to one recording - the
+    /// uploader keeps a record of how far it has got - sits in the same
+    /// directory, and is therefore deleted by the same purge.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Record which meeting the server gave this recording.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Io`] if the manifest cannot be rewritten.
+    pub fn note_server_meeting(&mut self, meeting_id: &str) -> Result<()> {
+        self.manifest.server_meeting_id = Some(meeting_id.to_owned());
+        self.manifest
+            .save_atomically(&manifest_path(&self.directory))
+    }
+
+    /// Record when the meeting began.
+    ///
+    /// Written at the start, because it is the one fact about a recording that
+    /// cannot be recovered afterwards: a crashed laptop that uploads on Monday
+    /// would otherwise declare Friday's meeting as having happened on Monday.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Io`] if the manifest cannot be rewritten.
+    pub fn note_start(&mut self, started_at: &str) -> Result<()> {
+        self.manifest.started_at = started_at.to_owned();
+        self.manifest
+            .save_atomically(&manifest_path(&self.directory))
+    }
+
+    /// Record how much audio the pauses threw away.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Io`] if the manifest cannot be rewritten.
+    pub fn note_paused(&mut self, paused_ms: u64) -> Result<()> {
+        self.manifest.paused_ms = paused_ms;
+        self.manifest
+            .save_atomically(&manifest_path(&self.directory))
+    }
+
+    /// Record which devices the capture actually opened.
+    ///
+    /// Written at the end rather than at [`Vault::begin`], because what the
+    /// recorder can say before the first packet is which device it *asked*
+    /// for - "the Windows default" - and after a crash that is the one answer
+    /// support does not need. The manifest is the only thing that survives the
+    /// process, so it carries the names the audio was really recorded with.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Io`] if the manifest cannot be rewritten.
+    pub fn note_devices(&mut self, input: &str, output: &str) -> Result<()> {
+        self.manifest.input_device = input.to_owned();
+        self.manifest.output_device = output.to_owned();
+        self.manifest
+            .save_atomically(&manifest_path(&self.directory))
     }
 
     /// Move the recording to a new state.

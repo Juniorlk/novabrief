@@ -14,10 +14,17 @@
 //! refused at construction rather than at request time, because the request
 //! that would discover it is the one carrying the password.
 
+pub mod meetings;
+
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
+
+pub use meetings::{
+    Decision, Meeting, MeetingDetail, Report, Task, TranscriptSegment, UploadSlot, UploadTicket,
+    UploadedPart,
+};
 
 /// How long a request may take before it is abandoned.
 ///
@@ -130,7 +137,8 @@ struct RefreshBody<'a> {
 #[derive(Debug, Clone)]
 pub struct ApiClient {
     base: Url,
-    http: reqwest::Client,
+    /// Shared with `meetings`, which is the other half of this client.
+    pub(crate) http: reqwest::Client,
 }
 
 impl ApiClient {
@@ -220,6 +228,45 @@ impl ApiClient {
         }
     }
 
+    /// A signed-in GET, decoded.
+    pub(crate) async fn authorised_get<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        access_token: &str,
+    ) -> Result<T, ApiError> {
+        let url = self.endpoint(path)?;
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| ApiError::Unreachable)?;
+
+        match response.status().as_u16() {
+            200 => decode(response).await,
+            401 | 403 => Err(ApiError::SessionExpired),
+            _ => Err(problem(response).await),
+        }
+    }
+
+    /// A signed-in POST, left undecoded so the caller can read its status.
+    pub(crate) async fn authorised_post<B: Serialize>(
+        &self,
+        path: &str,
+        access_token: &str,
+        body: &B,
+    ) -> Result<reqwest::Response, ApiError> {
+        let url = self.endpoint(path)?;
+        self.http
+            .post(url)
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| ApiError::Unreachable)
+    }
+
     fn endpoint(&self, path: &str) -> Result<Url, ApiError> {
         self.base
             .join(&format!("/api/v1/{path}"))
@@ -243,7 +290,7 @@ impl ApiClient {
     }
 }
 
-async fn decode<T: serde::de::DeserializeOwned>(
+pub(crate) async fn decode<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, ApiError> {
     response.json::<T>().await.map_err(|_| ApiError::Protocol)
@@ -254,7 +301,7 @@ async fn decode<T: serde::de::DeserializeOwned>(
 /// RFC 9457 gives a `detail` as well, and it is deliberately dropped: the API's
 /// own validation errors quote the field that failed, and a client that logged
 /// them would eventually log a password that was too short.
-async fn problem(response: reqwest::Response) -> ApiError {
+pub(crate) async fn problem(response: reqwest::Response) -> ApiError {
     let status = response.status().as_u16();
     let code = response
         .json::<serde_json::Value>()

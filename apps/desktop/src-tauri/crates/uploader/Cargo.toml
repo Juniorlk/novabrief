@@ -1,0 +1,22 @@
+[package]
+name = "uploader"
+description = "Sends a recording from the vault to the bucket, and survives the network (EF-18)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+api-client = { path = "../api-client" }
+vault = { path = "../vault" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+thiserror = "2.0.20"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

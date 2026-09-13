@@ -21,8 +21,24 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+api-client = { path = "crates/api-client" }
 audio-engine = { path = "crates/audio-engine" }
+uploader = { path = "crates/uploader" }
 vault = { path = "crates/vault" }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+# Already in the tree by way of Tauri, so it costs nothing against the 15 MB
+# installer budget of EF-10. Needed for exactly one thing: stamping a recording
+# with when it began, in the format the API declares meetings in.
+time = { version = "0.3.55", features = ["formatting", "macros"] }
 serde = { version = "1", features = ["derive"] }
+thiserror = "2.0.20"
 serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
 tauri = { version = "2", features = ["tray-icon"] }
+# EF-10 asks for optional automatic start. A registry key under HKCU, which is
+# what "per-user, no administrator" means on Windows - and writing it by hand
+# would be a second implementation of something Windows has opinions about.
+tauri-plugin-autostart = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
