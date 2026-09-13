@@ -302,6 +302,40 @@ async def finalize_local(
 
 
 @router.post(
+    "/meetings/{meeting_id}/upload-parts",
+    response_model=UploadTicket,
+    summary="Sign the upload slots again, for an upload already under way",
+)
+async def resume_upload(
+    meeting_id: uuid.UUID,
+    caller: CurrentCaller,
+    session: ScopedSession,
+    storage: Storage,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> UploadTicket:
+    """EF-18: an outage outlives a fifteen-minute signature.
+
+    Nothing changes here — not the state, not the key, not the upload. The
+    parts the store has already accepted keep their numbers, so the client
+    sends what is missing rather than the meeting again.
+    """
+    try:
+        meeting = await meetings.get(session, meeting_id=meeting_id, caller=caller.user)
+        upload = await meetings.resume_upload(
+            session, storage=storage, meeting=meeting, caller=caller.user
+        )
+    except meetings.MeetingError as error:
+        raise _as_problem(error) from error
+
+    return UploadTicket(
+        upload_id=upload.upload_id,
+        part_size_bytes=upload.part_size_bytes,
+        parts=[UploadPart(part_number=part.part_number, url=part.url) for part in upload.parts],
+        expires_in_seconds=settings.r2_presign_ttl_seconds,
+    )
+
+
+@router.post(
     "/meetings/{meeting_id}/finalize",
     response_model=MeetingSummary,
     status_code=status.HTTP_202_ACCEPTED,

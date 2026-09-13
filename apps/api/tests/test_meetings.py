@@ -600,6 +600,105 @@ async def test_starting_an_upload_twice_is_refused(api: Harness) -> None:
     assert response.json()["code"] == "ILLEGAL_TRANSITION"
 
 
+async def test_upload_parts_signs_the_same_upload_again(api: Harness) -> None:
+    """EF-18: the signatures expire, the upload does not.
+
+    A presigned URL lasts fifteen minutes and an outage on a Douala connection
+    often does not, so the client has to be able to come back for new URLs. The
+    upload it comes back to must be the one it left.
+    """
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+    first = await _ticket(api, headers, meeting["id"])
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/upload-parts", headers=headers
+    )
+
+    assert response.status_code == 200, response.text
+    again = response.json()
+    assert again["upload_id"] == first["upload_id"], "a second upload was opened"
+    assert len(again["parts"]) == len(first["parts"])  # type: ignore[arg-type]
+    assert again["part_size_bytes"] == first["part_size_bytes"]
+
+
+async def test_upload_parts_opens_nothing_in_the_store(api: Harness) -> None:
+    """Re-signing must not open a second upload.
+
+    This is what separates re-signing from starting again, and from the outside
+    the two are indistinguishable: both hand back a usable ticket. Only one of
+    them lets the client finish with the ETags it already has. The other makes
+    a customer on a metered connection send the whole meeting a second time,
+    and leaves the first upload's parts sitting in the bucket, billed until
+    somebody names them - which nothing ever will, because the row now points
+    at the second one.
+
+    So the assertion is on the store rather than on the answer.
+    """
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+    ticket = await _ticket(api, headers, meeting["id"])
+    assert len(api.storage.uploads) == 1
+
+    await api.client.post(f"{PREFIX}/meetings/{meeting['id']}/upload-parts", headers=headers)
+
+    assert len(api.storage.uploads) == 1, "a second multipart upload was opened and abandoned"
+    assert ticket["upload_id"] in api.storage.uploads
+
+    # And the client finishes with the ETags it confirmed before the outage.
+    etags = [
+        {"part_number": part["part_number"], "etag": "confirmed-before-the-outage"}  # type: ignore[index]
+        for part in ticket["parts"]  # type: ignore[union-attr]
+    ]
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/finalize",
+        json={"upload_id": ticket["upload_id"], "parts": etags},
+        headers=headers,
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "QUEUED"
+
+
+async def test_upload_parts_changes_nothing(api: Harness) -> None:
+    """Re-signing is a read. It must not move the meeting anywhere."""
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+    await _ticket(api, headers, meeting["id"])
+
+    await api.client.post(f"{PREFIX}/meetings/{meeting['id']}/upload-parts", headers=headers)
+    current = (await api.client.get(f"{PREFIX}/meetings/{meeting['id']}", headers=headers)).json()
+
+    assert current["status"] == "UPLOADING"
+
+
+async def test_upload_parts_needs_an_upload_under_way(api: Harness) -> None:
+    """Nothing to re-sign before `finalize-local` has opened anything."""
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/upload-parts", headers=headers
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "UPLOAD_NOT_STARTED"
+
+
+async def test_only_the_author_may_resume_an_upload(api: Harness) -> None:
+    headers = await _owner(api.client)
+    meeting = await _declare(api.client, headers)
+    await _ticket(api, headers, meeting["id"])
+    other = await _owner(api.client)
+
+    response = await api.client.post(
+        f"{PREFIX}/meetings/{meeting['id']}/upload-parts", headers=other
+    )
+
+    # Another tenant cannot even see it.
+    assert response.status_code == 404
+
+
 async def test_finalizing_queues_the_meeting(api: Harness) -> None:
     """EF-40: 202, and the meeting is in the queue."""
     headers = await _owner(api.client)

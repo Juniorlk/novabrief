@@ -114,6 +114,17 @@ class StorageProvider(Protocol):
         """Open an upload and presign a slot for every part."""
         ...
 
+    async def presign_parts(self, *, key: str, upload_id: str, size_bytes: int) -> MultipartUpload:
+        """Sign the slots again for an upload that is already open.
+
+        A presigned URL lasts fifteen minutes; an upload from a Cameroonian
+        SME does not always. EF-18 asks for retries backing off to five
+        minutes with no limit, which is an admission that outages outlive the
+        signatures — so the client has to be able to ask for new ones without
+        losing the parts it has already confirmed.
+        """
+        ...
+
     async def complete_multipart(
         self, *, key: str, upload_id: str, etags: Sequence[tuple[int, str]]
     ) -> StoredObject:
@@ -186,22 +197,7 @@ class S3StorageProvider:
                     Bucket=self._bucket, Key=key, ContentType=content_type
                 )
                 upload_id = str(created["UploadId"])
-                parts = [
-                    PartUpload(
-                        part_number=number,
-                        url=await client.generate_presigned_url(
-                            "upload_part",
-                            Params={
-                                "Bucket": self._bucket,
-                                "Key": key,
-                                "UploadId": upload_id,
-                                "PartNumber": number,
-                            },
-                            ExpiresIn=self._ttl,
-                        ),
-                    )
-                    for number in range(1, parts_needed + 1)
-                ]
+                parts = await self._sign_parts(client, key, upload_id, parts_needed)
         except ClientError as exc:
             raise StorageError(_describe(exc)) from exc
 
@@ -210,6 +206,47 @@ class S3StorageProvider:
         return MultipartUpload(
             key=key, upload_id=upload_id, parts=parts, part_size_bytes=self._part_size
         )
+
+    async def presign_parts(self, *, key: str, upload_id: str, size_bytes: int) -> MultipartUpload:
+        """Sign the slots again, without opening a second upload.
+
+        Nothing is created here, which is the whole point: the parts already
+        accepted by the store keep their numbers and their ETags, so a client
+        that comes back after an hour off the network sends what is missing
+        rather than the meeting again.
+        """
+        parts_needed = part_count_for(size_bytes, part_size_bytes=self._part_size)
+        try:
+            async with self._client() as client:
+                parts = await self._sign_parts(client, key, upload_id, parts_needed)
+        except ClientError as exc:
+            raise StorageError(_describe(exc)) from exc
+
+        logger.info("multipart_upload_resigned", key=key, parts=parts_needed)
+        return MultipartUpload(
+            key=key, upload_id=upload_id, parts=parts, part_size_bytes=self._part_size
+        )
+
+    async def _sign_parts(
+        self, client: Any, key: str, upload_id: str, count: int
+    ) -> list[PartUpload]:
+        """One presigned slot per part."""
+        return [
+            PartUpload(
+                part_number=number,
+                url=await client.generate_presigned_url(
+                    "upload_part",
+                    Params={
+                        "Bucket": self._bucket,
+                        "Key": key,
+                        "UploadId": upload_id,
+                        "PartNumber": number,
+                    },
+                    ExpiresIn=self._ttl,
+                ),
+            )
+            for number in range(1, count + 1)
+        ]
 
     async def complete_multipart(
         self, *, key: str, upload_id: str, etags: Sequence[tuple[int, str]]
@@ -377,6 +414,21 @@ class InMemoryStorageProvider:
             upload_id=upload_id,
             parts=[
                 PartUpload(part_number=number, url=f"memory://{key}?part={number}")
+                for number in range(1, count + 1)
+            ],
+            part_size_bytes=self.part_size_bytes,
+        )
+
+    async def presign_parts(self, *, key: str, upload_id: str, size_bytes: int) -> MultipartUpload:
+        if upload_id not in self.uploads:
+            message = "no such upload"
+            raise StorageError(message)
+        count = part_count_for(size_bytes, part_size_bytes=self.part_size_bytes)
+        return MultipartUpload(
+            key=key,
+            upload_id=upload_id,
+            parts=[
+                PartUpload(part_number=number, url=f"memory://{key}?part={number}&again")
                 for number in range(1, count + 1)
             ],
             part_size_bytes=self.part_size_bytes,
